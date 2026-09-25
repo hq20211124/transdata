@@ -1,0 +1,28 @@
+[package]
+name = "transdata"
+version = "1.0.0"
+edition = "2021"
+description = "PC <-> Android file transfer server + native GUI, single exe"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+qrcode = { version = "0.14", features = ["image"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+eframe = { version = "0.28", features = ["wgpu"] }
+rfd = "0.15"
+thiserror = "2"
+tokio-tungstenite = "0.21"
+futures-util = "0.3"
+serde_json = "1"
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
+sha2 = "0.10"
+
+[build-dependencies]
+embed-resource = "2"
+
+[profile.release]
+strip = "symbols"
+lto = true
+codegen-units = 1
+panic = "abort"
+opt-level = "z"
