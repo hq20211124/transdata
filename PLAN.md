@@ -1,7 +1,7 @@
 # 计划：transdata Rust 版 —— 删 Python 旧版 + 文件夹直传 + 网络代码层修复
 
 日期：2026-07-03（会话：Agnes）
-范围：`<项目根目录>`。Python 版（`server/`）确认废弃；`transdata-rs/` 为唯一版本。
+范围：`<项目根目录>`（即本仓库）。Python 版（`server/`）确认废弃；`transdata-rs/` 为唯一版本。
 
 ---
 
@@ -96,7 +96,7 @@ README 加 3 行"传输速度低"的排查说明（网卡链路速率/杀软/Wi-
 用户批复：① uploads 合并进 Rust 版 uploads 目录后删 Python 版；② 删 Python 版不单独留痕；③ 文件夹方案照计划；④ 新增：**做服务端 zip 一键下载**（参考 LocalSend 类实践，浏览器场景下流式 zip 是最省事的接收端方案）；⑤ 网络只改代码。
 
 已完成：
-- `server/` 整目录删除；`<历史 APK> / <历史 APK> / <GUI 配置文件>` 已并入 `transdata-rs/target/release/uploads/`
+- `server/` 整目录删除；其中遗留的若干历史 APK 与配置文件已并入 `transdata-rs/target/release/uploads/`
 - 服务端 `src/http/server.rs`：
   - `sanitize_rel` 路径白名单（拒 `..`/绝对路径/盘符/控制字符），`sanitize` 失败回退 safe_leaf
   - 上传支持子目录（`create_dir_all`），`UPLOAD_LOCK` 串行同名临界区，断线自动删截断文件
@@ -231,5 +231,20 @@ README 加 3 行"传输速度低"的排查说明（网卡链路速率/杀软/Wi-
 
 网页端（手机/电脑浏览器）无此问题：textarea 高度固定、按钮在输入框上方，
 已用 Playwright 在 1280×900 下实测粘贴长文本后布局不变。
+
+## 追加：开源仓库信息脱敏（仓库保持 public）
+
+仓库按用户要求继续开源，但把文档里能指向本人本地环境的痕迹去掉：
+
+- 绝对本地路径（盘符 + 项目目录名）→ 统一写成 `<项目根目录>`
+- 遗留的其他项目产物名（历史 APK 名、某个 GUI 配置文件名）→ 泛化为「若干历史 APK 与配置文件」
+- 保留：路径穿越示例（`C:\x`、`\\server\share`）、本项目自身的开发期文件名
+  （`td_*.log`、`gui_*.png`、`icon_*.png`）——这些是程序行为说明，不指向本人
+
+同时核查：仓库内**无任何**密钥/口令/token/私钥；`transdata-rs/target/` 已被 .gitignore 忽略，
+真实传输目录（PDF、截图、APK、日志、exe 副本）从未入库，远程文件树只有源码/图标/文档。
+
+附记：README.md 一度显示为乱码，实为本地终端 GBK 代码页的显示问题，
+文件本身是合法 UTF-8（无 BOM、无 U+FFFD、无 mojibake），无需改动。
 
 
