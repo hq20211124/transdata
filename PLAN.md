@@ -204,3 +204,32 @@ README 加 3 行"传输速度低"的排查说明（网卡链路速率/杀软/Wi-
 - 验证：从新 exe 资源提取图标确认为本设计；exe 启动 5s 无崩溃；
   `uploads/transdata.exe` 旧副本已同步为新版
 
+## 追加：电脑端「快捷文本」粘贴长文本后按钮被挤占（已修复）
+
+现象：电脑端窗口（egui GUI）的「快捷文本」输入框里**一次粘贴长文本**，
+下面的「复制 / 发送」按钮就看不见了（被挤出窗口）。
+
+根因（egui 0.28 的多行 TextEdit，两个坑）：
+1. **高度无上限**：TextEdit 的高度 = 文本排版后的高度（`galley.size().y`）。
+   4400 字中文排版后约 1050px 高，而主窗口固定 860×560 不可缩放 →
+   按钮被顶到 y≈1097，直接跑到窗口外面。
+2. **默认只在空格处断行**：粘贴一整段没有空格的长文本（URL / base64 / 中文）
+   → 排版宽度暴涨 → 输入框把左右按钮顶出屏幕。
+
+修复（`gui.rs::note_text_edit()`）：
+- 外层套 `ScrollArea::vertical().max_height(120)`：输入框占位高度恒定 ≤120px，
+  超出的内容在框内滚动（粘贴后 egui 的 `scroll_to_rect` 自动滚到光标处），
+  按钮位置永远固定在输入框正下方。
+- 内层自定义 `layouter`：`job.wrap.break_anywhere = true`，任意字符都能断行。
+- 输入框行数 4 → 6（配合限高 120px）。
+
+验证：新增无头布局回归测试 `gui::tests::long_text_must_not_push_buttons_out_of_window`
+（egui `Context::run` 模拟 860×560 窗口）：
+  旧写法 输入框占位 1055px / 按钮 y=1097（窗外）→ 新写法 占位 121px / 按钮 y=163（窗内）。
+另用无头渲染出图肉眼确认：输入框被裁到 120px，按钮在框正下方可见。
+`cargo test --release` 12/12 通过；release 重建 + `uploads/transdata.exe` 副本已同步。
+
+网页端（手机/电脑浏览器）无此问题：textarea 高度固定、按钮在输入框上方，
+已用 Playwright 在 1280×900 下实测粘贴长文本后布局不变。
+
+

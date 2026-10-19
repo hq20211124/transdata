@@ -6,6 +6,10 @@ use eframe::{App, CreationContext, Frame};
 
 use crate::config::Config;
 
+/// 主窗口尺寸（固定不可缩放，测试也按这个尺寸模拟布局）
+const WIN_W: f32 = 860.0;
+const WIN_H: f32 = 560.0;
+
 /// Load Microsoft YaHei (微软雅黑) so Chinese text renders instead of tofu
 /// boxes. Falls back to SimSun, then nothing (app still runs).
 fn cjk_font() -> Option<(Vec<u8>, u32)> {
@@ -86,9 +90,6 @@ pub fn run_gui(cfg: Arc<Config>, port: u16) {
         rt.spawn(ws_note_client(gui_ctx, port_thread));
         rt.block_on(crate::http::server::serve(cfg_server));
     });
-
-    const WIN_W: f32 = 860.0;
-    const WIN_H: f32 = 560.0;
 
     let (screen_w, screen_h) = primary_monitor_size();
     let start_x = (screen_w - WIN_W) / 2.0;
@@ -466,11 +467,8 @@ impl App for GuiApp {
                     });
                     ui.add_space(8.0);
                     let before = text.clone();
-                    ui.add(
-                        eframe::egui::TextEdit::multiline(&mut text)
-                            .desired_width(ui.available_width().max(80.0))
-                            .desired_rows(4),
-                    );
+                    // 固定最大高度 + 框内滚动：粘贴长文本也不会把下面的按钮顶出窗口
+                    note_text_edit(ui, &mut text, 120.0);
                     let changed = text != before;
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
@@ -726,4 +724,110 @@ fn choose_dir() -> Option<PathBuf> {
     rfd::FileDialog::new()
         .set_title("选择传输目录")
         .pick_folder()
+}
+
+// ---------------------------------------------------------------------------
+// 快捷文本输入区
+//
+// egui 的多行 TextEdit 有两个坑，都会把下方的「复制 / 发送」按钮挤掉：
+//
+// 1. 高度没有上限：TextEdit 的高度 = 文本排版后的高度。
+//    一次粘贴长文本 → 输入框长到上千像素 → 按钮被顶出窗口（看不见了）。
+//    → 外面套一层「最大高度固定」的 ScrollArea，超出部分在框内滚动，
+//      输入框高度恒定，按钮位置永远不变。
+//
+// 2. 默认只在空格处断行：粘贴一整段没有空格的长文本（URL / base64 / 中文）
+//    → 排版宽度暴涨 → 输入框把左右两侧的按钮顶出屏幕。
+//    → 自定义 layouter，允许在任意字符间断行。
+fn note_text_edit(
+    ui: &mut eframe::egui::Ui,
+    text: &mut String,
+    max_height: f32,
+) -> eframe::egui::Response {
+    let font_id = eframe::egui::TextStyle::Body.resolve(ui.style());
+    let mut layouter = |ui: &eframe::egui::Ui, t: &str, wrap_width: f32| {
+        let color = ui.visuals().widgets.inactive.text_color();
+        let mut job = eframe::egui::text::LayoutJob::simple(
+            t.to_string(),
+            font_id.clone(),
+            color,
+            wrap_width,
+        );
+        job.wrap.break_anywhere = true; // 无空格长文本也能正常换行
+        ui.fonts(|f| f.layout_job(job))
+    };
+    eframe::egui::ScrollArea::vertical()
+        .id_source("note_text_edit_scroll")
+        .max_height(max_height)
+        .show(ui, |ui| {
+            ui.add(
+                eframe::egui::TextEdit::multiline(text)
+                    .desired_width(ui.available_width().max(80.0))
+                    .desired_rows(6)
+                    .layouter(&mut layouter),
+            )
+        })
+        .inner
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eframe::egui;
+
+    /// 真实窗口尺寸见模块顶部的 WIN_W / WIN_H
+
+    /// 模拟一帧布局，返回 (输入框宽, 输入框占位高, 按钮 x, 按钮 y)。
+    /// `fixed` = 走修复后的 note_text_edit（限高 + 任意断行）。
+    fn layout_probe(fixed: bool) -> (f32, f32, f32, f32) {
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(WIN_W, WIN_H),
+        ));
+        // 一整段没有空格的长文本 —— 正是"一次粘贴长文本"的典型内容
+        let mut text = "这是一段很长的中文文本用来测试粘贴长文本的效果。".repeat(200);
+        let mut out = (0.0_f32, 0.0_f32, 0.0_f32, 0.0_f32);
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let resp = if fixed {
+                    note_text_edit(ui, &mut text, 120.0)
+                } else {
+                    // 旧写法：TextEdit 直接放在布局流里，高度随文本无限增长
+                    ui.add(
+                        egui::TextEdit::multiline(&mut text)
+                            .desired_width(ui.available_width().max(80.0))
+                            .desired_rows(4),
+                    )
+                };
+                let btn = ui.allocate_space(egui::vec2(88.0, 32.0)).1;
+                // 输入框在父布局里实际占掉的高度（修复后应被限高卡住）
+                let used_h = btn.min.y - resp.rect.min.y;
+                out = (resp.rect.width(), used_h, btn.min.x, btn.max.y);
+            });
+        });
+        out
+    }
+
+    /// 回归测试：一次粘贴长文本后，输入框不能暴涨，按钮必须留在窗口内。
+    #[test]
+    fn long_text_must_not_push_buttons_out_of_window() {
+        let (w_old, h_old, bx_old, by_old) = layout_probe(false);
+        let (w_new, h_new, bx_new, by_new) = layout_probe(true);
+        println!(
+            "旧写法: 宽 {w_old:.0} 占位高 {h_old:.0} 按钮 ({bx_old:.0},{by_old:.0}) / 新写法: 宽 {w_new:.0} 占位高 {h_new:.0} 按钮 ({bx_new:.0},{by_new:.0})"
+        );
+
+        // 旧写法：输入框高度 = 文本排版高度（上万像素），按钮被顶到窗口外
+        assert!(h_old > 500.0, "旧写法高度本应暴涨, 高 = {h_old}");
+        assert!(by_old > WIN_H, "旧写法本应把按钮顶出窗口, y = {by_old}");
+
+        // 修复后：输入框占位高度被限高卡住，按钮留在窗口内
+        assert!(h_new <= 130.0, "输入框占位高度仍失控, 高 = {h_new}");
+        assert!(w_new <= WIN_W, "输入框宽度仍失控, 宽 = {w_new}");
+        assert!(by_new < WIN_H, "按钮仍被挤出窗口, y = {by_new}");
+        assert!(bx_new < WIN_W, "按钮仍被挤出屏幕, x = {bx_new}");
+    }
+
 }
