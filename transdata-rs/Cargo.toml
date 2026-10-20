@@ -1,10 +1,12 @@
 [package]
 name = "transdata"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 description = "PC <-> Android file transfer server + native GUI, single exe"
 
 [dependencies]
+# 在线更新（查版本 / 下载新 exe）
+ureq = "2"
 tokio = { version = "1", features = ["full"] }
 qrcode = { version = "0.14", features = ["image"] }
 image = { version = "0.25", default-features = false, features = ["png"] }

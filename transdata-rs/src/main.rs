@@ -1,10 +1,11 @@
 #![windows_subsystem = "windows"]
 mod config;
-
 mod gui;
 mod http;
 mod net;
+mod settings;
 mod tls;
+mod update;
 mod web;
 
 use config::Config;

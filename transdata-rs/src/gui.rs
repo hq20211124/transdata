@@ -6,9 +6,12 @@ use eframe::{App, Frame};
 
 use crate::config::Config;
 
-/// 主窗口尺寸（固定不可缩放，测试也按这个尺寸模拟布局）
+/// 主窗口尺寸（初始大小；可以拖边缘改大小，测试也按这个尺寸模拟布局）
 const WIN_W: f32 = 880.0;
 const WIN_H: f32 = 570.0;
+/// 最小尺寸：拖边缘时不能缩到比这更小（否则内容挤不下）
+const WIN_MIN_W: f32 = 640.0;
+const WIN_MIN_H: f32 = 470.0;
 /// 自绘标题栏的高度（原来这块是系统标题栏，深色模式下是一条黑边）
 const TITLEBAR_H: f32 = 42.0;
 
@@ -52,6 +55,9 @@ mod win_shape {
             cy: i32,
             flags: u32,
         ) -> i32;
+        fn GetCursorPos(pt: *mut PointRaw) -> i32;
+        fn SetCapture(hwnd: isize) -> i32;
+        fn ReleaseCapture() -> i32;
     }
 
     #[link(name = "gdi32")]
@@ -196,6 +202,75 @@ mod win_shape {
             } else {
                 d
             }
+        }
+    }
+
+    /// 窗口现在是最大化状态吗
+    pub fn is_zoomed(hwnd: isize) -> bool {
+        if hwnd == 0 {
+            return false;
+        }
+        unsafe { IsZoomed(hwnd) != 0 }
+    }
+
+    /// 光标在屏幕上的位置（物理像素）
+    pub fn cursor_pos() -> Option<(i32, i32)> {
+        let mut pt = PointRaw { x: 0, y: 0 };
+        unsafe {
+            if GetCursorPos(&mut pt) == 0 {
+                return None;
+            }
+        }
+        Some((pt.x, pt.y))
+    }
+
+    /// 窗口在屏幕上的矩形（左上右下，物理像素）
+    pub fn window_rect(hwnd: isize) -> Option<(i32, i32, i32, i32)> {
+        if hwnd == 0 {
+            return None;
+        }
+        let mut r = RectRaw {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        unsafe {
+            if GetWindowRect(hwnd, &mut r) == 0 {
+                return None;
+            }
+        }
+        Some((r.left, r.top, r.right, r.bottom))
+    }
+
+    /// 移动并调整窗口大小（物理像素）
+    pub fn set_window_rect(hwnd: isize, x: i32, y: i32, w: i32, h: i32) -> bool {
+        if hwnd == 0 {
+            return false;
+        }
+        unsafe {
+            SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                x,
+                y,
+                w.max(1),
+                h.max(1),
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            ) != 0
+        }
+    }
+
+    /// 把鼠标抓到自己窗口里（拖到窗口外面也能继续收到移动事件）
+    pub fn set_capture(hwnd: isize) {
+        unsafe {
+            SetCapture(hwnd);
+        }
+    }
+
+    pub fn release_capture() {
+        unsafe {
+            ReleaseCapture();
         }
     }
 
@@ -378,11 +453,46 @@ pub fn run_gui(cfg: Arc<Config>, port: u16) {
 
     let cfg_server = cfg.clone();
     let cfg_gui = cfg.clone();
+    // 持久化设置：主题（浅色/深色）、在线更新源
+    let settings = crate::settings::Settings::load();
+    // 写回一份：用户能直接打开 settings.json 改更新地址
+    settings.save();
+    let theme = settings.theme;
+    // 在线更新的状态：启动时先查一次版本，设置面板里直接能看到"最新版本"
+    let update_slot: Arc<std::sync::Mutex<crate::update::UpdateStatus>> =
+        Arc::new(std::sync::Mutex::new(crate::update::UpdateStatus::Idle));
     // egui Context, captured when eframe creates the window; the WS note
     // client below uses it to repaint when remote content arrives.
     let ctx_holder: Arc<std::sync::Mutex<Option<eframe::egui::Context>>> =
         Arc::new(std::sync::Mutex::new(None));
     let ctx_holder_gui = ctx_holder.clone();
+    {
+        let url = settings.update_url.clone();
+        let slot = update_slot.clone();
+        let ctx_holder_check = ctx_holder.clone();
+        std::thread::spawn(move || {
+            let result = match crate::update::fetch_release(&url) {
+                Ok(rel) => {
+                    if crate::update::is_newer(&rel.version, crate::update::APP_VERSION) {
+                        crate::update::UpdateStatus::Available(rel)
+                    } else {
+                        crate::update::UpdateStatus::UpToDate(rel.version)
+                    }
+                }
+                Err(e) if e == crate::update::NO_RELEASE => {
+                    crate::update::UpdateStatus::UpToDate(
+                        crate::update::APP_VERSION.to_string(),
+                    )
+                }
+                Err(e) => crate::update::UpdateStatus::Failed(e),
+            };
+            *slot.lock().unwrap() = result;
+            eprintln!("update check: {:?}", slot.lock().unwrap());
+            if let Some(ctx) = ctx_holder_check.lock().unwrap().clone() {
+                ctx.request_repaint();
+            }
+        });
+    }
     // Number of transfers currently in flight (the status dot in the window).
     let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let active_gui = active.clone();
@@ -459,8 +569,11 @@ pub fn run_gui(cfg: Arc<Config>, port: u16) {
             // 无系统标题栏：自己画标题栏（图标 + 窗口按钮），避免深色系统下
             // 顶部那条突兀的黑边。
             .with_decorations(false)
+            // 系统标题栏关掉后没有可拖的边框，改为自己实现边缘拖拽缩放
+            // （见 GuiApp::handle_resize），所以这里保持 resizable = false，
+            // 免得系统边框和自绘缩放打架。
             .with_resizable(false)
-            .with_min_inner_size(eframe::egui::vec2(WIN_W, WIN_H))
+            .with_min_inner_size(eframe::egui::vec2(WIN_MIN_W, WIN_MIN_H))
             .with_icon(window_icon())
             .with_position(eframe::egui::Pos2::new(start_x, start_y)),
         ..Default::default()
@@ -471,11 +584,12 @@ pub fn run_gui(cfg: Arc<Config>, port: u16) {
         options,
         Box::new(move |cc| {
             *ctx_holder_gui.lock().unwrap() = Some(cc.egui_ctx.clone());
-            // Force the light theme regardless of the OS dark mode: the design is
-            // light (white cards on gray). Without this, dark-mode systems render
-            // the TextEdit with a near-black background.
+            // 主题跟着设置走（深浅两套配色在 pal::now() 里）
             let mut style = (*cc.egui_ctx.style()).clone();
-            style.visuals = eframe::egui::Visuals::light();
+            style.visuals = match theme {
+                crate::settings::Theme::Light => eframe::egui::Visuals::light(),
+                crate::settings::Theme::Dark => eframe::egui::Visuals::dark(),
+            };
             cc.egui_ctx.set_style(style);
             if let Some((bytes, index)) = cjk_font() {
                 let font_data = eframe::egui::FontData {
@@ -504,6 +618,8 @@ pub fn run_gui(cfg: Arc<Config>, port: u16) {
                     port,
                     active_gui,
                     paired_gui,
+                    settings,
+                    update_slot,
                     #[cfg(windows)]
                     win_shape::find_main_window(),
                 )
@@ -554,6 +670,34 @@ struct GuiApp {
     active_transfers: Arc<std::sync::atomic::AtomicUsize>,
     /// 已配对的设备数量。
     paired_devices: Arc<std::sync::atomic::AtomicUsize>,
+    /// 持久化设置（主题 / 更新源）
+    settings: crate::settings::Settings,
+    /// 设置面板是否打开
+    settings_open: bool,
+    /// 在线更新的状态（后台线程写，GUI 读）
+    update: Arc<std::sync::Mutex<crate::update::UpdateStatus>>,
+    /// 正在拖动窗口边缘改大小时的状态
+    resize: Option<ResizeState>,
+}
+
+/// 拖边缘改大小时记下的东西：起始光标位置 + 起始窗口矩形（物理像素）
+#[derive(Clone, Copy)]
+struct ResizeState {
+    edge: ResizeEdge,
+    start_cursor: (i32, i32),
+    start_rect: (i32, i32, i32, i32),
+}
+
+/// 窗口的哪条边被拖住了
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ResizeEdge {
+    Left,
+    Right,
+    Bottom,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
 }
 
 impl GuiApp {
@@ -562,6 +706,8 @@ impl GuiApp {
         port: u16,
         active_transfers: Arc<std::sync::atomic::AtomicUsize>,
         paired_devices: Arc<std::sync::atomic::AtomicUsize>,
+        settings: crate::settings::Settings,
+        update: Arc<std::sync::Mutex<crate::update::UpdateStatus>>,
         #[cfg(windows)] hwnd: isize,
     ) -> Self {
         let (_, last_v) = cfg.read_note();
@@ -590,6 +736,10 @@ impl GuiApp {
             note_status: String::new(),
             active_transfers,
             paired_devices,
+            settings,
+            settings_open: false,
+            update,
+            resize: None,
         }
     }
 
@@ -659,7 +809,7 @@ impl GuiApp {
             .exact_height(TITLEBAR_H)
             .frame(
                 eframe::egui::Frame::none()
-                    .fill(eframe::egui::Color32::WHITE)
+                    .fill(pal::now().surface)
                     .inner_margin(eframe::egui::Margin::symmetric(10.0, 0.0)),
             )
             .show(ctx, |ui| {
@@ -670,17 +820,20 @@ impl GuiApp {
                         eframe::egui::pos2(bar.left(), bar.bottom()),
                         eframe::egui::pos2(bar.right(), bar.bottom()),
                     ],
-                    eframe::egui::Stroke::new(1.0_f32, pal::CARD_BORDER),
+                    eframe::egui::Stroke::new(1.0_f32, pal::now().card_border),
                 );
 
                 // 窗口按钮固定在右上角（绝对定位，不参与布局）
+                // 从右往左：关闭 / 最大化 / 最小化 ‖ 设置 / 主题（月亮太阳）
                 let btn_w = 36.0_f32;
                 let btn_h = TITLEBAR_H - 2.0;
-                let btn_base_x = bar.right() - btn_w * 3.0;
+                let win_base_x = bar.right() - btn_w * 3.0;
+                let gear_x = win_base_x - 10.0 - btn_w;
+                let moon_x = gear_x - btn_w;
                 let btn_y = bar.top() + 1.0;
-                let rect_of = |i: usize| {
+                let rect_at = |x: f32| {
                     eframe::egui::Rect::from_min_size(
-                        eframe::egui::pos2(btn_base_x + btn_w * i as f32, btn_y),
+                        eframe::egui::pos2(x, btn_y),
                         eframe::egui::vec2(btn_w, btn_h),
                     )
                 };
@@ -702,7 +855,12 @@ impl GuiApp {
                                 RichText::new("TransData")
                                     .size(14.0)
                                     .strong()
-                                    .color(pal::FG),
+                                    .color(pal::now().fg),
+                            );
+                            ui.label(
+                                RichText::new(format!("v{}", crate::update::APP_VERSION))
+                                    .size(10.5)
+                                    .color(pal::now().muted),
                             );
                         });
                     });
@@ -711,7 +869,7 @@ impl GuiApp {
                 // 运行状态：右对齐到窗口按钮左侧
                 let status_rect = eframe::egui::Rect::from_min_max(
                     eframe::egui::pos2(bar.left(), bar.top()),
-                    eframe::egui::pos2(btn_base_x - 10.0, bar.bottom()),
+                    eframe::egui::pos2(moon_x - 10.0, bar.bottom()),
                 );
                 ui.allocate_ui_at_rect(status_rect, |ui| {
                     ui.with_layout(
@@ -726,11 +884,11 @@ impl GuiApp {
                                 ui.label(
                                     RichText::new(format!("● 传输中 ({active})"))
                                         .size(11.5)
-                                        .color(pal::ACCENT),
+                                        .color(pal::now().accent),
                                 );
                             }
                             ui.label(
-                                RichText::new("●").size(10.0).color(pal::GREEN_DOT),
+                                RichText::new("●").size(10.0).color(pal::now().green_dot),
                             );
                             let paired =
                                 self.paired_devices.load(std::sync::atomic::Ordering::SeqCst);
@@ -739,13 +897,27 @@ impl GuiApp {
                             } else {
                                 format!("运行中 · 端口 {}", self.port)
                             };
-                            ui.label(RichText::new(status).size(11.5).color(pal::GREEN));
+                            ui.label(RichText::new(status).size(11.5).color(pal::now().green));
                         },
                     );
                 });
 
+                // 主题切换（现在深色，点一下变浅色）
+                if theme_button(ui, rect_at(moon_x)) {
+                    self.toggle_theme(ctx);
+                }
+                // 设置
+                if gear_button(ui, rect_at(gear_x)) {
+                    self.toggle_settings(ctx);
+                }
                 // 窗口按钮：关闭 / 最大化 / 最小化
-                if win_button(ui, rect_of(2), "close", WinGlyph::Close, true) {
+                if win_button(
+                    ui,
+                    rect_at(win_base_x + btn_w * 2.0),
+                    "close",
+                    WinGlyph::Close,
+                    true,
+                ) {
                     ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Close);
                 }
                 let glyph = if self.maximized {
@@ -753,17 +925,17 @@ impl GuiApp {
                 } else {
                     WinGlyph::Maximize
                 };
-                if win_button(ui, rect_of(1), "maximize", glyph, false) {
+                if win_button(ui, rect_at(win_base_x + btn_w), "maximize", glyph, false) {
                     self.toggle_maximize(ctx);
                 }
-                if win_button(ui, rect_of(0), "minimize", WinGlyph::Minimize, false) {
+                if win_button(ui, rect_at(win_base_x), "minimize", WinGlyph::Minimize, false) {
                     ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Minimized(true));
                 }
 
                 // 除按钮外整条都是拖动区（按住拖窗口，双击 = 最大化/还原）
                 let drag_rect = eframe::egui::Rect::from_min_max(
                     bar.left_top(),
-                    eframe::egui::pos2(btn_base_x, bar.bottom()),
+                    eframe::egui::pos2(moon_x, bar.bottom()),
                 );
                 let drag = ui.interact(
                     drag_rect,
@@ -784,6 +956,364 @@ impl GuiApp {
         ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Maximized(self.maximized));
         ctx.request_repaint();
     }
+
+    /// 浅色 / 深色来回切
+    fn toggle_theme(&mut self, ctx: &eframe::egui::Context) {
+        let next = match crate::settings::theme() {
+            crate::settings::Theme::Light => crate::settings::Theme::Dark,
+            crate::settings::Theme::Dark => crate::settings::Theme::Light,
+        };
+        crate::settings::set_theme(next);
+        self.settings.theme = next;
+        self.settings.save();
+        ctx.set_visuals(match next {
+            crate::settings::Theme::Light => eframe::egui::Visuals::light(),
+            crate::settings::Theme::Dark => eframe::egui::Visuals::dark(),
+        });
+        ctx.request_repaint();
+    }
+
+    /// 打开 / 关闭设置面板
+    fn toggle_settings(&mut self, ctx: &eframe::egui::Context) {
+        self.settings_open = !self.settings_open;
+        if self.settings_open {
+            // 打开就顺手查一次有没有新版本
+            self.start_update_check(ctx);
+        }
+        ctx.request_repaint();
+    }
+
+    /// 去更新服务器问一次版本号
+    fn start_update_check(&mut self, ctx: &eframe::egui::Context) {
+        let url = self.settings.update_url.clone();
+        let slot = self.update.clone();
+        let ctx = ctx.clone();
+        {
+            let mut g = slot.lock().unwrap();
+            if matches!(*g, crate::update::UpdateStatus::Checking) {
+                return;
+            }
+            *g = crate::update::UpdateStatus::Checking;
+        }
+        std::thread::spawn(move || {
+            let result = match crate::update::fetch_release(&url) {
+                Ok(rel) => {
+                    if crate::update::is_newer(&rel.version, crate::update::APP_VERSION) {
+                        crate::update::UpdateStatus::Available(rel)
+                    } else {
+                        crate::update::UpdateStatus::UpToDate(rel.version)
+                    }
+                }
+                Err(e) if e == crate::update::NO_RELEASE => {
+                    crate::update::UpdateStatus::UpToDate(
+                        crate::update::APP_VERSION.to_string(),
+                    )
+                }
+                Err(e) => crate::update::UpdateStatus::Failed(e),
+            };
+            *slot.lock().unwrap() = result;
+            ctx.request_repaint();
+        });
+    }
+
+    /// 下载新版本并替换掉正在运行的 exe
+    fn start_update_download(&mut self, ctx: &eframe::egui::Context) {
+        let rel = match &*self.update.lock().unwrap() {
+            crate::update::UpdateStatus::Available(r) => r.clone(),
+            _ => return,
+        };
+        let slot = self.update.clone();
+        let ctx = ctx.clone();
+        *slot.lock().unwrap() = crate::update::UpdateStatus::Downloading {
+            received: 0,
+            total: 0,
+        };
+        std::thread::spawn(move || {
+            let tmp = crate::update::temp_download_path();
+            let result = (|| -> Result<(), String> {
+                crate::update::download(&rel.url, &tmp, |received, total| {
+                    *slot.lock().unwrap() = crate::update::UpdateStatus::Downloading {
+                        received,
+                        total,
+                    };
+                    ctx.request_repaint();
+                })?;
+                crate::update::verify(&tmp, &rel.sha256)?;
+                let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+                crate::update::replace_exe(&tmp, &exe)
+            })();
+            *slot.lock().unwrap() = match result {
+                Ok(()) => crate::update::UpdateStatus::Ready,
+                Err(e) => crate::update::UpdateStatus::Failed(e),
+            };
+            ctx.request_repaint();
+        });
+    }
+
+    /// 设置面板：目前只有「关于」一项，顺带放上在线更新
+    fn draw_settings(&mut self, ctx: &eframe::egui::Context) {
+        let p = pal::now();
+
+        let status = self.update.lock().unwrap().clone();
+        let (latest, hint, tone) = match &status {
+            crate::update::UpdateStatus::Idle => (
+                "未检查".to_string(),
+                "点「检查更新」看看有没有新版本".to_string(),
+                p.muted,
+            ),
+            crate::update::UpdateStatus::Checking => (
+                "检查中…".to_string(),
+                "正在连接更新服务器".to_string(),
+                p.muted,
+            ),
+            crate::update::UpdateStatus::UpToDate(v) => {
+                (v.clone(), "已经是最新版本".to_string(), p.green)
+            }
+            crate::update::UpdateStatus::Available(r) => (
+                r.version.clone(),
+                "发现新版本，可以直接更新".to_string(),
+                p.accent,
+            ),
+            crate::update::UpdateStatus::Downloading { received, total } => {
+                let pct = if *total > 0 {
+                    (received * 100 / total).min(100)
+                } else {
+                    0
+                };
+                (
+                    "下载中".to_string(),
+                    format!("已下载 {pct}%"),
+                    p.accent,
+                )
+            }
+            crate::update::UpdateStatus::Ready => (
+                crate::update::APP_VERSION.to_string(),
+                "更新完成，重启后生效".to_string(),
+                p.green,
+            ),
+            crate::update::UpdateStatus::Failed(e) => {
+                ("—".to_string(), e.clone(), p.btn_hover_close)
+            }
+        };
+        let notes = match &status {
+            crate::update::UpdateStatus::Available(r) => r.notes.clone(),
+            _ => None,
+        };
+
+        let mut open = self.settings_open;
+        eframe::egui::Window::new("设置")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(
+                eframe::egui::Align2::CENTER_CENTER,
+                eframe::egui::vec2(0.0, 0.0),
+            )
+            .frame(
+                eframe::egui::Frame::none()
+                    .fill(p.surface)
+                    .rounding(14.0)
+                    .stroke(eframe::egui::Stroke::new(1.0_f32, p.card_border))
+                    .inner_margin(eframe::egui::Margin::same(18.0)),
+            )
+            .show(ctx, |ui| {
+                ui.set_width(340.0);
+
+                // ---- 关于
+                section_label(ui, "关于");
+                ui.add_space(6.0);
+                for (k, v) in about_rows(crate::update::APP_VERSION, &latest) {
+                    kv_row(ui, &k, &v);
+                }
+                ui.add_space(4.0);
+                ui.add(
+                    eframe::egui::Label::new(
+                        RichText::new(&hint).size(11.0).color(tone),
+                    )
+                    .wrap(),
+                );
+                if let Some(n) = &notes {
+                    ui.add_space(6.0);
+                    ui.add(
+                        eframe::egui::Label::new(
+                            RichText::new(n).size(11.0).color(p.muted),
+                        )
+                        .wrap(),
+                    );
+                }
+
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if btn_soft(ui, "检查更新", 12.0, 30.0, 84.0) {
+                        self.start_update_check(ctx);
+                    }
+                    match &status {
+                        crate::update::UpdateStatus::Available(_) => {
+                            if btn_primary(ui, "立即更新", 12.0, 30.0, 84.0) {
+                                self.start_update_download(ctx);
+                            }
+                        }
+                        crate::update::UpdateStatus::Ready => {
+                            if btn_primary(ui, "立即重启", 12.0, 30.0, 84.0) {
+                                crate::update::restart_self();
+                            }
+                        }
+                        _ => {}
+                    }
+                });
+            });
+        self.settings_open = open;
+    }
+
+    /// 拖窗口边缘改大小。
+    ///
+    /// 系统标题栏关掉了，没有系统边框可以拖，所以自己实现：光标靠近边缘时
+    /// 换成缩放光标，按下鼠标后抓住鼠标，按位移算出新的窗口矩形。
+    #[cfg(windows)]
+    fn handle_resize(&mut self, ctx: &eframe::egui::Context) {
+        if self.hwnd == 0 || self.maximized || win_shape::is_zoomed(self.hwnd) {
+            return;
+        }
+        let Some((cx, cy)) = win_shape::cursor_pos() else {
+            return;
+        };
+        let Some((l, t, r, b)) = win_shape::window_rect(self.hwnd) else {
+            return;
+        };
+        let scale = win_shape::dpi(self.hwnd) as f32 / 96.0;
+        let zone = 6.0 * scale;
+
+        // 正在缩放：按光标位移算新矩形
+        if let Some(st) = self.resize {
+            let dx = cx - st.start_cursor.0;
+            let dy = cy - st.start_cursor.1;
+            let min_w = (WIN_MIN_W * scale) as i32;
+            let min_h = (WIN_MIN_H * scale) as i32;
+            let (left, top, right, bottom) =
+                resize_rect(st.start_rect, st.edge, dx, dy, min_w, min_h);
+            win_shape::set_window_rect(self.hwnd, left, top, right - left, bottom - top);
+
+            // 松手就结束
+            if ctx.input(|i| !i.pointer.any_down()) {
+                win_shape::release_capture();
+                self.resize = None;
+            }
+            return;
+        }
+
+        // 没在缩放：看光标是不是在边缘上
+        if cx < l || cx >= r || cy < t || cy >= b {
+            return;
+        }
+        let Some(edge) = detect_edge(cx - l, cy - t, r - l, b - t, zone) else {
+            return;
+        };
+        ctx.set_cursor_icon(edge.cursor());
+        let pressed = ctx.input(|i| {
+            i.pointer.primary_pressed()
+        });
+        if pressed {
+            win_shape::set_capture(self.hwnd);
+            self.resize = Some(ResizeState {
+                edge,
+                start_cursor: (cx, cy),
+                start_rect: (l, t, r, b),
+            });
+        }
+    }
+}
+
+impl ResizeEdge {
+    /// 拖这条边时左边会不会动
+    fn moves_left(self) -> bool {
+        matches!(
+            self,
+            ResizeEdge::Left | ResizeEdge::TopLeft | ResizeEdge::BottomLeft
+        )
+    }
+
+    fn moves_top(self) -> bool {
+        matches!(self, ResizeEdge::TopLeft | ResizeEdge::TopRight)
+    }
+
+    fn cursor(self) -> eframe::egui::CursorIcon {
+        use eframe::egui::CursorIcon;
+        match self {
+            ResizeEdge::Left | ResizeEdge::Right => CursorIcon::ResizeHorizontal,
+            ResizeEdge::Bottom => CursorIcon::ResizeVertical,
+            ResizeEdge::TopLeft | ResizeEdge::BottomRight => CursorIcon::ResizeNwSe,
+            ResizeEdge::TopRight | ResizeEdge::BottomLeft => CursorIcon::ResizeNeSw,
+        }
+    }
+}
+
+/// 光标在窗口的哪条边上（坐标是相对窗口左上角，物理像素）
+fn detect_edge(x: i32, y: i32, w: i32, h: i32, zone: f32) -> Option<ResizeEdge> {
+    let left = x as f32 <= zone;
+    let right = (w - x) as f32 <= zone;
+    let top = y as f32 <= zone;
+    let bottom = (h - y) as f32 <= zone;
+    match (left, right, top, bottom) {
+        (true, _, true, _) => Some(ResizeEdge::TopLeft),
+        (_, true, true, _) => Some(ResizeEdge::TopRight),
+        (true, _, _, true) => Some(ResizeEdge::BottomLeft),
+        (_, true, _, true) => Some(ResizeEdge::BottomRight),
+        (true, _, _, _) => Some(ResizeEdge::Left),
+        (_, true, _, _) => Some(ResizeEdge::Right),
+        (_, _, _, true) => Some(ResizeEdge::Bottom),
+        _ => None,
+    }
+}
+
+/// 拖边缩放：按光标位移算出新的窗口矩形
+///
+/// `start` 是起始矩形（左上右下），`dx/dy` 是光标位移。最小尺寸必须守住 ——
+/// 不然窗口能被拖成一个点。
+fn resize_rect(
+    start: (i32, i32, i32, i32),
+    edge: ResizeEdge,
+    dx: i32,
+    dy: i32,
+    min_w: i32,
+    min_h: i32,
+) -> (i32, i32, i32, i32) {
+    let (mut left, mut top, mut right, mut bottom) = start;
+    match edge {
+        ResizeEdge::Left => left += dx,
+        ResizeEdge::Right => right += dx,
+        ResizeEdge::Bottom => bottom += dy,
+        ResizeEdge::TopLeft => {
+            left += dx;
+            top += dy;
+        }
+        ResizeEdge::TopRight => {
+            right += dx;
+            top += dy;
+        }
+        ResizeEdge::BottomLeft => {
+            left += dx;
+            bottom += dy;
+        }
+        ResizeEdge::BottomRight => {
+            right += dx;
+            bottom += dy;
+        }
+    }
+    if right - left < min_w {
+        if edge.moves_left() {
+            left = right - min_w;
+        } else {
+            right = left + min_w;
+        }
+    }
+    if bottom - top < min_h {
+        if edge.moves_top() {
+            top = bottom - min_h;
+        } else {
+            bottom = top + min_h;
+        }
+    }
+    (left, top, right, bottom)
 }
 
 /// Split a SHA-256 fingerprint ("AA:BB:CC:…") so it fits on one line:
@@ -797,23 +1327,75 @@ fn fingerprint_short(fp: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// palette (light theme)
+// palette (浅色 / 深色两套，标题栏的月亮按钮随时切换)
 
 mod pal {
-    pub const BG: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(0xF4, 0xF5, 0xF9);
-    pub const CARD_BORDER: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(0xE3, 0xE5, 0xEE);
-    pub const FG: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(0x2A, 0x2E, 0x3F);
-    pub const MUTED: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(0x8A, 0x90, 0xA2);
-    pub const ACCENT: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(0x5A, 0x6E, 0xE8);
-    pub const GREEN: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(0x1E, 0x7A, 0x46);
-    pub const GREEN_DOT: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(0x34, 0xC7, 0x7B);
-    pub const SOFT_BG: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(0xEE, 0xF0, 0xF6);
-    pub const SOFT_FG: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(0x4A, 0x4F, 0x66);
-    /// 输入框未聚焦时的边框
-    pub const INPUT_BORDER: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(0xD8, 0xDC, 0xE6);
-    /// 窗口按钮悬停底色（关闭按钮是红的）
-    pub const BTN_HOVER: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(0xE9, 0xEB, 0xF2);
-    pub const BTN_HOVER_CLOSE: eframe::egui::Color32 = eframe::egui::Color32::from_rgb(0xE5, 0x33, 0x2E);
+    use eframe::egui::Color32;
+
+    #[derive(Clone, Copy)]
+    pub struct Palette {
+        /// 窗口底色
+        pub bg: Color32,
+        /// 卡片 / 标题栏底色
+        pub surface: Color32,
+        pub card_border: Color32,
+        pub fg: Color32,
+        pub muted: Color32,
+        pub accent: Color32,
+        pub green: Color32,
+        pub green_dot: Color32,
+        pub soft_bg: Color32,
+        pub soft_fg: Color32,
+        /// 输入框未聚焦时的边框
+        pub input_border: Color32,
+        /// 窗口按钮悬停底色（关闭按钮是红的）
+        pub btn_hover: Color32,
+        pub btn_hover_close: Color32,
+    }
+
+    pub fn light() -> Palette {
+        Palette {
+            bg: Color32::from_rgb(0xF4, 0xF5, 0xF9),
+            surface: Color32::WHITE,
+            card_border: Color32::from_rgb(0xE3, 0xE5, 0xEE),
+            fg: Color32::from_rgb(0x2A, 0x2E, 0x3F),
+            muted: Color32::from_rgb(0x8A, 0x90, 0xA2),
+            accent: Color32::from_rgb(0x5A, 0x6E, 0xE8),
+            green: Color32::from_rgb(0x1E, 0x7A, 0x46),
+            green_dot: Color32::from_rgb(0x34, 0xC7, 0x7B),
+            soft_bg: Color32::from_rgb(0xEE, 0xF0, 0xF6),
+            soft_fg: Color32::from_rgb(0x4A, 0x4F, 0x66),
+            input_border: Color32::from_rgb(0xD8, 0xDC, 0xE6),
+            btn_hover: Color32::from_rgb(0xE9, 0xEB, 0xF2),
+            btn_hover_close: Color32::from_rgb(0xE5, 0x33, 0x2E),
+        }
+    }
+
+    pub fn dark() -> Palette {
+        Palette {
+            bg: Color32::from_rgb(0x1B, 0x1E, 0x27),
+            surface: Color32::from_rgb(0x25, 0x29, 0x34),
+            card_border: Color32::from_rgb(0x35, 0x3A, 0x48),
+            fg: Color32::from_rgb(0xE4, 0xE7, 0xEF),
+            muted: Color32::from_rgb(0x96, 0x9C, 0xB0),
+            accent: Color32::from_rgb(0x7C, 0x8D, 0xFF),
+            green: Color32::from_rgb(0x55, 0xD3, 0x8B),
+            green_dot: Color32::from_rgb(0x3A, 0xD1, 0x86),
+            soft_bg: Color32::from_rgb(0x2E, 0x33, 0x40),
+            soft_fg: Color32::from_rgb(0xC2, 0xC7, 0xD8),
+            input_border: Color32::from_rgb(0x3C, 0x42, 0x52),
+            btn_hover: Color32::from_rgb(0x33, 0x38, 0x47),
+            btn_hover_close: Color32::from_rgb(0xE5, 0x33, 0x2E),
+        }
+    }
+
+    /// 当前主题的配色（每帧取若干次，开销可以忽略）
+    pub fn now() -> Palette {
+        match crate::settings::theme() {
+            crate::settings::Theme::Light => light(),
+            crate::settings::Theme::Dark => dark(),
+        }
+    }
 }
 
 impl App for GuiApp {
@@ -845,6 +1427,17 @@ impl GuiApp {
 
         let url = self.base_url();
         let (shared_text, shared_v) = self.cfg.read_note();
+
+        // 拖边缘改大小（要在画界面之前处理，鼠标指针才换得及时）
+        #[cfg(windows)]
+        self.handle_resize(ctx);
+
+        // Esc 关掉设置面板
+        if self.settings_open
+            && ctx.input(|i| i.key_pressed(eframe::egui::Key::Escape))
+        {
+            self.settings_open = false;
+        }
 
         let refresh_now = self.qr_dirty;
         if self.qr_dirty {
@@ -882,7 +1475,7 @@ impl GuiApp {
         eframe::egui::CentralPanel::default()
             .frame(
                 eframe::egui::Frame::none()
-                    .fill(pal::BG)
+                    .fill(pal::now().bg)
                     .inner_margin(eframe::egui::Margin::symmetric(18.0, 12.0)),
             )
             .show(ctx, |ui| {
@@ -928,7 +1521,7 @@ impl GuiApp {
                                     url_font.clone(),
                                     ui.available_width().max(80.0),
                                 );
-                                ui.label(RichText::new(shown).font(url_font).color(pal::ACCENT));
+                                ui.label(RichText::new(shown).font(url_font).color(pal::now().accent));
                                 // Hotspot / second NIC: the default-route IP may not be
                                 // the one the phone can reach — list all IPs.
                                 if self.ips.len() > 1 {
@@ -943,7 +1536,7 @@ impl GuiApp {
                                         eframe::egui::Label::new(
                                             RichText::new(tip)
                                                 .font(tip_font)
-                                                .color(pal::MUTED),
+                                                .color(pal::now().muted),
                                         )
                                         .wrap(),
                                     );
@@ -956,7 +1549,7 @@ impl GuiApp {
                                     &mut tls_on,
                                     RichText::new("启用 HTTPS（加密传输）")
                                         .size(12.5)
-                                        .color(pal::FG),
+                                        .color(pal::now().fg),
                                 );
                                 if resp.changed() {
                                     self.set_tls(tls_on);
@@ -970,7 +1563,7 @@ impl GuiApp {
                                                 "手机首次打开会提示一次「证书不受信任」：Chrome 点「高级 → 继续前往」，Safari 点「显示详细信息 → 访问此网站」。",
                                             )
                                             .size(10.5)
-                                            .color(pal::MUTED),
+                                            .color(pal::now().muted),
                                         )
                                         .wrap(),
                                     );
@@ -980,13 +1573,13 @@ impl GuiApp {
                                             ui.label(
                                                 RichText::new("证书指纹")
                                                     .size(10.5)
-                                                    .color(pal::MUTED),
+                                                    .color(pal::now().muted),
                                             );
                                             let fp_font = eframe::egui::FontId::monospace(10.0);
                                             ui.label(
                                                 RichText::new(fingerprint_short(&m.fingerprint))
                                                     .font(fp_font)
-                                                    .color(pal::SOFT_FG),
+                                                    .color(pal::now().soft_fg),
                                             );
                                             if btn_link(ui, "复制") {
                                                 ctx.copy_text(m.fingerprint.clone());
@@ -998,7 +1591,7 @@ impl GuiApp {
                                         eframe::egui::Label::new(
                                             RichText::new("不开启时为明文 HTTP，同一网络内可被旁观。")
                                                 .size(10.5)
-                                                .color(pal::MUTED),
+                                                .color(pal::now().muted),
                                         )
                                         .wrap(),
                                     );
@@ -1038,7 +1631,7 @@ impl GuiApp {
                                         ui.available_width().max(60.0),
                                     ))
                                     .font(font)
-                                    .color(pal::FG),
+                                    .color(pal::now().fg),
                                 );
                                 ui.add_space(6.0);
                                 ui.add(
@@ -1047,7 +1640,7 @@ impl GuiApp {
                                             "关闭窗口即停止服务器；「打开」进入目录，「更改」切换位置",
                                         )
                                         .size(11.0)
-                                        .color(pal::MUTED)
+                                        .color(pal::now().muted)
                                         .weak(),
                                     )
                                     .wrap(),
@@ -1069,7 +1662,7 @@ impl GuiApp {
                                 ui.label(
                                     RichText::new("扫码连接  或用配对码")
                                         .size(12.0)
-                                        .color(pal::MUTED),
+                                        .color(pal::now().muted),
                                 );
                                 ui.add_space(8.0);
                                 ui.vertical_centered(|ui| {
@@ -1079,7 +1672,7 @@ impl GuiApp {
                                             .rounding(10.0)
                                             .stroke(eframe::egui::Stroke::new(
                                                 1.0_f32,
-                                                pal::CARD_BORDER,
+                                                pal::now().card_border,
                                             ))
                                             .inner_margin(eframe::egui::Margin::same(8.0))
                                             .show(ui, |ui| {
@@ -1102,14 +1695,14 @@ impl GuiApp {
                                         ui.label(
                                             RichText::new("配对码")
                                                 .size(11.0)
-                                                .color(pal::MUTED),
+                                                .color(pal::now().muted),
                                         );
                                         ui.label(
                                             RichText::new(&self.pair_code)
                                                 .size(20.0)
                                                 .strong()
                                                 .monospace()
-                                                .color(pal::FG),
+                                                .color(pal::now().fg),
                                         );
                                     });
                                     code_rect = row.response.rect;
@@ -1128,7 +1721,7 @@ impl GuiApp {
                                     ui.label(
                                         RichText::new(&self.pair_msg)
                                             .size(10.5)
-                                            .color(pal::MUTED),
+                                            .color(pal::now().muted),
                                     );
                                 }
                             });
@@ -1164,13 +1757,13 @@ impl GuiApp {
                                         ui.label(
                                             RichText::new(&self.note_status)
                                                 .size(11.5)
-                                                .color(pal::ACCENT),
+                                                .color(pal::now().accent),
                                         );
                                     } else {
                                         ui.label(
                                             RichText::new("自动同步 · 不限长度")
                                                 .size(11.0)
-                                                .color(pal::MUTED),
+                                                .color(pal::now().muted),
                                         );
                                     }
                                 },
@@ -1199,7 +1792,7 @@ impl GuiApp {
                                         ui.label(
                                             RichText::new("Ctrl+Enter 可快捷发送")
                                                 .size(11.0)
-                                                .color(pal::MUTED),
+                                                .color(pal::now().muted),
                                         );
                                         hit
                                     },
@@ -1245,18 +1838,23 @@ impl GuiApp {
             // the window stays idle — no constant full redraw, so no flicker.
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
+
+        // 设置面板浮在最上面
+        if self.settings_open {
+            self.draw_settings(ctx);
+        }
     }
 }
 
 // ---------------------------------------------------------------------------
 // layout helpers
 
-/// White rounded card with a 1px border and bottom spacing.
+/// Rounded card with a 1px border and bottom spacing.
 fn card(ui: &mut eframe::egui::Ui, add: impl FnOnce(&mut eframe::egui::Ui)) {
     eframe::egui::Frame::none()
-        .fill(eframe::egui::Color32::WHITE)
+        .fill(pal::now().surface)
         .rounding(12.0)
-        .stroke(eframe::egui::Stroke::new(1.0_f32, pal::CARD_BORDER))
+        .stroke(eframe::egui::Stroke::new(1.0_f32, pal::now().card_border))
         .inner_margin(eframe::egui::Margin::same(14.0))
         .outer_margin(eframe::egui::Margin {
             left: 0.0,
@@ -1268,7 +1866,26 @@ fn card(ui: &mut eframe::egui::Ui, add: impl FnOnce(&mut eframe::egui::Ui)) {
 }
 
 fn section_label(ui: &mut eframe::egui::Ui, text: &str) {
-    ui.label(RichText::new(text).size(12.0).color(pal::MUTED));
+    ui.label(RichText::new(text).size(12.0).color(pal::now().muted));
+}
+
+/// 设置面板里「关于」这几行的内容
+///
+/// 单独拆出来：版本号是这面板上最重要的信息，得能单独测。
+fn about_rows(current: &str, latest: &str) -> Vec<(String, String)> {
+    vec![
+        ("应用".to_string(), "TransData".to_string()),
+        ("当前版本".to_string(), current.to_string()),
+        ("最新版本".to_string(), latest.to_string()),
+    ]
+}
+
+/// 设置面板里的一行「名字 — 值」
+fn kv_row(ui: &mut eframe::egui::Ui, key: &str, value: &str) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(key).size(12.0).color(pal::now().muted));
+        ui.label(RichText::new(value).size(12.0).color(pal::now().fg));
+    });
 }
 
 /// Accent-filled primary button.
@@ -1280,7 +1897,7 @@ fn btn_primary(ui: &mut eframe::egui::Ui, label: &str, size: f32, h: f32, w: f32
                 .strong()
                 .color(eframe::egui::Color32::WHITE),
         )
-        .fill(pal::ACCENT)
+        .fill(pal::now().accent)
         .rounding(8.0)
         .min_size(eframe::egui::vec2(w, h)),
     )
@@ -1290,8 +1907,8 @@ fn btn_primary(ui: &mut eframe::egui::Ui, label: &str, size: f32, h: f32, w: f32
 /// Soft gray secondary button.
 fn btn_soft(ui: &mut eframe::egui::Ui, label: &str, size: f32, h: f32, w: f32) -> bool {
     ui.add(
-        eframe::egui::Button::new(RichText::new(label).size(size).color(pal::SOFT_FG))
-            .fill(pal::SOFT_BG)
+        eframe::egui::Button::new(RichText::new(label).size(size).color(pal::now().soft_fg))
+            .fill(pal::now().soft_bg)
             .rounding(8.0)
             .min_size(eframe::egui::vec2(w, h)),
     )
@@ -1301,7 +1918,7 @@ fn btn_soft(ui: &mut eframe::egui::Ui, label: &str, size: f32, h: f32, w: f32) -
 /// Small text-only button (no background) — used next to labels.
 fn btn_link(ui: &mut eframe::egui::Ui, label: &str) -> bool {
     ui.add(
-        eframe::egui::Button::new(RichText::new(label).size(11.0).color(pal::ACCENT))
+        eframe::egui::Button::new(RichText::new(label).size(11.0).color(pal::now().accent))
             .fill(eframe::egui::Color32::TRANSPARENT)
             .stroke(eframe::egui::Stroke::NONE)
             .rounding(6.0)
@@ -1327,6 +1944,128 @@ enum WinGlyph {
     Close,
 }
 
+/// 标题栏的主题按钮：现在是浅色就画月亮（点了变深色），深色就画太阳。
+fn theme_button(ui: &mut eframe::egui::Ui, rect: eframe::egui::Rect) -> bool {
+    let resp = ui.interact(
+        rect,
+        ui.id().with("theme_button"),
+        eframe::egui::Sense::click(),
+    );
+    if resp.hovered() {
+        ui.painter()
+            .rect_filled(rect, 0.0, pal::now().btn_hover);
+    }
+    let c = rect.center();
+    let color = if resp.hovered() {
+        pal::now().fg
+    } else {
+        pal::now().soft_fg
+    };
+    match crate::settings::theme() {
+        crate::settings::Theme::Light => {
+            // 月牙：外圆减去一个偏心的内圆
+            let pts = crescent_points(c, 6.2);
+            ui.painter().add(eframe::egui::Shape::convex_polygon(
+                pts,
+                color,
+                eframe::egui::Stroke::NONE,
+            ));
+        }
+        crate::settings::Theme::Dark => {
+            // 太阳：一个圆加八根光线
+            ui.painter().circle_filled(c, 3.2, color);
+            let stroke = eframe::egui::Stroke::new(1.1_f32, color);
+            for i in 0..8 {
+                let a = i as f32 * std::f32::consts::PI / 4.0;
+                let d = eframe::egui::vec2(a.cos(), a.sin());
+                ui.painter()
+                    .line_segment([c + d * 5.2, c + d * 7.6], stroke);
+            }
+        }
+    }
+    resp.clicked()
+}
+
+/// 月牙的轮廓点（外圆减掉一个偏心的内圆）
+fn crescent_points(center: eframe::egui::Pos2, r: f32) -> Vec<eframe::egui::Pos2> {
+    let r1 = r;
+    // 内圆跟外圆差不多大、偏心一些，挖出来的月牙才细
+    let r2 = r * 0.98;
+    let d = r * 0.55;
+    let a = (d * d - r2 * r2 + r1 * r1) / (2.0 * d);
+    let h2 = r1 * r1 - a * a;
+    if h2 <= 0.0 {
+        return vec![center];
+    }
+    let h = h2.sqrt();
+    let th = h.atan2(a);
+    let phi = h.atan2(a - d);
+    let n = 24;
+    let mut pts = Vec::with_capacity((n + 1) * 2);
+    // 外圈：从右上绕左边到右下
+    for i in 0..=n {
+        let t = th + (2.0 * std::f32::consts::PI - 2.0 * th) * (i as f32 / n as f32);
+        pts.push(center + eframe::egui::vec2(r1 * t.cos(), -r1 * t.sin()));
+    }
+    // 内圈：从右下绕回来（反向），把月牙的肚子挖出来
+    let t0 = 2.0 * std::f32::consts::PI - phi;
+    for i in 0..=n {
+        let t = t0 + (phi - t0) * (i as f32 / n as f32);
+        pts.push(center + eframe::egui::vec2(d + r2 * t.cos(), -r2 * t.sin()));
+    }
+    pts
+}
+
+/// 标题栏的设置按钮（齿轮）
+fn gear_button(ui: &mut eframe::egui::Ui, rect: eframe::egui::Rect) -> bool {
+    let resp = ui.interact(
+        rect,
+        ui.id().with("gear_button"),
+        eframe::egui::Sense::click(),
+    );
+    if resp.hovered() {
+        ui.painter()
+            .rect_filled(rect, 0.0, pal::now().btn_hover);
+    }
+    let c = rect.center();
+    let color = if resp.hovered() {
+        pal::now().fg
+    } else {
+        pal::now().soft_fg
+    };
+    // 齿轮：中间一个圆盘 + 八个方齿 + 中间的孔
+    ui.painter().circle_filled(c, 4.4, color);
+    for i in 0..8 {
+        let a = i as f32 * std::f32::consts::PI / 4.0;
+        let (s, co) = (a.sin(), a.cos());
+        let mid = c + eframe::egui::vec2(co, s) * 5.1;
+        let half = 1.25;
+        let corners = [
+            eframe::egui::vec2(-half, -half),
+            eframe::egui::vec2(half, -half),
+            eframe::egui::vec2(half, half),
+            eframe::egui::vec2(-half, half),
+        ];
+        let pts: Vec<eframe::egui::Pos2> = corners
+            .iter()
+            .map(|v| {
+                mid + eframe::egui::vec2(
+                    v.x * co - v.y * s,
+                    v.x * s + v.y * co,
+                )
+            })
+            .collect();
+        ui.painter().add(eframe::egui::Shape::convex_polygon(
+            pts,
+            color,
+            eframe::egui::Stroke::NONE,
+        ));
+    }
+    // 中间的孔
+    ui.painter().circle_filled(c, 1.7, pal::now().surface);
+    resp.clicked()
+}
+
 /// Draw one window button (Windows-11-ish: no border, hover highlight,
 /// close turns red). Returns true when clicked.
 fn win_button(
@@ -1342,16 +2081,16 @@ fn win_button(
             rect,
             0.0,
             if is_close {
-                pal::BTN_HOVER_CLOSE
+                pal::now().btn_hover_close
             } else {
-                pal::BTN_HOVER
+                pal::now().btn_hover
             },
         );
     }
     let fg = if resp.hovered() && is_close {
         eframe::egui::Color32::WHITE
     } else {
-        pal::SOFT_FG
+        pal::now().soft_fg
     };
     let stroke = eframe::egui::Stroke::new(1.1_f32, fg);
     let c = rect.center();
@@ -1546,13 +2285,13 @@ fn note_text_edit(
     };
     // 聚焦时用主色描边，替代 egui 默认的深灰（看着像黑框）
     let border = if *focused {
-        pal::ACCENT
+        pal::now().accent
     } else {
-        pal::INPUT_BORDER
+        pal::now().input_border
     };
     let mut resp = None;
     eframe::egui::Frame::none()
-        .fill(pal::SOFT_BG)
+        .fill(pal::now().soft_bg)
         .rounding(10.0)
         .stroke(eframe::egui::Stroke::new(1.0_f32, border))
         .inner_margin(eframe::egui::Margin::symmetric(10.0, 8.0))
@@ -1614,6 +2353,10 @@ mod tests {
             9999,
             std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            crate::settings::Settings::load(),
+            std::sync::Arc::new(std::sync::Mutex::new(
+                crate::update::UpdateStatus::Idle,
+            )),
             #[cfg(windows)]
             0,
         );
@@ -1623,15 +2366,79 @@ mod tests {
             cfg.set_tls(true);
             app.qr_dirty = true;
         }
+        render_png(&ctx, &mut app, "target/gui_render.png");
+    }
+
+    /// 深色模式 + 设置面板长什么样
+    #[test]
+    #[ignore]
+    fn render_dark_and_settings() {
+        let ctx = egui::Context::default();
+        let mut style = (*ctx.style()).clone();
+        style.visuals = egui::Visuals::dark();
+        ctx.set_style(style);
+        if let Some((bytes, index)) = cjk_font() {
+            let font_data = eframe::egui::FontData {
+                font: std::borrow::Cow::Owned(bytes),
+                index,
+                tweak: eframe::egui::FontTweak::default(),
+            };
+            let mut definitions = eframe::egui::FontDefinitions::default();
+            definitions.font_data.insert("cjk".to_owned(), font_data);
+            definitions
+                .families
+                .insert(egui::FontFamily::Proportional, vec!["cjk".to_owned()]);
+            ctx.set_fonts(definitions);
+        }
+        crate::settings::set_theme(crate::settings::Theme::Dark);
+        let mut app = GuiApp::new(
+            std::sync::Arc::new(Config::new()),
+            9999,
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            crate::settings::Settings {
+                theme: crate::settings::Theme::Dark,
+                update_url: String::new(),
+            },
+            std::sync::Arc::new(std::sync::Mutex::new(
+                crate::update::UpdateStatus::Idle,
+            )),
+            #[cfg(windows)]
+            0,
+        );
+        render_png(&ctx, &mut app, "target/gui_dark.png");
+        // 设置面板：浅色 + 有新版本的状态
+        crate::settings::set_theme(crate::settings::Theme::Light);
+        app.settings.theme = crate::settings::Theme::Light;
+        *app.update.lock().unwrap() = crate::update::UpdateStatus::Available(
+            crate::update::Release {
+                version: "9.9.9".to_string(),
+                url: "http://127.0.0.1:1/app.exe".to_string(),
+                sha256: None,
+                notes: Some("这是测试用的更新说明".to_string()),
+            },
+        );
+        app.settings_open = true;
+        render_png(&ctx, &mut app, "target/gui_settings.png");
+        crate::settings::set_theme(crate::settings::Theme::Light);
+    }
+
+    /// 画一帧并渲染成 PNG
+    ///
+    /// 连画好几帧：设置面板是带淡入动画的，只画一帧的话它还没出现。
+    fn render_png(ctx: &egui::Context, app: &mut GuiApp, path: &str) {
         let mut input = egui::RawInput::default();
         input.screen_rect = Some(egui::Rect::from_min_size(
             egui::pos2(0.0, 0.0),
             egui::vec2(WIN_W, WIN_H),
         ));
-        let out = ctx.run(input, |ctx| {
-            app.draw(ctx);
-        });
-        let _ = &out;
+        let mut out = egui::FullOutput::default();
+        for i in 0..20 {
+            input.time = Some(i as f64 * 0.05);
+            out = ctx.run(input.clone(), |ctx| {
+                app.draw(ctx);
+            });
+        }
         let shapes = ctx.tessellate(out.shapes, out.pixels_per_point);
         let mut img = image::RgbaImage::from_pixel(
             WIN_W as u32,
@@ -1685,11 +2492,196 @@ mod tests {
                 }
             }
         }
-        img.save("target/gui_render.png").unwrap();
-        println!("saved target/gui_render.png");
+        img.save(path).unwrap();
+        println!("saved {path}");
     }
 
     /// 真实窗口尺寸见模块顶部的 WIN_W / WIN_H
+
+    /// 拖边缩放：边缘要认得对，最小尺寸也要守得住
+    #[test]
+    fn resize_edges_and_min_size() {
+        // 800x600 的窗口，边缘感应宽度 6 像素
+        let w = 800;
+        let h = 600;
+        let zone = 6.0;
+        assert_eq!(detect_edge(2, 300, w, h, zone), Some(ResizeEdge::Left));
+        assert_eq!(detect_edge(797, 300, w, h, zone), Some(ResizeEdge::Right));
+        assert_eq!(detect_edge(400, 597, w, h, zone), Some(ResizeEdge::Bottom));
+        assert_eq!(detect_edge(2, 2, w, h, zone), Some(ResizeEdge::TopLeft));
+        assert_eq!(
+            detect_edge(797, 2, w, h, zone),
+            Some(ResizeEdge::TopRight)
+        );
+        assert_eq!(
+            detect_edge(2, 597, w, h, zone),
+            Some(ResizeEdge::BottomLeft)
+        );
+        // 中间不是边
+        assert_eq!(detect_edge(400, 300, w, h, zone), None);
+
+        // 拖右边 100 像素 → 宽 +100
+        let start = (100, 100, 900, 700);
+        assert_eq!(
+            resize_rect(start, ResizeEdge::Right, 100, 0, 640, 470),
+            (100, 100, 1000, 700)
+        );
+
+        // 拖左边 -50 → 左边往右挪，宽 +50
+        assert_eq!(
+            resize_rect(start, ResizeEdge::Left, -50, 0, 640, 470),
+            (50, 100, 900, 700)
+        );
+
+        // 拖到比最小尺寸还小：守住下限
+        let (l, _t, r, _b) = resize_rect(start, ResizeEdge::Right, -1000, 0, 640, 470);
+        assert_eq!(r - l, 640, "宽度不能小于最小值");
+        let (l, _t, r, _b) = resize_rect(start, ResizeEdge::Left, 1000, 0, 640, 470);
+        assert_eq!(r - l, 640, "宽度不能小于最小值");
+        let (_l, t, _r, b) = resize_rect(start, ResizeEdge::Bottom, 0, -1000, 640, 470);
+        assert_eq!(b - t, 470, "高度不能小于最小值");
+    }
+
+    /// 标题栏里月亮 / 齿轮按钮的位置（逻辑坐标，窗口左上角为原点）
+    ///
+    /// 和 draw_titlebar 里算的一样：窗口右边的三个是 最小化/最大化/关闭，
+    /// 往左是 设置(齿轮) 和 主题(月亮)。
+    fn titlebar_button_pos(which: &str) -> (f32, f32) {
+        let btn_w = 36.0_f32;
+        let win_base_x = WIN_W - btn_w * 3.0;
+        let gear_x = win_base_x - 10.0 - btn_w;
+        let moon_x = gear_x - btn_w;
+        let y = 1.0 + (TITLEBAR_H - 2.0) / 2.0;
+        match which {
+            "moon" => (moon_x + btn_w / 2.0, y),
+            "gear" => (gear_x + btn_w / 2.0, y),
+            _ => (0.0, 0.0),
+        }
+    }
+
+    /// 造一帧「鼠标移到 (x,y) 然后点一下」的输入
+    fn click_input(x: f32, y: f32) -> egui::RawInput {
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(WIN_W, WIN_H),
+        ));
+        input.events.push(egui::Event::PointerMoved(egui::pos2(x, y)));
+        input.events.push(egui::Event::PointerButton {
+            pos: egui::pos2(x, y),
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::default(),
+        });
+        input.events.push(egui::Event::PointerButton {
+            pos: egui::pos2(x, y),
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::default(),
+        });
+        input
+    }
+
+    /// 一个不联网、不写文件的测试用窗口
+    fn test_app(ctx: &egui::Context) -> GuiApp {
+        let mut style = (*ctx.style()).clone();
+        style.visuals = egui::Visuals::light();
+        ctx.set_style(style);
+        if let Some((bytes, index)) = cjk_font() {
+            let font_data = eframe::egui::FontData {
+                font: std::borrow::Cow::Owned(bytes),
+                index,
+                tweak: eframe::egui::FontTweak::default(),
+            };
+            let mut definitions = eframe::egui::FontDefinitions::default();
+            definitions.font_data.insert("cjk".to_owned(), font_data);
+            definitions
+                .families
+                .insert(egui::FontFamily::Proportional, vec!["cjk".to_owned()]);
+            ctx.set_fonts(definitions);
+        }
+        GuiApp::new(
+            std::sync::Arc::new(Config::new()),
+            9999,
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            crate::settings::Settings {
+                theme: crate::settings::Theme::Light,
+                update_url: String::new(),
+            },
+            std::sync::Arc::new(std::sync::Mutex::new(
+                crate::update::UpdateStatus::Idle,
+            )),
+            #[cfg(windows)]
+            0,
+        )
+    }
+
+    /// 标题栏上的月亮（切深浅色）和齿轮（打开设置）必须真的能点
+    #[test]
+    fn titlebar_buttons_work() {
+        let ctx = egui::Context::default();
+        crate::settings::set_theme(crate::settings::Theme::Light);
+        let mut app = test_app(&ctx);
+
+        // 先画一帧，让布局稳定
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(WIN_W, WIN_H),
+                )),
+                ..Default::default()
+            },
+            |ctx| app.draw(ctx),
+        );
+
+        // 点月亮 → 变深色
+        let (mx, my) = titlebar_button_pos("moon");
+        let _ = ctx.run(click_input(mx, my), |ctx| app.draw(ctx));
+        assert_eq!(
+            crate::settings::theme(),
+            crate::settings::Theme::Dark,
+            "点月亮应该切到深色"
+        );
+
+        // 点齿轮 → 打开设置面板
+        let (gx, gy) = titlebar_button_pos("gear");
+        let _ = ctx.run(click_input(gx, gy), |ctx| app.draw(ctx));
+        assert!(app.settings_open, "点齿轮应该打开设置面板");
+
+        // 复原（别把用户的设置改掉）
+        crate::settings::set_theme(crate::settings::Theme::Light);
+        app.settings.theme = crate::settings::Theme::Light;
+        app.settings.save();
+    }
+
+    /// 设置面板里能看到版本号（关于）
+    #[test]
+    fn settings_panel_shows_version() {
+        let rows = about_rows(crate::update::APP_VERSION, "9.9.9");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[1].0, "当前版本");
+        assert_eq!(rows[1].1, crate::update::APP_VERSION);
+        assert_eq!(rows[2].1, "9.9.9");
+
+        // 面板能打开、也不崩
+        let ctx = egui::Context::default();
+        crate::settings::set_theme(crate::settings::Theme::Light);
+        let mut app = test_app(&ctx);
+        app.settings_open = true;
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::pos2(0.0, 0.0),
+                    egui::vec2(WIN_W, WIN_H),
+                )),
+                ..Default::default()
+            },
+            |ctx| app.draw(ctx),
+        );
+        assert!(app.settings_open);
+    }
 
     /// 模拟一帧布局，返回 (输入框宽, 内容占位高, 按钮 x, 按钮 y)。
     /// `fixed` = 走修复后的 note_text_edit（限高 + 圆角外框 + 任意断行）。
