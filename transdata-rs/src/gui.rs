@@ -1081,7 +1081,8 @@ impl GuiApp {
                 // 卡片高度 = 剩余空间，输入框把剩余高度吃掉，窗口底部不留空白。
                 let leftover = ui.available_height();
                 // 输入框吃掉剩余空间（窗口最大化时输入框变高，中间不留灰洞）
-                let input_h = (leftover - 92.0).clamp(88.0, 360.0);
+                // 94 = 卡片内边距 28 + 标题行 18 + 两处 8 + 按钮行 32
+                let input_h = (leftover - 94.0).clamp(80.0, 360.0);
                 ui.with_layout(
                     eframe::egui::Layout::bottom_up(eframe::egui::Align::Min),
                     |ui| {
@@ -1095,11 +1096,20 @@ impl GuiApp {
                             ui.with_layout(
                                 eframe::egui::Layout::right_to_left(eframe::egui::Align::Center),
                                 |ui| {
-                                    ui.label(
-                                        RichText::new("自动同步 · 不限长度")
-                                            .size(11.0)
-                                            .color(pal::MUTED),
-                                    );
+                                    // 状态提示放在标题行右侧：放按钮下面会被窗口底边裁掉
+                                    if !self.note_status.is_empty() {
+                                        ui.label(
+                                            RichText::new(&self.note_status)
+                                                .size(11.5)
+                                                .color(pal::ACCENT),
+                                        );
+                                    } else {
+                                        ui.label(
+                                            RichText::new("自动同步 · 不限长度")
+                                                .size(11.0)
+                                                .color(pal::MUTED),
+                                        );
+                                    }
                                 },
                             );
                         });
@@ -1157,12 +1167,6 @@ impl GuiApp {
                         if changed {
                             // 只有真的敲了字才留一份本地副本（每帧拷贝大文本是浪费）
                             self.note_local = Some(self.text_buf.clone());
-                        }
-                        if !self.note_status.is_empty() {
-                            ui.add_space(6.0);
-                            ui.label(
-                                RichText::new(&self.note_status).size(11.0).color(pal::MUTED),
-                            );
                         }
                     });
                         },
