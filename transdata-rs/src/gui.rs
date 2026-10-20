@@ -75,6 +75,11 @@ pub fn run_gui(cfg: Arc<Config>, port: u16) {
     let ctx_holder_thread = ctx_holder.clone();
     let ctx_holder_gui = ctx_holder.clone();
     let port_thread = port;
+    // Number of transfers currently in flight (the status dot in the window).
+    let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let active_thread = active.clone();
+    let active_gui = active.clone();
+    let token_thread = cfg.token.clone();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -87,7 +92,12 @@ pub fn run_gui(cfg: Arc<Config>, port: u16) {
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         };
-        rt.spawn(ws_note_client(gui_ctx, port_thread));
+        rt.spawn(ws_note_client(
+            gui_ctx,
+            port_thread,
+            token_thread,
+            active_thread,
+        ));
         rt.block_on(crate::http::server::serve(cfg_server));
     });
 
@@ -134,7 +144,7 @@ pub fn run_gui(cfg: Arc<Config>, port: u16) {
                 );
                 cc.egui_ctx.set_fonts(definitions);
             }
-            Ok(Box::new(GuiApp::new(cc, cfg_gui, port)))
+            Ok(Box::new(GuiApp::new(cc, cfg_gui, port, active_gui)))
         }),
     )
     .expect("eframe run failed");
@@ -153,12 +163,22 @@ struct GuiApp {
     /// 快捷文本：Some = 本地有未发送的编辑；None = 跟随共享文本。
     /// 远端内容到达时直接覆盖（note_local 被丢弃）。
     note_local: Option<String>,
+    /// 编辑框里正在显示的内容。单独存一份，避免每帧克隆整段文本
+    /// （打字时光标闪烁 60fps，长文本会被反复拷贝）。
+    text_buf: String,
     note_last_v: u64,
     note_status: String,
+    /// 正在进行的传输数量（由后台线程每 2 秒轮询 /info 更新）。
+    active_transfers: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl GuiApp {
-    fn new(_cc: &CreationContext, cfg: Arc<Config>, port: u16) -> Self {
+    fn new(
+        _cc: &CreationContext,
+        cfg: Arc<Config>,
+        port: u16,
+        active_transfers: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
         let (_, last_v) = cfg.read_note();
         Self {
             cfg,
@@ -168,8 +188,10 @@ impl GuiApp {
             qr_dirty: true,
             ips: crate::net::all_ipv4s(),
             note_local: None,
+            text_buf: String::new(),
             note_last_v: last_v,
             note_status: String::new(),
+            active_transfers,
         }
     }
 
@@ -231,7 +253,17 @@ impl App for GuiApp {
             self.refresh_qr(ctx);
         }
 
-        let mut text = self.note_local.clone().unwrap_or(shared_text);
+        // A newer version on the server wins: remote content overwrites the
+        // local edit (两端同步规则).
+        if shared_v != self.note_last_v {
+            self.note_last_v = shared_v;
+            self.note_local = None;
+            self.text_buf = shared_text.as_ref().clone();
+            self.note_status = "已收到对方内容".to_string();
+        } else if self.text_buf.is_empty() && self.note_local.is_none() {
+            // First frame: show whatever the server already has.
+            self.text_buf = shared_text.as_ref().clone();
+        }
 
         eframe::egui::CentralPanel::default()
             .frame(
@@ -253,6 +285,17 @@ impl App for GuiApp {
                         |ui| {
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 6.0;
+                                // 传输中：手机/浏览器在传文件时亮起来
+                                let active = self
+                                    .active_transfers
+                                    .load(std::sync::atomic::Ordering::SeqCst);
+                                if active > 0 {
+                                    ui.label(
+                                        RichText::new(format!("● 传输中 ({active})"))
+                                            .size(12.0)
+                                            .color(pal::ACCENT),
+                                    );
+                                }
                                 ui.label(
                                     RichText::new("●").size(10.0).color(pal::GREEN_DOT),
                                 );
@@ -466,10 +509,9 @@ impl App for GuiApp {
                         );
                     });
                     ui.add_space(8.0);
-                    let before = text.clone();
                     // 固定最大高度 + 框内滚动：粘贴长文本也不会把下面的按钮顶出窗口
-                    note_text_edit(ui, &mut text, 120.0);
-                    let changed = text != before;
+                    let resp = note_text_edit(ui, &mut self.text_buf, 120.0);
+                    let changed = resp.changed;
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         let copy_hit = btn_soft(ui, "复制", 13.0, 32.0, 88.0);
@@ -491,9 +533,8 @@ impl App for GuiApp {
                             )
                             .inner;
                         if copy_hit {
-                            win32_set_clipboard(&text);
+                            win32_set_clipboard(&self.text_buf);
                             self.note_local = None;
-                            self.note_last_v = shared_v;
                             self.note_status = "已复制到剪贴板".to_string();
                         }
                         // Ctrl+Enter 快捷键直接发送（顺带吞掉该按键，避免 TextEdit 插入换行）
@@ -507,21 +548,15 @@ impl App for GuiApp {
                             });
                         }
                         if send_hit || ctrl_enter {
-                            let t = text.clone();
-                            let v = self.cfg.store_note(&t);
+                            let v = self.cfg.store_note(&self.text_buf);
                             self.note_local = None;
                             self.note_last_v = v;
                             self.note_status = "已发送，另一端将自动填入".to_string();
                         }
                     });
                     if changed {
-                        self.note_local = Some(text.clone());
-                    }
-                    // Remote content always overwrites local edits.
-                    if shared_v != self.note_last_v {
-                        self.note_last_v = shared_v;
-                        self.note_local = None;
-                        self.note_status = "已收到对方内容".to_string();
+                        // 只有真的敲了字才留一份本地副本（每帧拷贝大文本是浪费）
+                        self.note_local = Some(self.text_buf.clone());
                     }
                     if !self.note_status.is_empty() {
                         ui.add_space(6.0);
@@ -691,24 +726,56 @@ fn win32_set_clipboard(_text: &str) {}
 
 /// Live note client: stays connected to our own /ws endpoint and repaints the
 /// GUI whenever remote note content arrives. Reconnects automatically.
-async fn ws_note_client(ctx: eframe::egui::Context, port: u16) {
+///
+/// It also polls `/info` every two seconds to learn how many transfers are in
+/// flight, so the window can show a "传输中" hint (the transfers themselves
+/// happen in the browser — the desktop app would otherwise look idle while
+/// files are moving).
+async fn ws_note_client(
+    ctx: eframe::egui::Context,
+    port: u16,
+    token: String,
+    active: Arc<std::sync::atomic::AtomicUsize>,
+) {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message as WsMsg;
 
     loop {
-        match tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/ws")).await {
+        match tokio_tungstenite::connect_async(format!(
+            "ws://127.0.0.1:{port}/ws?t={token}"
+        ))
+        .await
+        {
             Ok((mut ws, _)) => {
-                while let Some(msg) = ws.next().await {
-                    match msg {
-                        Ok(WsMsg::Text(_) | WsMsg::Binary(_)) => {
-                            let _ = ctx.request_repaint();
+                // While the socket is open, poll the transfer counter.
+                let mut poll = tokio::time::interval(std::time::Duration::from_secs(2));
+                poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    tokio::select! {
+                        msg = ws.next() => {
+                            match msg {
+                                Some(Ok(WsMsg::Text(_) | WsMsg::Binary(_))) => {
+                                    let _ = ctx.request_repaint();
+                                }
+                                Some(Ok(WsMsg::Ping(p))) => {
+                                    let _ = ws.send(WsMsg::Pong(p)).await;
+                                }
+                                Some(Ok(WsMsg::Close(_))) => break,
+                                Some(Ok(_)) => {}
+                                Some(Err(_)) => break,
+                                None => break,
+                            }
                         }
-                        Ok(WsMsg::Ping(p)) => {
-                            let _ = ws.send(WsMsg::Pong(p)).await;
+                        _ = poll.tick() => {
+                            if let Some(n) = fetch_active(port, &token).await {
+                                if active
+                                    .swap(n, std::sync::atomic::Ordering::SeqCst)
+                                    != n
+                                {
+                                    let _ = ctx.request_repaint();
+                                }
+                            }
                         }
-                        Ok(WsMsg::Close(_)) => break,
-                        Ok(_) => {}
-                        Err(_) => break,
                     }
                 }
             }
@@ -718,6 +785,37 @@ async fn ws_note_client(ctx: eframe::egui::Context, port: u16) {
         }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
+}
+
+/// Ask the local server how many transfers are in flight.
+async fn fetch_active(port: u16, token: &str) -> Option<usize> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.ok()?;
+    let req = format!(
+        "GET /info HTTP/1.1\r\nHost: 127.0.0.1\r\nX-TD-Token: {token}\r\nConnection: close\r\n\r\n"
+    );
+    sock.write_all(req.as_bytes()).await.ok()?;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = sock.read(&mut chunk).await.ok()?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if buf.len() > 64 * 1024 {
+            break;
+        }
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let body = text.split("\r\n\r\n").nth(1)?;
+    // "active":3
+    let idx = body.find("\"active\":")? + 9;
+    let rest = &body[idx..];
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest[..end].parse::<usize>().ok()
 }
 
 fn choose_dir() -> Option<PathBuf> {

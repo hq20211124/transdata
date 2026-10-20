@@ -47,6 +47,15 @@
         .delete-btn { padding: 3px 10px; background: white; color: #dc3545; border: 1px solid #f1b2b7; border-radius: 6px; cursor: pointer; font-size: 12px; margin-left: 6px; white-space: nowrap; }
         .rm-btn { flex-shrink: 0; margin-left: 8px; width: 24px; height: 24px; border: none; border-radius: 50%; background: #e9ecef; color: #555; font-size: 14px; line-height: 1; cursor: pointer; }
         .rm-btn:hover { background: #dc3545; color: white; }
+        /* 传输进度条 */
+        .progress { margin-top: 8px; display: none; }
+        .progress.show { display: block; }
+        .bar-wrap { height: 8px; background: #e9ecef; border-radius: 6px; overflow: hidden; }
+        .bar { height: 100%; width: 0; background: linear-gradient(90deg, #667eea, #764ba2); border-radius: 6px; transition: width 0.15s linear; }
+        .progress-text { display: flex; justify-content: space-between; font-size: 11px; color: #999; margin-top: 4px; }
+        .btn-ghost { padding: 3px 10px; background: white; color: #667eea; border: 1px solid #c5cad8; border-radius: 6px; cursor: pointer; font-size: 12px; white-space: nowrap; font-weight: 600; text-decoration: none; }
+        .btn-ghost:hover { background: #f0f2ff; }
+        .note-meta { font-size: 11px; color: #999; }
     </style>
 </head>
 <body>
@@ -73,6 +82,13 @@
                 <input type="file" id="folderInput" webkitdirectory multiple onchange="handleFolderSelect(event)">
                 <div class="file-list" id="fileList"></div>
                 <button class="btn" id="uploadBtn" onclick="uploadFiles()" disabled>确认</button>
+                <div class="progress" id="uploadProgress">
+                    <div class="bar-wrap"><div class="bar" id="uploadBar"></div></div>
+                    <div class="progress-text">
+                        <span id="uploadProgressText">准备中…</span>
+                        <button class="btn-ghost" id="uploadCancel" onclick="cancelUpload()">取消</button>
+                    </div>
+                </div>
                 <div id="statusMsg"></div>
             </div>
 
@@ -86,7 +102,7 @@
         </div>
 
         <div class="card">
-            <h2>便签（自动同步 · 不限长度）</h2>
+            <h2>便签（自动同步 · 不限长度）<span class="note-meta" id="noteMeta"></span></h2>
             <div class="note-btns">
                 <button class="btn" id="noteCopyBtn" onclick="noteCopy()">复制</button>
                 <button class="btn" id="noteSendBtn" onclick="noteSend()">发送</button>
@@ -97,6 +113,21 @@
     </div>
 
     <script>
+        // ------------------------------------------------------------------
+        // 会话令牌：页面由本服务器同源提供，但服务端不再开放 CORS，
+        // 所以别的网站无法读取/删除本机的文件。这里的令牌是第二道锁：
+        // 请求必须带上它（请求头 / ?t= / Cookie 三选一）。
+        // ------------------------------------------------------------------
+        const TD_TOKEN = '__TD_TOKEN__';
+        function withToken(path) {
+            return path + (path.indexOf('?') >= 0 ? '&' : '?') + 't=' + encodeURIComponent(TD_TOKEN);
+        }
+        function apiFetch(path, opts) {
+            opts = opts || {};
+            opts.headers = Object.assign({ 'X-TD-Token': TD_TOKEN }, opts.headers || {});
+            return fetch(withToken(path), opts);
+        }
+
         let selectedFiles = []; // [{file: File, path: 'a/b.txt'}]
         const BATCH_MAX_FILES = 32;
         const BATCH_MAX_BYTES = 256 * 1024 * 1024;
@@ -211,12 +242,67 @@
             return items.map(it => ({ path: it.path, size: it.file.size }));
         }
 
+        // ------------------------------------------------------------------
+        // 上传（XHR）：能报告进度、也能中途取消
+        // ------------------------------------------------------------------
+        let uploadXhr = null;
+        let uploadCancelled = false;
+
+        function uploadBatch(batch, onProgress) {
+            return new Promise((resolve, reject) => {
+                const fd = new FormData();
+                for (const it of batch) fd.append('file', it.file, it.path);
+                const xhr = new XMLHttpRequest();
+                uploadXhr = xhr;
+                xhr.open('POST', withToken('/upload'));
+                xhr.setRequestHeader('X-TD-Token', TD_TOKEN);
+                xhr.upload.onprogress = (e) => {
+                    if (e.lengthComputable) onProgress(e.loaded);
+                };
+                xhr.onload = () => {
+                    uploadXhr = null;
+                    try { resolve(JSON.parse(xhr.responseText)); }
+                    catch (e) { reject(e); }
+                };
+                xhr.onerror = () => { uploadXhr = null; reject(new Error('网络错误')); };
+                xhr.onabort = () => { uploadXhr = null; reject(new Error('已取消')); };
+                xhr.send(fd);
+            });
+        }
+
+        function cancelUpload() {
+            if (!uploadXhr) return;
+            uploadCancelled = true;
+            uploadXhr.abort();
+        }
+
+        function showProgress(show) {
+            document.getElementById('uploadProgress').classList.toggle('show', !!show);
+            if (!show) document.getElementById('uploadBar').style.width = '0%';
+        }
+
+        let progressT0 = 0;
+        function setProgress(done, total, batchIndex) {
+            const now = Date.now();
+            if (!progressT0) progressT0 = now;
+            const pct = total > 0 ? Math.min(100, (done / total) * 100) : 0;
+            document.getElementById('uploadBar').style.width = pct.toFixed(1) + '%';
+            const secs = (now - progressT0) / 1000;
+            const speed = secs > 0.3 ? (done / secs / 1048576) : 0;
+            const left = speed > 0.01 && total > done ? (total - done) / (speed * 1048576) : 0;
+            document.getElementById('uploadProgressText').textContent =
+                formatSize(done) + ' / ' + formatSize(total) + '  (' + pct.toFixed(0) + '%)'
+                + (speed > 0.01 ? '  ' + speed.toFixed(1) + ' MB/s' : '')
+                + (left > 0 ? '  剩 ' + Math.ceil(left) + ' 秒' : '')
+                + (batchIndex ? '  批次 ' + batchIndex : '');
+        }
+
         async function verifyManifest(entries) {
             const chunks = [];
             for (let i = 0; i < entries.length; i += 15000) chunks.push(entries.slice(i, i + 15000));
             let all_ok = true; const results = [];
             for (const c of chunks) {
-                const resp = await fetch('/verify', {
+                const resp = await apiFetch('/verify', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ files: c })
@@ -234,12 +320,14 @@
             if (selectedFiles.length === 0) { return; }
             btn.disabled = true;
             statusMsg.innerHTML = '';
+            uploadCancelled = false;
+            progressT0 = 0;
 
             // 0) 先确认服务器可达，否则立即明确报错（避免关着服务端时干等重试）
             try {
                 const ctrl = new AbortController();
                 const t = setTimeout(() => ctrl.abort(), 3000);
-                const r = await fetch('/info', { signal: ctrl.signal });
+                const r = await apiFetch('/info', { signal: ctrl.signal });
                 clearTimeout(t);
                 if (!r.ok) throw 0;
             } catch (e) {
@@ -263,32 +351,45 @@
             // 2) 分批上传，单批失败重试 3 次
             const batches = buildBatches(todo);
             let failedCount = 0;
+            const totalBytes = todo.reduce((n, it) => n + it.file.size, 0);
+            let doneBytes = 0;
+            if (totalBytes > 0) {
+                showProgress(true);
+                setProgress(0, totalBytes, 0);
+            }
             for (let bi = 0; bi < batches.length; bi++) {
                 const batch = batches[bi];
+                const batchBytes = batch.reduce((n, it) => n + it.file.size, 0);
                 let ok = false;
                 for (let attempt = 1; attempt <= 3 && !ok; attempt++) {
+                    if (uploadCancelled) break;
                     btn.textContent = '传输中 批次 ' + (bi + 1) + '/' + batches.length + ' …';
                     statusMsg.innerHTML = '<div class="status">第 ' + attempt + ' 次传输中…</div>';
-                    const fd = new FormData();
-                    for (const it of batch) fd.append('file', it.file, it.path);
                     try {
-                        const resp = await fetch('/upload', { method: 'POST', body: fd });
-                        const j = await resp.json();
+                        // XHR 而不是 fetch：只有 XHR 能报告上传进度（可取消）
+                        const j = await uploadBatch(batch, (loaded) => {
+                            setProgress(doneBytes + loaded, totalBytes, bi);
+                        });
                         ok = !!(j && j.success);
                     } catch (e) { ok = false; }
-                    if (!ok && attempt < 3) {
+                    if (!ok && attempt < 3 && !uploadCancelled) {
                         statusMsg.innerHTML = '<div class="status error">第 ' + attempt + ' 次失败，2 秒后重试…</div>';
                         await new Promise(r => setTimeout(r, 2000));
                     }
                 }
                 if (ok) {
+                    doneBytes += batchBytes;
+                    setProgress(doneBytes, totalBytes, bi + 1);
                     statusMsg.innerHTML = '<div class="status success">批次 ' + (bi + 1) + '/' + batches.length + ' 完成（' + batch.length + ' 个文件）</div>';
                 } else {
                     failedCount = selectedFiles.length;
-                    statusMsg.innerHTML = '<div class="status error">批次 ' + (bi + 1) + ' 重试 3 次仍失败，已停止（重开本页再点上传可自动续传）</div>';
+                    statusMsg.innerHTML = uploadCancelled
+                        ? '<div class="status error">已取消传输（已传完的部分保留，再点「确认」可续传）</div>'
+                        : '<div class="status error">批次 ' + (bi + 1) + ' 重试 3 次仍失败，已停止（重开本页再点上传可自动续传）</div>';
                     break;
                 }
             }
+            showProgress(false);
 
             // 3) 最终清单校验
             if (failedCount === 0 && todo.length > 0) {
@@ -306,7 +407,9 @@
                         (bad.length > 20 ? '<br>…（共 ' + bad.length + ' 个）' : '') + '<br>重开本页再点上传可自动续传</div>';
                 }
             } else if (failedCount > 0) {
-                statusMsg.innerHTML += '<div class="status error">本批次传输失败，未做最终校验</div>';
+                if (!uploadCancelled) {
+                    statusMsg.innerHTML += '<div class="status error">本批次传输失败，未做最终校验</div>';
+                }
             }
 
             if (failedCount === 0) {
@@ -335,7 +438,7 @@
             const list = document.getElementById('downloadList');
             const countEl = document.getElementById('dlCount');
             try {
-                const response = await fetch('/files');
+                const response = await apiFetch('/files');
                 dlFiles = await response.json();
             } catch (error) {
                 countEl.textContent = '';
@@ -378,20 +481,21 @@
             countEl.innerHTML = '共 ' + all.length + ' 个文件' +
                 (dlFiles.truncated ? '（超过 1 万仅显示部分）' : '') +
                 (totalPages === 1 && folderNames.length === 1 && totalTop === 0
-                    ? `&nbsp;｜&nbsp;<a href="/zip/${encPath(folderNames[0])}" style="color:#667eea;">全部打包下载 zip</a>`
-                    : '');
+                    ? `&nbsp;｜&nbsp;<a href="${withToken(`/zip/${encPath(folderNames[0])}`)}" style="color:#667eea;">全部打包下载 zip</a>`
+                    : '') +
+                '&nbsp;｜&nbsp;<a href="#" onclick="loadDownloadList();return false;" style="color:#667eea;">刷新</a>';
 
             let html = '';
             for (const [name, meta] of Object.entries(folders)) {
                 html += `<div class="file-item"><div class="file-info"><div class="file-name">&#128193; ${escHtml(name)}</div><div class="file-size">${meta.count} 个文件 · ${formatSize(meta.bytes)}</div></div>` +
-                    `<a href="/zip/${encPath(name)}" class="download-btn">打包下载</a>` +
+                    `<a href="${withToken(`/zip/${encPath(name)}`)}" class="download-btn">打包下载</a>` +
                     `<button class="delete-btn" data-p="${escHtml(name)}" onclick="deleteItem(this.dataset.p)">删除</button></div>`;
             }
             const start = (dlPage - 1) * DL_PAGE;
             const slice = topFiles.slice(start, start + DL_PAGE);
             for (const f of slice) {
                 html += `<div class="file-item"><div class="file-info"><div class="file-name">${escHtml(f.name)}</div><div class="file-size">${formatSize(f.size)}</div></div>` +
-                    `<a href="/download/${encPath(f.name)}" class="download-btn">下载</a>` +
+                    `<a href="${withToken(`/download/${encPath(f.name)}`)}" class="download-btn">下载</a>` +
                     `<button class="delete-btn" data-p="${escHtml(f.name)}" onclick="deleteItem(this.dataset.p)">删除</button></div>`;
             }
             if (slice.length === 0 && totalTop > 0) {
@@ -413,7 +517,7 @@
         async function deleteItem(p) {
             if (!confirm('删除「' + p + '」？')) return;
             try {
-                const response = await fetch('/delete/' + encPath(p), { method: 'DELETE' });
+                const response = await apiFetch('/delete/' + encPath(p), { method: 'DELETE' });
                 const result = await response.json();
                 if (result.success) {
                     loadDownloadList();
@@ -431,9 +535,11 @@
         // ------------------------------------------------------------------
         let noteLastV = 0;   // 最近应用到的版本号
         let noteWs = null;
+        let noteSyncedAt = 0;
 
         const noteText = document.getElementById('noteText');
         const noteStatus = document.getElementById('noteStatus');
+        const noteMeta = document.getElementById('noteMeta');
 
         function noteSetStatus(msg, ok) {
             noteStatus.innerHTML = msg
@@ -441,22 +547,37 @@
                 : '';
         }
 
+        // 字数 + 最近同步时间（让便签有"活"的反馈）
+        function noteUpdateMeta() {
+            const n = noteText.value.length;
+            let when = '';
+            if (noteSyncedAt) {
+                const d = new Date(noteSyncedAt);
+                const p = x => (x < 10 ? '0' : '') + x;
+                when = ' · ' + p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+            }
+            noteMeta.textContent = n + ' 字' + when;
+        }
+        noteText.addEventListener('input', noteUpdateMeta);
+
         async function noteInit() {
             try {
-                const r = await fetch('/note');
+                const r = await apiFetch('/note');
                 const j = await r.json();
                 if (j.success) {
                     noteText.value = j.text || '';
                     noteLastV = j.v || 0;
+                    noteSyncedAt = Date.now();
                 }
             } catch (e) {}
+            noteUpdateMeta();
             noteConnectWs();
         }
 
         async function noteSend() {
             const text = noteText.value;
             try {
-                const r = await fetch('/note', {
+                const r = await apiFetch('/note', {
                     method: 'POST',
                     headers: { 'Content-Type': 'text/plain; charset=utf-8' },
                     body: text
@@ -464,6 +585,8 @@
                 const j = await r.json();
                 if (j.success) {
                     noteLastV = j.v;
+                    noteSyncedAt = Date.now();
+                    noteUpdateMeta();
                     noteSetStatus('已发送，另一端将自动填入', true);
                 } else {
                     noteSetStatus('发送失败', false);
@@ -476,11 +599,13 @@
         async function noteCopy() {
             // 1) 取最新并显示（不清空自己正在编辑的内容：取的是服务端最新）
             try {
-                const r = await fetch('/note');
+                const r = await apiFetch('/note');
                 const j = await r.json();
                 if (j.success) {
                     noteText.value = j.text || '';
                     noteLastV = j.v || 0;
+                    noteSyncedAt = Date.now();
+                    noteUpdateMeta();
                 }
             } catch (e) {} // 取不到就保持现有内容
             // 2) 默认全选
@@ -503,7 +628,7 @@
         function noteConnectWs() {
             if (noteWs && (noteWs.readyState === 0 || noteWs.readyState === 1)) return;
             const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-            noteWs = new WebSocket(proto + '//' + location.host + '/ws');
+            noteWs = new WebSocket(proto + '//' + location.host + withToken('/ws'));
             noteWs.onmessage = (e) => {
                 let m;
                 try { m = JSON.parse(e.data); } catch (_) { return; }
@@ -511,6 +636,8 @@
                 // 直接覆盖本地内容（包括未发送的编辑）
                 noteLastV = m.v;
                 noteText.value = m.text || '';
+                noteSyncedAt = Date.now();
+                noteUpdateMeta();
                 noteSetStatus('已收到对方内容', true);
             };
             noteWs.onclose = () => { noteWs = null; setTimeout(noteConnectWs, 2000); };
@@ -519,7 +646,7 @@
 
         async function getServerUrl() {
             try {
-                const response = await fetch('/info');
+                const response = await apiFetch('/info');
                 const info = await response.json();
                 const el = document.getElementById('serverUrl');
                 const text = '地址：' + info.url;

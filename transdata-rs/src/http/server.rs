@@ -17,6 +17,11 @@ use crate::config::Config;
 
 const MAX_HEAD: usize = 8 * 1024;
 const CHUNK: usize = 256 * 1024;
+
+/// Fixed session token used by the unit tests (the real one is random per
+/// run and lives in `Config::token`).
+#[cfg(test)]
+pub const TEST_TOKEN: &str = "test-token";
 /// /files listing cap; deeper trees are truncated and flagged.
 const FILE_LIST_CAP: usize = 10_000;
 /// /verify per-request cap.
@@ -60,9 +65,18 @@ pub async fn serve(cfg: Arc<Config>) {
 struct Request {
     method: String,
     path: String,
+    query: String,
     boundary: Option<String>,
     content_length: usize,
     ws: bool,
+    /// `X-TD-Token` header (the page's fetch calls send it).
+    token: Option<String>,
+    /// Raw `Cookie` header.
+    cookie: Option<String>,
+    /// Does the client accept a gzip-encoded body?
+    accept_gzip: bool,
+    /// `If-None-Match` header (for the page's ETag / 304).
+    if_none_match: Option<String>,
 }
 
 fn parse_request(head: &str) -> Option<Request> {
@@ -71,11 +85,21 @@ fn parse_request(head: &str) -> Option<Request> {
     let mut parts = start.split_whitespace();
     let method = parts.next()?.to_string();
     let target = parts.next()?;
-    let path = url_decode(target);
+    // The target may carry a query string (`?t=<token>` for download links
+    // and the websocket, which cannot set request headers).
+    let (raw_path, query) = match target.split_once('?') {
+        Some((p, q)) => (p, q.to_string()),
+        None => (target, String::new()),
+    };
+    let path = url_decode(raw_path);
 
     let mut boundary = None;
     let mut content_length = 0usize;
     let mut ws = false;
+    let mut token = None;
+    let mut cookie = None;
+    let mut accept_gzip = false;
+    let mut if_none_match = None;
     for line in lines {
         if line.is_empty() {
             break;
@@ -102,43 +126,147 @@ fn parse_request(head: &str) -> Option<Request> {
             content_length = v.parse().unwrap_or(0);
         } else if lname == "upgrade" && v.eq_ignore_ascii_case("websocket") {
             ws = true;
+        } else if lname == "x-td-token" {
+            token = Some(v.to_string());
+        } else if lname == "cookie" {
+            cookie = Some(v.to_string());
+        } else if lname == "accept-encoding" && v.to_ascii_lowercase().contains("gzip") {
+            accept_gzip = true;
+        } else if lname == "if-none-match" {
+            if_none_match = Some(v.to_string());
         }
     }
     Some(Request {
         method,
         path,
+        query,
         boundary,
         content_length,
         ws,
+        token,
+        cookie,
+        accept_gzip,
+        if_none_match,
     })
 }
 
+/// Value of a query parameter, e.g. `t` in `?t=abc`.
+fn query_param(query: &str, key: &str) -> Option<String> {
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            if k == key {
+                return Some(url_decode(v));
+            }
+        }
+    }
+    None
+}
+
+/// Is this request allowed to talk to the API?
+///
+/// The page is served by this very server, so it is same-origin and needs no
+/// CORS. The session token is what keeps *other* websites out: without it a
+/// page open in the phone/PC browser could list, download or delete the files
+/// in the transfer directory (the old `Access-Control-Allow-Origin: *` made
+/// that trivial for any site on the internet).
+///
+/// The token may arrive three ways: the `X-TD-Token` header (fetch calls),
+/// a `?t=` parameter (download links / websocket) or the `td_token` cookie
+/// (set when the page was served).
+fn authorized(cfg: &Config, req: &Request) -> bool {
+    if req.token.as_deref() == Some(cfg.token.as_str()) {
+        return true;
+    }
+    if let Some(t) = query_param(&req.query, "t") {
+        if t == cfg.token {
+            return true;
+        }
+    }
+    if let Some(c) = &req.cookie {
+        for kv in c.split(';') {
+            let kv = kv.trim();
+            if kv.strip_prefix("td_token=") == Some(cfg.token.as_str()) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Read the HTTP request head.
+///
+/// Reads in 4 KB chunks instead of one byte at a time: the old byte-at-a-time
+/// loop cost one syscall + one reactor wake-up *per byte*, which showed up
+/// as 15-30 ms of pure latency for a 1 KB header.
 async fn read_head(sock: &mut TcpStream, buf: &mut Vec<u8>) -> Result<usize, std::io::Error> {
-    let mut got = 0usize;
-    let mut one = [0u8; 1];
-    while got < MAX_HEAD {
-        let n = sock.read(&mut one).await?;
+    let mut tmp = [0u8; 4096];
+    loop {
+        // Terminator already in the buffer?
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            return Ok(pos + 4);
+        }
+        if buf.len() >= MAX_HEAD {
+            return Ok(buf.len());
+        }
+        let n = sock.read(&mut tmp).await?;
         if n == 0 {
             break;
         }
-        buf.push(one[0]);
-        got += 1;
-        if got >= 4 && &buf[got - 4..got] == b"\r\n\r\n" {
-            break;
-        }
+        buf.extend_from_slice(&tmp[..n]);
     }
-    Ok(got)
+    Ok(buf.len())
 }
 
 // ---------------------------------------------------------------------------
 // connection handler
 
+/// Read body bytes: serve the bytes that were read ahead together with the
+/// request head first, then fall back to the socket.
+async fn read_body(
+    sock: &mut TcpStream,
+    pending: &mut Vec<u8>,
+    buf: &mut [u8],
+) -> std::io::Result<usize> {
+    if !pending.is_empty() {
+        let n = pending.len().min(buf.len());
+        buf[..n].copy_from_slice(&pending[..n]);
+        pending.drain(..n);
+        return Ok(n);
+    }
+    sock.read(buf).await
+}
+
+/// Like `read_body`, but fills the whole buffer.
+async fn read_body_exact(
+    sock: &mut TcpStream,
+    pending: &mut Vec<u8>,
+    buf: &mut [u8],
+) -> std::io::Result<()> {
+    let mut filled = 0usize;
+    if !pending.is_empty() {
+        let n = pending.len().min(buf.len());
+        buf[..n].copy_from_slice(&pending[..n]);
+        pending.drain(..n);
+        filled = n;
+    }
+    if filled < buf.len() {
+        sock.read_exact(&mut buf[filled..]).await?;
+    }
+    Ok(())
+}
+
 async fn handle_conn(mut sock: TcpStream, cfg: &Arc<Config>) -> Result<(), std::io::Error> {
     // TCP_NODELAY: keep large transfers from hitting Nagle+delayed-ACK stalls.
     let _ = sock.set_nodelay(true);
-    let mut buf = Vec::with_capacity(1024);
+    let mut buf = Vec::with_capacity(8192);
     let head_len = read_head(&mut sock, &mut buf).await?;
     let head = String::from_utf8_lossy(&buf[..head_len]).to_string();
+    // The head read may have pulled in the beginning of the body as well
+    // (they usually arrive in one TCP segment). Those bytes belong to the
+    // body, not to the head, so hand them to the body readers first.
+    let head_bytes = buf[..head_len].to_vec();
+    let mut pending: Vec<u8> = buf[head_len..].to_vec();
+    drop(buf);
 
     let req = match parse_request(&head) {
         Some(r) => r,
@@ -149,13 +277,22 @@ async fn handle_conn(mut sock: TcpStream, cfg: &Arc<Config>) -> Result<(), std::
     };
 
     if req.method == "OPTIONS" {
-        write_body(&mut sock, "200 OK", "text/plain", b"").await?;
+        // No CORS headers on purpose: the page is same-origin. A preflight
+        // from another site therefore gets no permission to read anything.
+        write_body(&mut sock, "204 No Content", "text/plain", b"").await?;
         return Ok(());
+    }
+
+    // The page itself is public (it carries the token); every API call has
+    // to present the session token.
+    let is_page = req.method == "GET" && (req.path == "/" || req.path == "/index.html");
+    if !is_page && !authorized(cfg, &req) {
+        return write_json_status(&mut sock, "401 Unauthorized", "Token required").await;
     }
 
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/ws") if req.ws => {
-            ws_conn(sock, cfg, buf[..head_len].to_vec()).await
+            ws_conn(sock, cfg, head_bytes).await
         }
         ("GET", "/note") => {
             let (text, v) = cfg.read_note();
@@ -173,7 +310,7 @@ async fn handle_conn(mut sock: TcpStream, cfg: &Arc<Config>) -> Result<(), std::
             while body.len() < total {
                 let take = total - body.len();
                 let mut chunk = vec![0u8; take.min(65536)];
-                match sock.read_exact(&mut chunk).await {
+                match read_body_exact(&mut sock, &mut pending, &mut chunk).await {
                     Ok(_) => body.extend_from_slice(&chunk),
                     Err(e) => {
                         eprintln!("/note body read failed: {e}");
@@ -190,14 +327,7 @@ async fn handle_conn(mut sock: TcpStream, cfg: &Arc<Config>) -> Result<(), std::
             .await
         }
         ("GET", "/") | ("GET", "/index.html") => {
-            let body = crate::web::INDEX_HTML;
-            write_body(
-                &mut sock,
-                "200 OK",
-                "text/html; charset=utf-8",
-                body.as_bytes(),
-            )
-            .await
+            write_page(&mut sock, cfg, &req).await
         }
         ("GET", "/info") => {
             let dir = cfg.upload_dir();
@@ -207,14 +337,24 @@ async fn handle_conn(mut sock: TcpStream, cfg: &Arc<Config>) -> Result<(), std::
                 .unwrap_or(0);
             let url = format!("http://{}:{}", crate::net::display_ip(), cfg.port);
             let dir_s = dir.to_string_lossy().replace('"', "\\\"");
+            let active = cfg
+                .active_transfers
+                .load(std::sync::atomic::Ordering::SeqCst);
             let body = format!(
-                r#"{{"success":true,"url":"{url}","files_count":{count},"save_dir":"{dir_s}"}}"#
+                r#"{{"success":true,"url":"{url}","files_count":{count},"save_dir":"{dir_s}","active":{active}}}"#
             );
             write_json(&mut sock, &body).await
         }
         ("GET", "/files") => {
             // Recursive listing so uploaded folder trees are visible, each
             // entry's `name` is the slash-separated relative path.
+            //
+            // Cached for 2 s: the directory walk + JSON build cost ~0.5 s for
+            // 2 000 files and the download list asks for it on every tab
+            // switch. Uploads and deletes invalidate the cache at once.
+            if let Some(cached) = cfg.cached_files() {
+                return write_json(&mut sock, &cached).await;
+            }
             let dir = cfg.upload_dir();
             let mut items: Vec<String> = Vec::new();
             let mut truncated = false;
@@ -261,6 +401,7 @@ async fn handle_conn(mut sock: TcpStream, cfg: &Arc<Config>) -> Result<(), std::
                 truncated,
                 items.join(",")
             );
+            cfg.store_files_cache(body.clone());
             write_json(&mut sock, &body).await
         }
         ("GET", p) if p.starts_with("/download/") => {
@@ -275,8 +416,8 @@ async fn handle_conn(mut sock: TcpStream, cfg: &Arc<Config>) -> Result<(), std::
                 None => write_json_err(&mut sock, "Bad path").await,
             }
         }
-        ("POST", "/upload") => upload(&mut sock, cfg, &req.boundary).await,
-        ("POST", "/verify") => verify(&mut sock, cfg, &req).await,
+        ("POST", "/upload") => upload(&mut sock, cfg, &req.boundary, &mut pending).await,
+        ("POST", "/verify") => verify(&mut sock, cfg, &req, &mut pending).await,
         ("GET", p) if p.starts_with("/zip/") => {
             match sanitize_rel(&url_decode(&p["/zip/".len()..])) {
                 Some(rel) => zip_dir(&mut sock, cfg, &rel).await,
@@ -419,10 +560,62 @@ async fn write_body(
     out.extend_from_slice(format!("HTTP/1.1 {status}\r\n").as_bytes());
     out.extend_from_slice(format!("Content-Type: {ctype}\r\n").as_bytes());
     out.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
-    out.extend_from_slice(b"Access-Control-Allow-Origin: *\r\n");
     out.extend_from_slice(b"Cache-Control: no-store, max-age=0\r\n");
     out.extend_from_slice(b"Connection: close\r\n");
     out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(body);
+    sock.write_all(&out).await?;
+    sock.flush().await?;
+    Ok(())
+}
+
+/// Serve the index page.
+///
+/// - gzip when the client accepts it (30 KB -> ~6 KB, which matters a lot on
+///   a phone over Wi-Fi)
+/// - ETag + `must-revalidate` so a reload costs a 304 instead of a full page
+/// - a `HttpOnly; SameSite=Strict` cookie carrying the session token, so the
+///   page can talk to the API without exposing the token to scripts
+async fn write_page(
+    sock: &mut TcpStream,
+    cfg: &Arc<Config>,
+    req: &Request,
+) -> Result<(), std::io::Error> {
+    let cookie = format!(
+        "Set-Cookie: td_token={}; Path=/; HttpOnly; SameSite=Strict\r\n",
+        cfg.token
+    );
+    // Not modified? Then the browser can keep its copy.
+    if let Some(inm) = &req.if_none_match {
+        if inm.split(',').any(|t| t.trim() == cfg.page_etag) {
+            let head = format!(
+                "HTTP/1.1 304 Not Modified\r\nETag: {}\r\nCache-Control: private, max-age=0, must-revalidate\r\n{}Connection: close\r\n\r\n",
+                cfg.page_etag, cookie
+            );
+            sock.write_all(head.as_bytes()).await?;
+            sock.flush().await?;
+            return Ok(());
+        }
+    }
+    let gz = req.accept_gzip;
+    let body = if gz {
+        cfg.page_gz.as_slice()
+    } else {
+        cfg.page.as_slice()
+    };
+    let mut out = Vec::with_capacity(body.len() + 512);
+    out.extend_from_slice(b"HTTP/1.1 200 OK\r\n");
+    out.extend_from_slice(b"Content-Type: text/html; charset=utf-8\r\n");
+    if gz {
+        out.extend_from_slice(b"Content-Encoding: gzip\r\n");
+    }
+    out.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
+    out.extend_from_slice(format!("ETag: {}\r\n", cfg.page_etag).as_bytes());
+    out.extend_from_slice(
+        b"Cache-Control: private, max-age=0, must-revalidate\r\n",
+    );
+    out.extend_from_slice(cookie.as_bytes());
+    out.extend_from_slice(b"Connection: close\r\n\r\n");
     out.extend_from_slice(body);
     sock.write_all(&out).await?;
     sock.flush().await?;
@@ -440,13 +633,22 @@ async fn write_json(sock: &mut TcpStream, body: &str) -> Result<(), std::io::Err
 }
 
 async fn write_json_err(sock: &mut TcpStream, msg: &str) -> Result<(), std::io::Error> {
+    write_json_status(sock, "404 Not Found", msg).await
+}
+
+/// JSON error with an explicit HTTP status.
+async fn write_json_status(
+    sock: &mut TcpStream,
+    status: &str,
+    msg: &str,
+) -> Result<(), std::io::Error> {
     let body = format!(
         r#"{{"success":false,"error":"{}"}}"#,
         msg.replace('"', "\\\"")
     );
     write_body(
         sock,
-        "404 Not Found",
+        status,
         "application/json; charset=utf-8",
         body.as_bytes(),
     )
@@ -508,7 +710,6 @@ async fn download(
         )
         .as_bytes(),
     );
-    out.extend_from_slice(b"Access-Control-Allow-Origin: *\r\n");
     out.extend_from_slice(b"Cache-Control: no-store, max-age=0\r\n");
     out.extend_from_slice(b"Connection: close\r\n");
     out.extend_from_slice(b"\r\n");
@@ -516,6 +717,7 @@ async fn download(
 
     // Async disk reads: no blocking tokio workers, no per-chunk flush
     // (TCP writes are already coalesced by the kernel).
+    let _active = ActiveGuard::new(cfg);
     let file = tokio::fs::File::open(&file).await?;
     let mut reader = BufReader::with_capacity(CHUNK, file);
     let mut chunk = vec![0u8; CHUNK];
@@ -527,6 +729,26 @@ async fn download(
         sock.write_all(&chunk[..n]).await?;
     }
     Ok(())
+}
+
+/// Counts a transfer as "in flight" for as long as it runs, so the desktop
+/// app can show whether something is currently being transferred.
+pub struct ActiveGuard<'a>(&'a Config);
+
+impl<'a> ActiveGuard<'a> {
+    pub fn new(cfg: &'a Config) -> Self {
+        cfg.active_transfers
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        ActiveGuard(cfg)
+    }
+}
+
+impl Drop for ActiveGuard<'_> {
+    fn drop(&mut self) {
+        self.0
+            .active_transfers
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -541,6 +763,7 @@ async fn delete(
     let p = dir.join(rel);
     if p.is_file() {
         if std::fs::remove_file(&p).is_ok() {
+            cfg.invalidate_files();
             return write_json(sock, r#"{"success":true}"#).await;
         }
     } else if p.is_dir() {
@@ -563,6 +786,7 @@ async fn delete(
         let _ = files.iter().map(|f| std::fs::remove_file(f)).count();
         let _ = dirs.into_iter().rev().map(|d| std::fs::remove_dir(d)).count();
         let _ = std::fs::remove_dir(&p);
+        cfg.invalidate_files();
         return write_json(sock, r#"{"success":true}"#).await;
     }
     write_json_err(sock, "Not Found").await
@@ -577,12 +801,13 @@ async fn verify(
     sock: &mut TcpStream,
     cfg: &Arc<Config>,
     req: &Request,
+    pending: &mut Vec<u8>,
 ) -> Result<(), std::io::Error> {
     let mut raw = Vec::with_capacity(req.content_length.min(1 << 20));
     while raw.len() < req.content_length {
         let take = (req.content_length - raw.len()).min(1 << 20);
         let mut chunk = vec![0u8; take];
-        match sock.read_exact(&mut chunk).await {
+        match read_body_exact(sock, pending, &mut chunk).await {
             Ok(_) => raw.extend_from_slice(&chunk),
             Err(e) => {
                 eprintln!("/verify body read failed: {e}");
@@ -832,7 +1057,6 @@ async fn zip_dir(
         )
         .as_bytes(),
     );
-    out.extend_from_slice(b"Access-Control-Allow-Origin: *\r\n");
     out.extend_from_slice(b"Cache-Control: no-store, max-age=0\r\n");
     out.extend_from_slice(b"Connection: close\r\n");
     out.extend_from_slice(b"\r\n");
@@ -958,6 +1182,7 @@ async fn upload(
     sock: &mut TcpStream,
     cfg: &Arc<Config>,
     boundary: &Option<String>,
+    pending: &mut Vec<u8>,
 ) -> Result<(), std::io::Error> {
     let boundary = match boundary {
         Some(b) => b,
@@ -965,40 +1190,44 @@ async fn upload(
     };
     // The multipart delimiter is `--<boundary>`; the closing marker is
     // `--<boundary>--`.
-    let delims: [Vec<u8>; 2] = [
-        format!("--{boundary}").into_bytes(),
-        format!("--{boundary}--").into_bytes(),
-    ];
     // We need to match either delimiter, and remember which we hit so we know
     // whether the body is finished.
-    let delim = delims[0].clone(); // intermediate delimiter
-    let close = delims[1].clone(); // terminal delimiter
+    let delim = format!("--{boundary}").into_bytes(); // intermediate delimiter
+    let close = format!("--{boundary}--").into_bytes(); // terminal delimiter
+    // SIMD-accelerated substring search. The old `w.windows(n).position(...)`
+    // compared a slice at *every* offset (~20 ns per byte) and was the
+    // single biggest cost of an upload: 256 MB used ~5 s of CPU.
+    let f_delim = memchr::memmem::Finder::new(&delim);
+    let f_close = memchr::memmem::Finder::new(&close);
 
     let dir = cfg.upload_dir();
     std::fs::create_dir_all(&dir).ok();
+    let _active = ActiveGuard::new(cfg);
 
     // Sliding window: holds unread multipart data not yet written to disk.
-    let mut window: Vec<u8> = Vec::with_capacity(CHUNK + close.len() + 8);
+    let mut window: Vec<u8> = Vec::with_capacity(CHUNK * 2 + close.len() + 8);
     let mut buf = vec![0u8; CHUNK];
 
     // Which part are we in?
     //   0 = before the first part header / between parts
     //   1 = inside a part, streaming its body
     let mut in_part: bool = false;
-    let mut file: Option<std::fs::File> = None;
+    // `tokio::fs::File` so the disk writes go through the blocking pool
+    // instead of stalling a runtime worker thread.
+    let mut file: Option<tokio::io::BufWriter<tokio::fs::File>> = None;
     let mut wrote_any = false;
     let mut body_done = false; // set when we hit the terminal delimiter
     // Files created by this connection (removed if the upload aborts).
     let mut created: Vec<std::path::PathBuf> = Vec::new();
 
     // Find the earliest delimiter position (and whether it is the terminal one)
-    fn find_delim<'a>(
-        w: &'a [u8],
-        delim: &[u8],
-        close: &[u8],
+    fn find_delim(
+        w: &[u8],
+        f_delim: &memchr::memmem::Finder<'_>,
+        f_close: &memchr::memmem::Finder<'_>,
     ) -> Option<(usize, bool)> {
-        let d = w.windows(delim.len()).position(|x| x == delim);
-        let c = w.windows(close.len()).position(|x| x == close);
+        let d = f_delim.find(w);
+        let c = f_close.find(w);
         match (d, c) {
             (Some(dp), Some(cp)) if cp < dp => Some((cp, true)),
             (Some(dp), Some(cp)) => Some((dp, cp == dp)), // dp <= cp; if equal prefer close
@@ -1012,7 +1241,7 @@ async fn upload(
         if body_done {
             break;
         }
-        let n = match sock.read(&mut buf).await {
+        let n = match read_body(sock, pending, &mut buf).await {
             Ok(0) => break,
             Ok(n) => n,
             Err(e) => {
@@ -1045,7 +1274,12 @@ async fn upload(
                             };
                             match create_res {
                                 Ok((f, p)) => {
-                                    file = Some(f);
+                                    // 1 MiB write buffer: fewer blocking-pool
+                                    // round trips per megabyte.
+                                    file = Some(tokio::io::BufWriter::with_capacity(
+                                        1 << 20,
+                                        tokio::fs::File::from_std(f),
+                                    ));
                                     created.push(p);
                                 }
                                 Err(e) => {
@@ -1057,7 +1291,7 @@ async fn upload(
                                 }
                             }
                         }
-                        window = window.split_off(pos + 4);
+                        window.drain(..pos + 4);
                         // Stay in the same loop iteration to process body bytes
                         // already in the window.
                     }
@@ -1066,7 +1300,8 @@ async fn upload(
                         // more.
                         let keep = CHUNK;
                         if window.len() > keep {
-                            window = window.split_off(window.len() - keep);
+                            let cut = window.len() - keep;
+                            window.drain(..cut);
                         }
                         break;
                     }
@@ -1075,7 +1310,7 @@ async fn upload(
 
             // Now (or still) in a part body: stream until the next delimiter.
             if in_part {
-                match find_delim(&window, &delim, &close) {
+                match find_delim(&window, &f_delim, &f_close) {
                     Some((pos, is_close)) => {
                         // The body of this part is window[0..pos] MINUS a
                         // trailing \r\n (the CRLF that precedes the delimiter).
@@ -1098,19 +1333,17 @@ async fn upload(
                             let payload = &window[..body_end];
                             if !payload.is_empty() {
                                 if let Some(ref mut f) = file {
-                                    std::io::Write::write_all(f, payload)?;
-                                    let _ = std::io::Write::flush(f);
+                                    tokio::io::AsyncWriteExt::write_all(f, payload).await?;
                                 }
                                 wrote_any = true;
                             }
-                            window = window.split_off(pos);
+                            window.drain(..pos);
                             break;
                         }
                         let payload = &window[..body_end];
                         if !payload.is_empty() {
                             if let Some(ref mut f) = file {
-                                std::io::Write::write_all(f, payload)?;
-                                let _ = std::io::Write::flush(f);
+                                tokio::io::AsyncWriteExt::write_all(f, payload).await?;
                             }
                             wrote_any = true;
                         }
@@ -1123,9 +1356,11 @@ async fn upload(
                         if window.len() >= after + 2 && &window[after..after + 2] == b"\r\n" {
                             after += 2;
                         }
-                        window = window.split_off(after);
+                        window.drain(..after);
                         // Close the current part's file.
-                        file = None;
+                        if let Some(mut f) = file.take() {
+                            tokio::io::AsyncWriteExt::flush(&mut f).await?;
+                        }
                         if is_close {
                             body_done = true;
                             in_part = false;
@@ -1144,11 +1379,10 @@ async fn upload(
                             let cut = window.len() - keep;
                             let payload = &window[..cut];
                             if let Some(ref mut f) = file {
-                                std::io::Write::write_all(f, payload)?;
-                                let _ = std::io::Write::flush(f);
+                                tokio::io::AsyncWriteExt::write_all(f, payload).await?;
                             }
                             wrote_any = true;
-                            window = window.split_off(cut);
+                            window.drain(..cut);
                         }
                         break;
                     }
@@ -1158,8 +1392,8 @@ async fn upload(
     }
 
     // Finalise any open part.
-    if let Some(ref mut f) = file {
-        let _ = std::io::Write::flush(f);
+    if let Some(mut f) = file.take() {
+        let _ = tokio::io::AsyncWriteExt::flush(&mut f).await;
     }
 
     if !body_done {
@@ -1172,6 +1406,8 @@ async fn upload(
     }
 
     if wrote_any {
+        // The file list changed: drop the cached /files payload.
+        cfg.invalidate_files();
         write_json(sock, r#"{"success":true}"#).await
     } else {
         write_json_err(sock, "No files").await
@@ -1284,7 +1520,7 @@ mod tests {
     async fn run_server_once() -> (u16, Arc<Config>) {
         let dir = std::env::temp_dir().join(format!("transdata_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).ok();
-        let cfg = Arc::new(Config::new());
+        let cfg = Arc::new(Config::with_token(TEST_TOKEN.to_string()));
         cfg.set_upload_dir(dir);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -1296,9 +1532,29 @@ mod tests {
         (port, cfg)
     }
 
+    /// The session token must be picked up from the header, the query
+    /// parameter or the cookie — and a request without it is rejected.
+    #[test]
+    fn session_token_is_required() {
+        let cfg = Config::with_token("secret".to_string());
+        let mk = |extra: &str| {
+            parse_request(&format!(
+                "GET /files HTTP/1.1\r\nHost: t\r\n{extra}\r\n"
+            ))
+            .unwrap()
+        };
+        assert!(!authorized(&cfg, &mk("")));
+        assert!(authorized(&cfg, &mk("X-TD-Token: secret\r\n")));
+        assert!(authorized(&cfg, &mk("Cookie: td_token=secret\r\n")));
+        assert!(!authorized(&cfg, &mk("X-TD-Token: wrong\r\n")));
+        // query parameter
+        let mut q = mk("X-TD-Token: secret\r\n");
+        q.query = "t=secret".to_string();
+        assert!(authorized(&cfg, &q));
+    }
+
     /// Read from the client socket until EOF, returning the response body.
-    async fn read_response(mut sock: tokio::net::TcpStream) -> Result<String, ()> {
-        let mut raw = Vec::new();
+    async fn read_response(mut sock: tokio::net::TcpStream) -> Result<String, ()> {        let mut raw = Vec::new();
         let mut one = [0u8; 1];
         while sock.read(&mut one).await.map_err(|_| ())? > 0 {
             raw.push(one[0]);
@@ -1327,7 +1583,7 @@ mod tests {
         // supplies the trailing `--` that completes `--Bb--`.
         let split_point = full.len() - 4;
         let req = format!(
-            "POST /upload HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: multipart/form-data; boundary={boundary}\r\nContent-Length: {}\r\n\r\n",
+            "POST /upload HTTP/1.1\r\nHost: 127.0.0.1\r\nX-TD-Token: test-token\r\nContent-Type: multipart/form-data; boundary={boundary}\r\nContent-Length: {}\r\n\r\n",
             full.len()
         );
         client.write_all(req.as_bytes()).await.map_err(|e| e.to_string())?;
@@ -1355,7 +1611,7 @@ mod tests {
         full.extend_from_slice(data);
         full.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
         let req = format!(
-            "POST /upload HTTP/1.0\r\nHost: 127.0.0.1\r\nContent-Type: multipart/form-data; boundary={boundary}\r\nContent-Length: {}\r\n\r\n",
+            "POST /upload HTTP/1.0\r\nHost: 127.0.0.1\r\nX-TD-Token: test-token\r\nContent-Type: multipart/form-data; boundary={boundary}\r\nContent-Length: {}\r\n\r\n",
             full.len()
         );
         client.write_all(req.as_bytes()).await.unwrap();
@@ -1393,7 +1649,7 @@ mod tests {
         let tail = format!("\r\n--{boundary}--\r\n");
         let total = prefix.len() + data.len() + tail.len();
         let req = format!(
-            "POST /upload HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: multipart/form-data; boundary={boundary}\r\nContent-Length: {total}\r\n\r\n"
+            "POST /upload HTTP/1.1\r\nHost: 127.0.0.1\r\nX-TD-Token: test-token\r\nContent-Type: multipart/form-data; boundary={boundary}\r\nContent-Length: {total}\r\n\r\n"
         );
         client.write_all(req.as_bytes()).await.unwrap();
         client.write_all(prefix.as_bytes()).await.unwrap();
@@ -1426,7 +1682,7 @@ mod multi_part_tests {
         let dir = std::env::temp_dir().join(format!("transdata_multi_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).ok();
-        let cfg = Arc::new(Config::new());
+        let cfg = Arc::new(Config::with_token(super::TEST_TOKEN.to_string()));
         cfg.set_upload_dir(dir.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -1451,7 +1707,7 @@ mod multi_part_tests {
             .unwrap();
         let split1 = idx + 4;
         let req = format!(
-            "POST /upload HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: multipart/form-data; boundary={boundary}\r\nContent-Length: {}\r\n\r\n",
+            "POST /upload HTTP/1.1\r\nHost: 127.0.0.1\r\nX-TD-Token: test-token\r\nContent-Type: multipart/form-data; boundary={boundary}\r\nContent-Length: {}\r\n\r\n",
             full.len()
         );
         client.write_all(req.as_bytes()).await.unwrap();
@@ -1501,7 +1757,7 @@ mod folder_tests {
             }
             std::fs::write(&p, data).ok();
         }
-        let cfg = Arc::new(Config::new());
+        let cfg = Arc::new(Config::with_token(super::TEST_TOKEN.to_string()));
         cfg.set_upload_dir(dir.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -1536,7 +1792,7 @@ mod folder_tests {
             "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"docs/sub/a.txt\"\r\n\r\nAAA\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"docs/sub/b.txt\"\r\n\r\nBBBB\r\n--{boundary}--\r\n"
         );
         let req = format!(
-            "POST /upload HTTP/1.1\r\nHost: t\r\nContent-Type: multipart/form-data; boundary={boundary}\r\nContent-Length: {}\r\n\r\n",
+            "POST /upload HTTP/1.1\r\nHost: t\r\nX-TD-Token: test-token\r\nContent-Type: multipart/form-data; boundary={boundary}\r\nContent-Length: {}\r\n\r\n",
             body.len()
         );
         let resp = http_text(port, &format!("{req}{body}")).await;
@@ -1554,7 +1810,7 @@ mod folder_tests {
             "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"..%2f..%2fsecret.txt\"\r\n\r\nS1\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"/etc/passwd\"\r\n\r\nP\r\n--{boundary}--\r\n"
         );
         let req = format!(
-            "POST /upload HTTP/1.1\r\nHost: t\r\nContent-Type: multipart/form-data; boundary={boundary}\r\nContent-Length: {}\r\n\r\n",
+            "POST /upload HTTP/1.1\r\nHost: t\r\nX-TD-Token: test-token\r\nContent-Type: multipart/form-data; boundary={boundary}\r\nContent-Length: {}\r\n\r\n",
             body.len()
         );
         let resp = http_text(port, &format!("{req}{body}")).await;
@@ -1571,7 +1827,7 @@ mod folder_tests {
         let boundary = "Ab";
         // Header promises more body than we will actually send: close early.
         let req = format!(
-            "POST /upload HTTP/1.1\r\nHost: t\r\nContent-Type: multipart/form-data; boundary={boundary}\r\nContent-Length: 99999\r\n\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"big/x.bin\"\r\n\r\nAAAA",
+            "POST /upload HTTP/1.1\r\nHost: t\r\nX-TD-Token: test-token\r\nContent-Type: multipart/form-data; boundary={boundary}\r\nContent-Length: 99999\r\n\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"big/x.bin\"\r\n\r\nAAAA",
         );
         let mut c = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         c.write_all(req.as_bytes()).await.unwrap();
@@ -1583,7 +1839,7 @@ mod folder_tests {
     #[tokio::test]
     async fn files_list_is_recursive() {
         let (port, _dir) = setup("recursive", &[("docs/sub/a.txt", b"AAA"), ("top.txt", b"T")]).await;
-        let resp = http_text(port, "GET /files HTTP/1.1\r\nHost: t\r\n\r\n").await;
+        let resp = http_text(port, "GET /files HTTP/1.1\r\nHost: t\r\nX-TD-Token: test-token\r\n\r\n").await;
         assert!(resp.contains("docs/sub/a.txt"), "resp: {resp}");
         assert!(resp.contains("top.txt"), "resp: {resp}");
     }
@@ -1594,7 +1850,7 @@ mod folder_tests {
         let body =
             r#"{"files":[{"path":"docs/a.txt","size":3},{"path":"docs/missing.txt","size":5}]}"#;
         let req = format!(
-            "POST /verify HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            "POST /verify HTTP/1.1\r\nHost: t\r\nX-TD-Token: test-token\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
             body.len(),
             body
         );
@@ -1605,7 +1861,7 @@ mod folder_tests {
 
         let body2 = r#"{"files":[{"path":"docs/a.txt","size":3}]}"#;
         let req2 = format!(
-            "POST /verify HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            "POST /verify HTTP/1.1\r\nHost: t\r\nX-TD-Token: test-token\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
             body2.len(),
             body2
         );
@@ -1615,7 +1871,7 @@ mod folder_tests {
         // Wrong size -> size_mismatch
         let body3 = r#"{"files":[{"path":"docs/a.txt","size":999}]}"#;
         let req3 = format!(
-            "POST /verify HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            "POST /verify HTTP/1.1\r\nHost: t\r\nX-TD-Token: test-token\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
             body3.len(),
             body3
         );
@@ -1631,7 +1887,7 @@ mod folder_tests {
             ("docs/c.txt", b"C"),
         ])
         .await;
-        let resp = http_text(port, "DELETE /delete/docs HTTP/1.1\r\nHost: t\r\n\r\n").await;
+        let resp = http_text(port, "DELETE /delete/docs HTTP/1.1\r\nHost: t\r\nX-TD-Token: test-token\r\n\r\n").await;
         assert!(resp.contains("\"success\":true"), "resp: {resp}");
         assert!(!dir.join("docs").exists(), "tree must be gone");
     }
@@ -1639,7 +1895,7 @@ mod folder_tests {
     #[tokio::test]
     async fn zip_smoke_test() {
         let (port, dir) = setup("zip", &[("docs/a.txt", b"AAA"), ("docs/sub/b.txt", b"BBBB")]).await;
-        let resp = http_bytes(port, "GET /zip/docs HTTP/1.1\r\nHost: t\r\n\r\n").await;
+        let resp = http_bytes(port, "GET /zip/docs HTTP/1.1\r\nHost: t\r\nX-TD-Token: test-token\r\n\r\n").await;
         let text = String::from_utf8_lossy(&resp);
         assert!(text.starts_with("HTTP/1.1 200"), "head: {}", &text[..text.len().min(60)]);
         assert!(resp.windows(4).any(|w| w == b"PK\x03\x04"), "no zip local header");

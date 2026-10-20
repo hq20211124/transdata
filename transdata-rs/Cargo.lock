@@ -3522,9 +3522,12 @@ version = "1.0.0"
 dependencies = [
  "eframe",
  "embed-resource",
+ "flate2",
  "futures-util",
  "image",
+ "memchr",
  "qrcode",
+ "rand 0.8.8",
  "rfd",
  "serde_json",
  "sha2",
