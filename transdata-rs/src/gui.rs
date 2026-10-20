@@ -332,7 +332,50 @@ fn window_icon() -> std::sync::Arc<eframe::egui::IconData> {
     })
 }
 
+/// 弹一个错误框。GUI 程序没有 stderr，错误只写进日志的话用户根本看不到
+/// （表现为"双击了没反应"）。
+#[cfg(windows)]
+fn show_error(msg: &str) {
+    #[link(name = "user32")]
+    extern "system" {
+        fn MessageBoxW(hwnd: isize, text: *const u16, caption: *const u16, flags: u32) -> i32;
+    }
+    const MB_ICONERROR: u32 = 0x00000010;
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+    let text = wide(msg);
+    let caption = wide("TransData");
+    unsafe {
+        MessageBoxW(
+            0,
+            text.as_ptr(),
+            caption.as_ptr(),
+            MB_ICONERROR,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn show_error(msg: &str) {
+    eprintln!("{msg}");
+}
+
 pub fn run_gui(cfg: Arc<Config>, port: u16) {
+    // 先探一下端口：被占用时直接弹窗说明，别开出一个"看起来正常"、
+    // 其实连不上的窗口（那是最难查的失败方式）。
+    match std::net::TcpListener::bind(("0.0.0.0", port)) {
+        Ok(l) => drop(l),
+        Err(e) => {
+            show_error(&format!(
+                "无法监听端口 {port}：{e}\n\n\
+                 端口可能已经被另一个 TransData 占用了（重复启动？）。\n\
+                 请关掉已经在运行的 TransData，或用任务管理器结束占用它的进程。"
+            ));
+            return;
+        }
+    }
+
     let cfg_server = cfg.clone();
     let cfg_gui = cfg.clone();
     // egui Context, captured when eframe creates the window; the WS note
@@ -493,6 +536,8 @@ struct GuiApp {
     shape_size: (i32, i32),
     /// 快捷文本输入框当前是否有焦点（决定边框颜色，避免 egui 默认的黑框）
     note_focused: bool,
+    /// 服务器已经挂了（弹过窗了，别重复弹）
+    server_dead_reported: bool,
     /// Cached `ipconfig` result — fetched once at startup and only when the
     /// transfer dir changes. Never re-run per frame (that spawned a visible
     /// cmd console window every second on some machines).
@@ -533,6 +578,7 @@ impl GuiApp {
             maximized: false,
             pair_msg: String::new(),
             note_focused: false,
+            server_dead_reported: false,
             #[cfg(windows)]
             hwnd,
             #[cfg(windows)]
@@ -780,6 +826,23 @@ impl GuiApp {
     /// Build one frame of the window. Kept separate from `App::update` so
     /// the layout can be rendered headlessly in a test.
     fn draw(&mut self, ctx: &eframe::egui::Context) {
+        // 服务器没起来就别装正常：端口被占用时窗口会显示二维码和配对码，
+        // 但手机根本连不上 —— 这种情况必须直接说清楚。
+        // （只看服务器明确报出来的错，不能用"还没 running"去猜：GUI 的
+        //   第一帧通常跑在服务器 bind 之前，那不是故障。）
+        if let Some(err) = self.cfg.server_error() {
+            if !self.server_dead_reported {
+                self.server_dead_reported = true;
+                show_error(&format!(
+                    "服务器没能启动。\n\n{err}\n\n\
+                     端口可能已经被另一个 TransData 占用了（重复启动？）。\n\
+                     请关掉已经在运行的 TransData 再打开本程序。"
+                ));
+                ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Close);
+            }
+            return;
+        }
+
         let url = self.base_url();
         let (shared_text, shared_v) = self.cfg.read_note();
 

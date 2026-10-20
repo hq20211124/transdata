@@ -80,6 +80,9 @@ pub async fn serve(cfg: Arc<Config>) {
             Ok(l) => l,
             Err(e) => {
                 eprintln!("bind :{} failed: {e}", cfg.port);
+                // Tell the GUI: a window without a server is worse than no
+                // window at all (the QR code would point nowhere).
+                cfg.set_server_error(format!("无法监听端口 {}：{}", cfg.port, e));
                 cfg.set_running(false);
                 return;
             }

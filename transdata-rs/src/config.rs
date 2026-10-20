@@ -40,6 +40,8 @@ pub struct Config {
     pub upload_dir: RwLock<PathBuf>,
     /// Whether the server is currently running.
     pub running: AtomicUsize,
+    /// Set when the server could not start (e.g. the port is taken).
+    pub server_error: Mutex<Option<String>>,
     /// Shared quick-note text (unlimited length), last-writer-wins.
     ///
     /// Shared as an `Arc<String>` so the GUI can render it every frame
@@ -135,6 +137,17 @@ impl Config {
             .map(|p| p.parent().map(|d| d.to_path_buf()))
             .unwrap_or_default()
             .unwrap_or_else(|| PathBuf::from("."));
+        // 有人会把 exe 直接放在传输目录里再运行（uploads\transdata.exe）。
+        // 这时别再套一层 uploads/uploads —— 用同一个目录当传输目录。
+        if dir
+            .file_name()
+            .map(|n| n.to_string_lossy().eq_ignore_ascii_case("uploads"))
+            .unwrap_or(false)
+        {
+            if let Some(parent) = dir.parent() {
+                dir = parent.to_path_buf();
+            }
+        }
         dir = dir.join("uploads");
         std::fs::create_dir_all(&dir).ok();
 
@@ -163,6 +176,7 @@ impl Config {
             port: 9999,
             upload_dir: RwLock::new(dir),
             running: AtomicUsize::new(0),
+            server_error: Mutex::new(None),
             note_buf: RwLock::new(Arc::new(String::new())),
             note_version: AtomicU64::new(0),
             note_tx,
@@ -203,6 +217,23 @@ impl Config {
 
     pub fn set_running(&self, v: bool) {
         self.running.store(v as usize, Ordering::SeqCst);
+    }
+
+    /// Why the server could not start (empty = no problem).
+    ///
+    /// The GUI must not guess this from `running`: the first frame is
+    /// usually drawn *before* the server thread has bound the port, and
+    /// that is not a failure.
+    pub fn set_server_error(&self, msg: String) {
+        if let Ok(mut slot) = self.server_error.lock() {
+            if slot.is_none() {
+                *slot = Some(msg);
+            }
+        }
+    }
+
+    pub fn server_error(&self) -> Option<String> {
+        self.server_error.lock().ok().and_then(|s| s.clone())
     }
 
     // ---- HTTPS ------------------------------------------------------------
