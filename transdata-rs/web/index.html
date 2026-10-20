@@ -2,663 +2,153 @@
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>文件传输</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="color-scheme" content="light dark">
+    <meta name="referrer" content="no-referrer">
+    <title>TransData · 局域网文件互传</title>
     <link rel="icon" type="image/png" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAFXElEQVR4nL1XTWxUVRT+7s97M9Ohtk4tWFQwoIZEDTYuRAQirtyZQKpClGii6M4djZtOSheGhRiBmGgIaGSjZQULNkYBFdCtRjT8WwqO/LSlU6Yz7917zLlvpvPezBS7oEwymbn33He+c879znfvEwCQz5McHBR2a//oGqX9D2DCtdYG3SArBQig6Cv4t+XYzm53Nlgh5DUpxI9kSp/u+uL5n/L5vBwcHLSir4/U8LAwW/tHt2vtfyil0mFQApkAgqOrOncOY87r47nZJSS08mFNEBoz/dHuvasH+vq+VQ5j67aRwQUdPQNTE1ctYAlEUoCfv0NmiAHXQNGQeXLMfi0P27MPyMlb/2zf8+XavHh/28gqob0TZI2xNlASYgZ4zmVvAq8H2GgHGZJQRgDKhOFqSQL9SvmCbCjmH5znhCAKhZKeEML2ayK7jvccRKo12N0BT9gtKUOMaddJE5RysKa+YL7Bq/PkMJGT7NSxFfcGXDTMSe6Ce5V5wu7WADret/cMPNaqulWvzzd49I1s2u0Jk8Itxt0BdyX+n+erc3JO2t6iMhw0yyXPKwn3n+dcMsY64WNRFdU1SfC6SuokB+raX3M+E0DVeVQmIKgYmMAi5QuMjVdcEJk0NxUhlRLcYrCGUCmF8HzOM3ZusC9KBGCTHWAJ02UDIVpou40yvr/Tw8bXlkJrgb/+GHe/v/5cwIZNy7BwURomJGhP4OiREfxy7ArSmSi4JA8ozoHYVgjCli0PY+HCFKhaDTZxUcbHyjiw/7wrbaZNuWCybRpBYPDIkix6ejL4fOdvCAODp3q7sPrFHpz4foQl2GE0ckAnOABCGFp05TysWLEAX391CSbkzN3euL19653lWPRgChfOTmLXjt+RTklcK9yGNRbPPteNqakQ1wu33XNj16dRqVSFrgUBmzgQP89vTQQ4d6boMomIZF0A4+OVmX3OZhQqZYOXXn4I506PuTVcEc8TTuE8LeokjJceCR2glgx3jWSs+8oqF/g/+2MCLl7chlffXOYCeHJlDiMXJ3H4m/Owtu6PYmDxcbMOUFUHELUSA3blfDzT2+lKGXGADxCLru4UUr7E1ctF7P/sNMKKwdO9OZw9PYb2+3wovuMQucpJLoPDbMy8kQOobUFEtL8vTuHoDwWs7O2c6WUOgH9PHivgwpkJeL5AcaLsnjt59Aoq06EjHVckrIRo7/Cc3W1BrbJ30gHBURtCZ4fGho2LEVQsxm6UZwgYtT+5rDa9/RiOfzeKG4UStAa0UpCwKN8OkevO4JXNT+DRxztQuFx028bcgdO8OnizDiBiue8JLFnS5vq69okEqKZV5Hqct4GdQ/EliuB7EqOXbuHYkYtYurwD/44WnQAdOvCnEyuuZDzzmcTfe/cE+ToTXRCcc4vpUth8wYx3irVIp/mWK/iemdD76akANmRfvMwik1auK5g/TRwgV4FqVFwBnlBAezvfzuIBVNkU6xan925cbzO2ZbMaQPR8/VxoDc4Hlo6zNOoGZnt9cXRKxsf1tXGJrtldGyLWdjQ7OM9JrfybnIVousfP5Uht4TwxngWc+CrGrWVvMqmP8xsLiExjhPMB7o5sssaTPg+PS1i7w5gyCUhXezHP4LxHQkgKTZnRdsjde1edMkF5KNuW0yIiAFciCqRRwxtEpPFgmdUeJcVabtiYTXXo0FSGPjn8+inJL4h79r2QLxYLQ0p61tPp6utZMnPHkVhm8QDvaK9WVEEKX6eVkspOlm4M7Tz8Rp6x5fDwq4ZflXfvWzNgTHk92fCgIBTcU/GsWlWj4WCZJXNuVV5QMCY8GATl9R8f2jyQR95h/wd1zseHgxVGxQAAAABJRU5ErkJggg==">
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; padding: 10px; }
-        .container { max-width: 480px; margin: 0 auto; }
-        .card { background: white; border-radius: 12px; padding: 10px 12px; margin-bottom: 8px; box-shadow: 0 4px 16px rgba(0,0,0,0.15); }
-        .card h2 { color: #555; margin-bottom: 8px; font-size: 13px; }
-        .url-line { background: #f8f9fa; padding: 7px 10px; border-radius: 8px; font-family: monospace; font-size: 12px; color: #4a5a7a; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-        .file-pick { border: 2px dashed #667eea; border-radius: 8px; padding: 9px 12px; text-align: center; cursor: pointer; transition: all 0.3s; font-size: 13px; font-weight: 600; color: #667eea; background: #f8f9ff; }
-        .file-pick:hover { border-color: #4d5ed8; background: #eef0ff; }
-        .pick-hint { font-size: 11px; color: #999; text-align: center; margin: 5px 0 2px; }
-        #fileInput, #folderInput { display: none; }
-        .file-list { margin-top: 8px; background: #fff; max-height: 200px; overflow-y: auto; }
-        .dl-list { margin-top: 8px; }
-        .dl-nav { display: flex; gap: 8px; margin-top: 8px; align-items: center; }
-        .page-btn { flex: 1; padding: 6px; border: 1px solid #c5cad8; background: white; color: #5a6a8a; border-radius: 8px; font-size: 12px; font-weight: 600; cursor: pointer; }
-        .page-btn:disabled { opacity: 0.4; cursor: default; }
-        .page-info { font-size: 12px; color: #999; white-space: nowrap; }
-        .count-row { font-size: 12px; color: #667eea; text-align: center; padding: 2px 0 8px; background: #fff; }
-        .list-more { font-size: 11px; color: #999; text-align: center; padding: 6px; }
-        .file-item { display: flex; align-items: center; padding: 2px 10px; background: #fff; border: 1px solid #e8ebf5; border-radius: 6px; }
-        .file-info { flex: 1; min-width: 0; }
-        .file-name { font-weight: 500; color: #333; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-        .file-size { font-size: 11px; color: #999; }
-        .empty-hint { text-align: center; color: #999; padding: 14px; font-size: 13px; }
-        .btn { width: 100%; padding: 9px; border: none; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; margin-top: 10px; }
-        .btn:disabled { opacity: 0.6; cursor: not-allowed; }
-        .status { padding: 6px; margin-top: 8px; border-radius: 8px; text-align: center; font-size: 12px; }
-        .status.success { background: #d4edda; color: #155724; }
-        .status.error { background: #f8d7da; color: #721c24; }
-        .tab-buttons { display: flex; gap: 8px; margin-bottom: 10px; }
-        .tab-btn { flex: 1; padding: 7px; border: 2px solid #e9ecef; background: white; border-radius: 8px; font-size: 13px; font-weight: 600; cursor: pointer; transition: all 0.3s; }
-        .tab-btn.active { border-color: #667eea; background: #667eea; color: white; }
-        .tab-content { display: none; }
-        .tab-content.active { display: block; }
-        .note-box { width: 100%; min-height: 64px; border: 2px solid #e9ecef; border-radius: 8px; padding: 8px 10px; font-size: 13px; font-family: inherit; resize: vertical; line-height: 1.4; margin-top: 8px; }
-        .note-box:focus { border-color: #667eea; outline: none; }
-        .note-btns { display: flex; gap: 8px; }
-        .note-btns .btn { width: auto; flex: 1; margin-top: 0; padding: 7px; font-size: 13px; }
-        .download-btn { padding: 3px 10px; background: white; color: #667eea; border: 1px solid #667eea; border-radius: 6px; cursor: pointer; text-decoration: none; font-size: 12px; white-space: nowrap; font-weight: 600; }
-        .delete-btn { padding: 3px 10px; background: white; color: #dc3545; border: 1px solid #f1b2b7; border-radius: 6px; cursor: pointer; font-size: 12px; margin-left: 6px; white-space: nowrap; }
-        .rm-btn { flex-shrink: 0; margin-left: 8px; width: 24px; height: 24px; border: none; border-radius: 50%; background: #e9ecef; color: #555; font-size: 14px; line-height: 1; cursor: pointer; }
-        .rm-btn:hover { background: #dc3545; color: white; }
-        /* 传输进度条 */
-        .progress { margin-top: 8px; display: none; }
-        .progress.show { display: block; }
-        .bar-wrap { height: 8px; background: #e9ecef; border-radius: 6px; overflow: hidden; }
-        .bar { height: 100%; width: 0; background: linear-gradient(90deg, #667eea, #764ba2); border-radius: 6px; transition: width 0.15s linear; }
-        .progress-text { display: flex; justify-content: space-between; font-size: 11px; color: #999; margin-top: 4px; }
-        .btn-ghost { padding: 3px 10px; background: white; color: #667eea; border: 1px solid #c5cad8; border-radius: 6px; cursor: pointer; font-size: 12px; white-space: nowrap; font-weight: 600; text-decoration: none; }
-        .btn-ghost:hover { background: #f0f2ff; }
-        .note-meta { font-size: 11px; color: #999; }
-    </style>
+    <link rel="stylesheet" href="/app.css">
 </head>
-<body>
-    <div class="container">
-        <div class="card">
-            <div class="url-line" id="serverUrl">地址：加载中…</div>
+<body data-mode="__TD_MODE__">
+
+<!-- ===================== 配对（未授权时显示） ===================== -->
+<div id="pairView" class="pair-wrap" hidden>
+    <div class="pair-card">
+        <div class="pair-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M4 7.5 12 3l8 4.5v9L12 21l-8-4.5v-9Z"/><path d="M12 12v9"/><path d="m4 7.5 8 4.5 8-4.5"/>
+            </svg>
         </div>
-
-        <div class="card">
-            <div class="tab-buttons">
-                <button class="tab-btn active" onclick="switchTab('upload')">上传</button>
-                <button class="tab-btn" onclick="switchTab('download')">下载</button>
-            </div>
-
-            <div id="uploadTab" class="tab-content active">
-                <div class="file-pick" onclick="document.getElementById('fileInput').click()">
-                    上传文件
-                </div>
-                <p class="pick-hint">提示：安卓手机点击「上传文件」后，长按文件可触发多选</p>
-                <input type="file" id="fileInput" multiple onchange="handleFileSelect(event)">
-                <div class="file-pick" style="margin-top:6px" onclick="document.getElementById('folderInput').click()">
-                    上传文件夹(仅支持电脑浏览器)
-                </div>
-                <input type="file" id="folderInput" webkitdirectory multiple onchange="handleFolderSelect(event)">
-                <div class="file-list" id="fileList"></div>
-                <button class="btn" id="uploadBtn" onclick="uploadFiles()" disabled>确认</button>
-                <div class="progress" id="uploadProgress">
-                    <div class="bar-wrap"><div class="bar" id="uploadBar"></div></div>
-                    <div class="progress-text">
-                        <span id="uploadProgressText">准备中…</span>
-                        <button class="btn-ghost" id="uploadCancel" onclick="cancelUpload()">取消</button>
-                    </div>
-                </div>
-                <div id="statusMsg"></div>
-            </div>
-
-            <div id="downloadTab" class="tab-content">
-                <div class="count-row" id="dlCount"></div>
-                <div class="dl-list" id="downloadList">
-                    <p class="empty-hint">暂无文件</p>
-                </div>
-                <div class="dl-nav" id="dlNav" style="display:none"></div>
-            </div>
-        </div>
-
-        <div class="card">
-            <h2>便签（自动同步 · 不限长度）<span class="note-meta" id="noteMeta"></span></h2>
-            <div class="note-btns">
-                <button class="btn" id="noteCopyBtn" onclick="noteCopy()">复制</button>
-                <button class="btn" id="noteSendBtn" onclick="noteSend()">发送</button>
-            </div>
-            <textarea id="noteText" class="note-box" placeholder="输入或粘贴文字，点「发送」同步到另一端"></textarea>
-            <div id="noteStatus"></div>
-        </div>
+        <h1 class="pair-title">连接到 TransData</h1>
+        <p class="pair-sub muted">用手机扫描电脑上的二维码，或输入窗口里显示的配对码。</p>
+        <form id="pairForm" class="pair-form" autocomplete="off">
+            <input id="pairCode" class="code-input" type="text" inputmode="numeric" pattern="[0-9]*"
+                   maxlength="8" placeholder="00000000" aria-label="8 位配对码" spellcheck="false">
+            <button class="btn btn--primary btn--wide" type="submit" id="pairSubmit">连接</button>
+        </form>
+        <p class="pair-msg" id="pairMsg" role="status" aria-live="polite"></p>
     </div>
+</div>
 
-    <script>
-        // ------------------------------------------------------------------
-        // 会话令牌：页面由本服务器同源提供，但服务端不再开放 CORS，
-        // 所以别的网站无法读取/删除本机的文件。这里的令牌是第二道锁：
-        // 请求必须带上它（请求头 / ?t= / Cookie 三选一）。
-        // ------------------------------------------------------------------
-        const TD_TOKEN = '__TD_TOKEN__';
-        function withToken(path) {
-            return path + (path.indexOf('?') >= 0 ? '&' : '?') + 't=' + encodeURIComponent(TD_TOKEN);
-        }
-        function apiFetch(path, opts) {
-            opts = opts || {};
-            opts.headers = Object.assign({ 'X-TD-Token': TD_TOKEN }, opts.headers || {});
-            return fetch(withToken(path), opts);
-        }
+<!-- ===================== 主界面 ===================== -->
+<div id="appView" class="app" hidden>
 
-        let selectedFiles = []; // [{file: File, path: 'a/b.txt'}]
-        const BATCH_MAX_FILES = 32;
-        const BATCH_MAX_BYTES = 256 * 1024 * 1024;
+    <header class="topbar">
+        <div class="brand">
+            <span class="brand-mark" aria-hidden="true">
+                <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M4 7.5 12 3l8 4.5v9L12 21l-8-4.5v-9Z"/><path d="M12 12v9"/><path d="m4 7.5 8 4.5 8-4.5"/>
+                </svg>
+            </span>
+            <span class="brand-name">TransData</span>
+        </div>
+        <div class="topbar-right">
+            <span class="pill" id="connPill"><span class="dot" id="connDot"></span><span id="connText">已连接</span></span>
+            <button class="btn btn--ghost btn--sm" id="copyAddr" type="button">复制地址</button>
+        </div>
+    </header>
 
-        function switchTab(tab) {
-            document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
-            document.querySelectorAll('.tab-content').forEach(content => content.classList.remove('active'));
-            if (tab === 'upload') {
-                document.querySelectorAll('.tab-btn')[0].classList.add('active');
-                document.getElementById('uploadTab').classList.add('active');
-            } else {
-                document.querySelectorAll('.tab-btn')[1].classList.add('active');
-                document.getElementById('downloadTab').classList.add('active');
-                loadDownloadList();
-            }
-        }
+    <main class="container">
+     <div class="container-inner">
+        <nav class="tabs" role="tablist" aria-label="主功能">
+            <button class="tab is-active" id="tabUpload" type="button" role="tab" aria-selected="true" aria-controls="uploadPanel">上传</button>
+            <button class="tab" id="tabDownload" type="button" role="tab" aria-selected="false" aria-controls="downloadPanel">下载</button>
+        </nav>
 
-        function handleFileSelect(event) {
-            // 累加模式：部分手机浏览器一次只能挑一个文件，
-            // 反复点选会逐个追加（同路径+同大小自动去重）。
-            const picked = Array.from(event.target.files).map(f => ({ file: f, path: f.name }));
-            mergeSelected(picked);
-            event.target.value = ''; // 清空 input 才能再次选同名文件
-            afterFilesPicked();
-        }
+        <!-- ---------- 上传 ---------- -->
+        <section class="panel" id="uploadPanel" role="tabpanel" aria-labelledby="tabUpload">
+            <div class="panel-head">
+                <h2 class="panel-title">上传文件</h2>
+                <span class="chip" id="uploadChip">未选择文件</span>
+            </div>
 
-        function mergeSelected(picked) {
-            const have = new Set(selectedFiles.map(it => it.path + '|' + it.file.size));
-            for (const it of picked) {
-                if (!have.has(it.path + '|' + it.file.size)) selectedFiles.push(it);
-            }
-        }
+            <div class="dropzone" id="dropzone" tabindex="0" role="button" aria-label="选择文件或拖拽到此处">
+                <svg class="dz-icon" viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M12 15V3"/><path d="m8 7 4-4 4 4"/><path d="M3 15v3a3 3 0 0 0 3 3h12a3 3 0 0 0 3-3v-3"/>
+                </svg>
+                <div class="dz-text">
+                    <p class="dz-title">把文件拖到这里</p>
+                    <p class="dz-sub muted">或用下面的按钮选择</p>
+                </div>
+                <div class="dz-actions">
+                    <button class="btn btn--soft" id="pickFiles" type="button">选择文件</button>
+                    <button class="btn btn--soft" id="pickFolder" type="button">选择文件夹</button>
+                </div>
+            </div>
 
-        function handleFolderSelect(event) {
-            const files = Array.from(event.target.files);
-            const picked = files.map(f => ({
-                file: f,
-                path: f.webkitRelativePath ? f.webkitRelativePath.replace(/\\/g, '/') : f.name
-            }));
-            event.target.value = '';
-            // 手机等不支持 webkitdirectory 的浏览器会退化成普通多选：
-            // 用相对路径是否为空来识别，给用户明确提示而不是假装支持。
-            if (picked.length > 0 && picked.every(it => it.path.indexOf('/') === -1)) {
-                document.getElementById('statusMsg').innerHTML =
-                    '<div class="status error">当前浏览器不支持选文件夹（手机浏览器均如此）。'
-                    + '已把选中的 ' + picked.length + ' 个文件按普通文件方式累加，可直接上传；'
-                    + '文件很多时建议先在手机里选中文件夹压缩成 zip 再传。</div>';
-            }
-            mergeSelected(picked);
-            afterFilesPicked();
-        }
+            <input type="file" id="fileInput" multiple hidden>
+            <input type="file" id="folderInput" webkitdirectory multiple hidden>
 
-        function afterFilesPicked() {
-            document.getElementById('fileList').scrollIntoView();
-            if (selectedFiles.length > 50000) {
-                document.getElementById('statusMsg').innerHTML =
-                    '<div class="status error">文件数 ' + selectedFiles.length + ' 超过 5 万，浏览器可能卡顿，建议先打包再传</div>';
-            } else {
-                document.getElementById('statusMsg').innerHTML = '';
-            }
-            renderFileList();
-            document.getElementById('uploadBtn').disabled = selectedFiles.length === 0;
-        }
+            <div class="listbar" id="uploadListBar" hidden>
+                <span class="listbar-info" id="uploadSummary">—</span>
+                <button class="btn btn--link btn--sm" id="toggleFiles" type="button" aria-expanded="false">展开</button>
+            </div>
+            <ul class="filelist" id="fileList"></ul>
 
-        function renderFileList() {
-            const list = document.getElementById('fileList');
-            const preview = selectedFiles.slice(0, 200);
-            let html = preview.map((it, i) => `<div class="file-item"><div class="file-info"><div class="file-name">${escHtml(it.path)}</div><div class="file-size">${formatSize(it.file.size)}</div></div><button class="rm-btn" onclick="removeFile(${i})">×</button></div>`).join('');
-            if (selectedFiles.length > 200) {
-                html += `<div class="file-item"><div class="file-info"><div class="file-size">… 共 ${selectedFiles.length} 个文件，仅显示前 200 个</div></div></div>`;
-            }
-            list.innerHTML = html;
-        }
+            <div class="progress" id="progress" hidden>
+                <div class="progress-top">
+                    <span id="progLabel">准备中…</span>
+                    <button class="btn btn--link btn--sm" id="cancelUpload" type="button">取消</button>
+                </div>
+                <div class="track"><div class="bar" id="progBar"></div></div>
+                <div class="progress-sub" id="progSub"></div>
+            </div>
 
-        function removeFile(idx) {
-            selectedFiles.splice(idx, 1);
-            renderFileList();
-            document.getElementById('uploadBtn').disabled = selectedFiles.length === 0;
-        }
+            <div class="notice" id="uploadNotice" role="status" aria-live="polite" hidden></div>
 
-        function escHtml(s) {
-            return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-        }
+            <div class="panel-foot">
+                <span class="foot-info muted" id="uploadFoot">局域网内直连，不经过服务器</span>
+                <button class="btn btn--primary" id="uploadBtn" type="button" disabled>开始上传</button>
+            </div>
+        </section>
 
-        function formatSize(bytes) {
-            if (bytes === 0) return '0 B';
-            const k = 1024;
-            const sizes = ['B', 'KB', 'MB', 'GB'];
-            const i = Math.floor(Math.log(bytes) / Math.log(k));
-            return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
-        }
+        <!-- ---------- 下载 ---------- -->
+        <section class="panel" id="downloadPanel" role="tabpanel" aria-labelledby="tabDownload" hidden>
+            <div class="panel-head">
+                <h2 class="panel-title">下载文件</h2>
+                <div class="head-actions">
+                    <button class="btn btn--link btn--sm" id="toggleDl" type="button" aria-expanded="false">展开全部</button>
+                    <button class="btn btn--link btn--sm" id="refreshBtn" type="button">刷新</button>
+                </div>
+            </div>
 
-        // ------------------------------------------------------------------
-        // 分批上传 + 清单校验：
-        //  - 每批 ≤32 个文件且 ≤256MB，单批失败自动重试 3 次（已完好的自动跳过）
-        //  - 全部传完后 POST /verify 逐条核对 path+size（截断/丢文件一目了然）
-        // ------------------------------------------------------------------
-        function buildBatches(items) {
-            const batches = [];
-            let cur = [], curBytes = 0;
-            for (const it of items) {
-                if (cur.length > 0 && (cur.length >= BATCH_MAX_FILES || curBytes + it.file.size > BATCH_MAX_BYTES)) {
-                    batches.push(cur); cur = []; curBytes = 0;
-                }
-                cur.push(it); curBytes += it.file.size;
-            }
-            if (cur.length) batches.push(cur);
-            return batches;
-        }
+            <div class="empty" id="dlEmpty">
+                <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M4 7.5 12 3l8 4.5v9L12 21l-8-4.5v-9Z"/><path d="m4 7.5 8 4.5 8-4.5"/>
+                </svg>
+                <p class="empty-title">这里还没有文件</p>
+                <p class="empty-sub muted">从另一台设备上传后，文件会出现在这里</p>
+            </div>
 
-        function manifestOf(items) {
-            return items.map(it => ({ path: it.path, size: it.file.size }));
-        }
+            <ul class="filelist" id="dlList"></ul>
 
-        // ------------------------------------------------------------------
-        // 上传（XHR）：能报告进度、也能中途取消
-        // ------------------------------------------------------------------
-        let uploadXhr = null;
-        let uploadCancelled = false;
+            <div class="panel-foot">
+                <span class="foot-info muted">「打包」＝把整个文件夹压成 zip 下载</span>
+                <a class="btn btn--soft" id="zipAll" href="#" hidden>全部打包下载</a>
+            </div>
+        </section>
+     </div>
+    </main>
 
-        function uploadBatch(batch, onProgress) {
-            return new Promise((resolve, reject) => {
-                const fd = new FormData();
-                for (const it of batch) fd.append('file', it.file, it.path);
-                const xhr = new XMLHttpRequest();
-                uploadXhr = xhr;
-                xhr.open('POST', withToken('/upload'));
-                xhr.setRequestHeader('X-TD-Token', TD_TOKEN);
-                xhr.upload.onprogress = (e) => {
-                    if (e.lengthComputable) onProgress(e.loaded);
-                };
-                xhr.onload = () => {
-                    uploadXhr = null;
-                    try { resolve(JSON.parse(xhr.responseText)); }
-                    catch (e) { reject(e); }
-                };
-                xhr.onerror = () => { uploadXhr = null; reject(new Error('网络错误')); };
-                xhr.onabort = () => { uploadXhr = null; reject(new Error('已取消')); };
-                xhr.send(fd);
-            });
-        }
+    <!-- ---------- 快捷文本（吸底） ---------- -->
+    <footer class="composer">
+        <div class="composer-inner">
+            <div class="composer-head">
+                <span class="composer-title">快捷文本</span>
+                <span class="composer-status muted" id="noteStatus" role="status" aria-live="polite"></span>
+                <span class="composer-count muted" id="noteMeta">0 字</span>
+            </div>
+            <div class="composer-row">
+                <textarea id="noteText" class="note-input" rows="1" placeholder="输入或粘贴文字…"></textarea>
+                <div class="composer-actions">
+                    <button class="btn btn--soft btn--sm" id="noteCopy" type="button">复制</button>
+                    <button class="btn btn--primary btn--sm" id="noteSend" type="button">发送</button>
+                </div>
+            </div>
+        </div>
+    </footer>
+</div>
 
-        function cancelUpload() {
-            if (!uploadXhr) return;
-            uploadCancelled = true;
-            uploadXhr.abort();
-        }
-
-        function showProgress(show) {
-            document.getElementById('uploadProgress').classList.toggle('show', !!show);
-            if (!show) document.getElementById('uploadBar').style.width = '0%';
-        }
-
-        let progressT0 = 0;
-        function setProgress(done, total, batchIndex) {
-            const now = Date.now();
-            if (!progressT0) progressT0 = now;
-            const pct = total > 0 ? Math.min(100, (done / total) * 100) : 0;
-            document.getElementById('uploadBar').style.width = pct.toFixed(1) + '%';
-            const secs = (now - progressT0) / 1000;
-            const speed = secs > 0.3 ? (done / secs / 1048576) : 0;
-            const left = speed > 0.01 && total > done ? (total - done) / (speed * 1048576) : 0;
-            document.getElementById('uploadProgressText').textContent =
-                formatSize(done) + ' / ' + formatSize(total) + '  (' + pct.toFixed(0) + '%)'
-                + (speed > 0.01 ? '  ' + speed.toFixed(1) + ' MB/s' : '')
-                + (left > 0 ? '  剩 ' + Math.ceil(left) + ' 秒' : '')
-                + (batchIndex ? '  批次 ' + batchIndex : '');
-        }
-
-        async function verifyManifest(entries) {
-            const chunks = [];
-            for (let i = 0; i < entries.length; i += 15000) chunks.push(entries.slice(i, i + 15000));
-            let all_ok = true; const results = [];
-            for (const c of chunks) {
-                const resp = await apiFetch('/verify', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ files: c })
-                });
-                const j = await resp.json();
-                if (!j.all_ok) all_ok = false;
-                results.push(...(j.results || []));
-            }
-            return { all_ok, results };
-        }
-
-        async function uploadFiles() {
-            const btn = document.getElementById('uploadBtn');
-            const statusMsg = document.getElementById('statusMsg');
-            if (selectedFiles.length === 0) { return; }
-            btn.disabled = true;
-            statusMsg.innerHTML = '';
-            uploadCancelled = false;
-            progressT0 = 0;
-
-            // 0) 先确认服务器可达，否则立即明确报错（避免关着服务端时干等重试）
-            try {
-                const ctrl = new AbortController();
-                const t = setTimeout(() => ctrl.abort(), 3000);
-                const r = await apiFetch('/info', { signal: ctrl.signal });
-                clearTimeout(t);
-                if (!r.ok) throw 0;
-            } catch (e) {
-                statusMsg.innerHTML = '<div class="status error">无法连接中转服务器：请确认电脑上运行着 transdata.exe，且手机与电脑在同一网络</div>';
-                btn.disabled = false;
-                btn.textContent = '确认';
-                return;
-            }
-
-            // 1) 先核对一次，已完好的不重传（断点续传效果）
-            let skip = new Set();
-            try {
-                const j = await verifyManifest(manifestOf(selectedFiles));
-                (j.results || []).forEach(r => { if (r.status === 'ok') skip.add(r.path); });
-            } catch (e) {}
-            const todo = selectedFiles.filter(it => !skip.has(it.path));
-            if (skip.size > 0) {
-                statusMsg.innerHTML = '<div class="status success">检测到 ' + skip.size + ' 个文件已完好，跳过；剩余 ' + todo.length + ' 个待传</div>';
-            }
-
-            // 2) 分批上传，单批失败重试 3 次
-            const batches = buildBatches(todo);
-            let failedCount = 0;
-            const totalBytes = todo.reduce((n, it) => n + it.file.size, 0);
-            let doneBytes = 0;
-            if (totalBytes > 0) {
-                showProgress(true);
-                setProgress(0, totalBytes, 0);
-            }
-            for (let bi = 0; bi < batches.length; bi++) {
-                const batch = batches[bi];
-                const batchBytes = batch.reduce((n, it) => n + it.file.size, 0);
-                let ok = false;
-                for (let attempt = 1; attempt <= 3 && !ok; attempt++) {
-                    if (uploadCancelled) break;
-                    btn.textContent = '传输中 批次 ' + (bi + 1) + '/' + batches.length + ' …';
-                    statusMsg.innerHTML = '<div class="status">第 ' + attempt + ' 次传输中…</div>';
-                    try {
-                        // XHR 而不是 fetch：只有 XHR 能报告上传进度（可取消）
-                        const j = await uploadBatch(batch, (loaded) => {
-                            setProgress(doneBytes + loaded, totalBytes, bi);
-                        });
-                        ok = !!(j && j.success);
-                    } catch (e) { ok = false; }
-                    if (!ok && attempt < 3 && !uploadCancelled) {
-                        statusMsg.innerHTML = '<div class="status error">第 ' + attempt + ' 次失败，2 秒后重试…</div>';
-                        await new Promise(r => setTimeout(r, 2000));
-                    }
-                }
-                if (ok) {
-                    doneBytes += batchBytes;
-                    setProgress(doneBytes, totalBytes, bi + 1);
-                    statusMsg.innerHTML = '<div class="status success">批次 ' + (bi + 1) + '/' + batches.length + ' 完成（' + batch.length + ' 个文件）</div>';
-                } else {
-                    failedCount = selectedFiles.length;
-                    statusMsg.innerHTML = uploadCancelled
-                        ? '<div class="status error">已取消传输（已传完的部分保留，再点「确认」可续传）</div>'
-                        : '<div class="status error">批次 ' + (bi + 1) + ' 重试 3 次仍失败，已停止（重开本页再点上传可自动续传）</div>';
-                    break;
-                }
-            }
-            showProgress(false);
-
-            // 3) 最终清单校验
-            if (failedCount === 0 && todo.length > 0) {
-                btn.textContent = '校验中…';
-                let j;
-                try {
-                    j = await verifyManifest(manifestOf(todo));
-                } catch (e) { j = { all_ok: false, results: [] }; }
-                const bad = (j.results || []).filter(r => r.status !== 'ok');
-                if (j.all_ok) {
-                    statusMsg.innerHTML = '<div class="status success">✅ 共 ' + selectedFiles.length + ' 个文件，校验全部通过</div>';
-                } else {
-                    const sample = bad.slice(0, 20).map(r => escHtml(r.path) + '（' + r.status + '）').join('<br>');
-                    statusMsg.innerHTML = '<div class="status error">⚠️ ' + bad.length + ' 个文件未通过校验：<br>' + sample +
-                        (bad.length > 20 ? '<br>…（共 ' + bad.length + ' 个）' : '') + '<br>重开本页再点上传可自动续传</div>';
-                }
-            } else if (failedCount > 0) {
-                if (!uploadCancelled) {
-                    statusMsg.innerHTML += '<div class="status error">本批次传输失败，未做最终校验</div>';
-                }
-            }
-
-            if (failedCount === 0) {
-                selectedFiles = [];
-                document.getElementById('fileInput').value = '';
-                document.getElementById('folderInput').value = '';
-                document.getElementById('fileList').innerHTML = '';
-                btn.textContent = '✅ 完成';
-                btn.disabled = true;
-            } else {
-                // 保留待传列表：直接再点「确认」即可自动续传（已完好的会跳过）
-                btn.textContent = '确认';
-                btn.disabled = false;
-            }
-        }
-
-        function encPath(p) { return p.split('/').map(encodeURIComponent).join('/'); }
-
-        // 下载列表：最原始的分页——每页 8 行（行已收窄），上一页/下一页按钮，
-        // 无嵌套滚动框（避开安卓魔改浏览器的渲染坑）。数据一次拉回，翻页纯本地切。
-        const DL_PAGE = 8;
-        let dlFiles = null;   // 最近一次 /files 的完整结果
-        let dlPage = 1;
-
-        async function loadDownloadList() {
-            const list = document.getElementById('downloadList');
-            const countEl = document.getElementById('dlCount');
-            try {
-                const response = await apiFetch('/files');
-                dlFiles = await response.json();
-            } catch (error) {
-                countEl.textContent = '';
-                list.innerHTML = '<p class="empty-hint" style="color:#dc3545;">加载失败</p>';
-                document.getElementById('dlNav').style.display = 'none';
-                return;
-            }
-            dlPage = 1;
-            renderDlPage();
-        }
-
-        function dlPrev() { if (dlPage > 1) { dlPage--; renderDlPage(); } }
-        function dlNext() { dlPage++; renderDlPage(); }
-
-        function renderDlPage() {
-            const list = document.getElementById('downloadList');
-            const countEl = document.getElementById('dlCount');
-            const nav = document.getElementById('dlNav');
-            const all = dlFiles ? (dlFiles.files || []) : [];
-            if (all.length === 0) {
-                countEl.textContent = '';
-                list.innerHTML = '<p class="empty-hint">暂无文件</p>';
-                nav.style.display = 'none';
-                return;
-            }
-            // 顶层文件 vs 文件夹（上传目录的相对路径按首段分组）
-            const topFiles = all.filter(f => !f.name.includes('/'));
-            const folders = {};
-            for (const f of all.filter(f => f.name.includes('/'))) {
-                const top = f.name.split('/')[0];
-                if (!folders[top]) folders[top] = { count: 0, bytes: 0 };
-                folders[top].count++; folders[top].bytes += f.size;
-            }
-            const folderNames = Object.keys(folders);
-
-            const totalTop = topFiles.length;
-            const totalPages = Math.max(1, Math.ceil(totalTop / DL_PAGE));
-            if (dlPage > totalPages) dlPage = totalPages;
-
-            countEl.innerHTML = '共 ' + all.length + ' 个文件' +
-                (dlFiles.truncated ? '（超过 1 万仅显示部分）' : '') +
-                (totalPages === 1 && folderNames.length === 1 && totalTop === 0
-                    ? `&nbsp;｜&nbsp;<a href="${withToken(`/zip/${encPath(folderNames[0])}`)}" style="color:#667eea;">全部打包下载 zip</a>`
-                    : '') +
-                '&nbsp;｜&nbsp;<a href="#" onclick="loadDownloadList();return false;" style="color:#667eea;">刷新</a>';
-
-            let html = '';
-            for (const [name, meta] of Object.entries(folders)) {
-                html += `<div class="file-item"><div class="file-info"><div class="file-name">&#128193; ${escHtml(name)}</div><div class="file-size">${meta.count} 个文件 · ${formatSize(meta.bytes)}</div></div>` +
-                    `<a href="${withToken(`/zip/${encPath(name)}`)}" class="download-btn">打包下载</a>` +
-                    `<button class="delete-btn" data-p="${escHtml(name)}" onclick="deleteItem(this.dataset.p)">删除</button></div>`;
-            }
-            const start = (dlPage - 1) * DL_PAGE;
-            const slice = topFiles.slice(start, start + DL_PAGE);
-            for (const f of slice) {
-                html += `<div class="file-item"><div class="file-info"><div class="file-name">${escHtml(f.name)}</div><div class="file-size">${formatSize(f.size)}</div></div>` +
-                    `<a href="${withToken(`/download/${encPath(f.name)}`)}" class="download-btn">下载</a>` +
-                    `<button class="delete-btn" data-p="${escHtml(f.name)}" onclick="deleteItem(this.dataset.p)">删除</button></div>`;
-            }
-            if (slice.length === 0 && totalTop > 0) {
-                html += '<p class="empty-hint">本页无散文件（见上方文件夹）</p>' + html;
-            }
-            list.innerHTML = html;
-
-            // 上一页 / 下一页（只有多页时才显示）
-            if (totalPages > 1) {
-                nav.style.display = 'flex';
-                nav.innerHTML = `<button class="page-btn" onclick="dlPrev()" ${dlPage === 1 ? 'disabled' : ''}>上一页</button>` +
-                    `<span class="page-info">${dlPage}/${totalPages} 页</span>` +
-                    `<button class="page-btn" onclick="dlNext()" ${dlPage === totalPages ? 'disabled' : ''}>下一页</button>`;
-            } else {
-                nav.style.display = 'none';
-                nav.innerHTML = '';
-            }
-        }
-        async function deleteItem(p) {
-            if (!confirm('删除「' + p + '」？')) return;
-            try {
-                const response = await apiFetch('/delete/' + encPath(p), { method: 'DELETE' });
-                const result = await response.json();
-                if (result.success) {
-                    loadDownloadList();
-                }
-                else alert('删除失败：' + (result.error || '未知错误'));
-            } catch (error) {
-                alert('删除失败');
-            }
-        }
-
-        // ------------------------------------------------------------------
-        // 快捷文本（shared note）：/note 存取 + /ws 实时推送，不轮询。
-        // 两端各一个输入框，点「发送」后另一端自动填入（直接覆盖）。
-        // 点「复制」= 取最新 + 全选 + （HTTPS 下）一键进本机剪贴板。
-        // ------------------------------------------------------------------
-        let noteLastV = 0;   // 最近应用到的版本号
-        let noteWs = null;
-        let noteSyncedAt = 0;
-
-        const noteText = document.getElementById('noteText');
-        const noteStatus = document.getElementById('noteStatus');
-        const noteMeta = document.getElementById('noteMeta');
-
-        function noteSetStatus(msg, ok) {
-            noteStatus.innerHTML = msg
-                ? '<div class="status ' + (ok ? 'success' : 'error') + '">' + msg + '</div>'
-                : '';
-        }
-
-        // 字数 + 最近同步时间（让便签有"活"的反馈）
-        function noteUpdateMeta() {
-            const n = noteText.value.length;
-            let when = '';
-            if (noteSyncedAt) {
-                const d = new Date(noteSyncedAt);
-                const p = x => (x < 10 ? '0' : '') + x;
-                when = ' · ' + p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
-            }
-            noteMeta.textContent = n + ' 字' + when;
-        }
-        noteText.addEventListener('input', noteUpdateMeta);
-
-        async function noteInit() {
-            try {
-                const r = await apiFetch('/note');
-                const j = await r.json();
-                if (j.success) {
-                    noteText.value = j.text || '';
-                    noteLastV = j.v || 0;
-                    noteSyncedAt = Date.now();
-                }
-            } catch (e) {}
-            noteUpdateMeta();
-            noteConnectWs();
-        }
-
-        async function noteSend() {
-            const text = noteText.value;
-            try {
-                const r = await apiFetch('/note', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'text/plain; charset=utf-8' },
-                    body: text
-                });
-                const j = await r.json();
-                if (j.success) {
-                    noteLastV = j.v;
-                    noteSyncedAt = Date.now();
-                    noteUpdateMeta();
-                    noteSetStatus('已发送，另一端将自动填入', true);
-                } else {
-                    noteSetStatus('发送失败', false);
-                }
-            } catch (e) {
-                noteSetStatus('发送失败（网络错误）', false);
-            }
-        }
-
-        async function noteCopy() {
-            // 1) 取最新并显示（不清空自己正在编辑的内容：取的是服务端最新）
-            try {
-                const r = await apiFetch('/note');
-                const j = await r.json();
-                if (j.success) {
-                    noteText.value = j.text || '';
-                    noteLastV = j.v || 0;
-                    noteSyncedAt = Date.now();
-                    noteUpdateMeta();
-                }
-            } catch (e) {} // 取不到就保持现有内容
-            // 2) 默认全选
-            noteText.focus();
-            noteText.select();
-            // 3) 能一键就一键（HTTPS/localhost），否则靠全选+长按复制
-            let copied = false;
-            try {
-                if (navigator.clipboard && window.isSecureContext) {
-                    await navigator.clipboard.writeText(noteText.value);
-                    copied = true;
-                } else {
-                    copied = document.execCommand && document.execCommand('copy');
-                }
-            } catch (e) { copied = false; }
-            if (copied) noteSetStatus('已复制到剪贴板', true);
-            else noteSetStatus('已全选：长按文字 → 复制，即可粘贴使用', true);
-        }
-
-        function noteConnectWs() {
-            if (noteWs && (noteWs.readyState === 0 || noteWs.readyState === 1)) return;
-            const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-            noteWs = new WebSocket(proto + '//' + location.host + withToken('/ws'));
-            noteWs.onmessage = (e) => {
-                let m;
-                try { m = JSON.parse(e.data); } catch (_) { return; }
-                if (!m || typeof m.v !== 'number' || m.v <= noteLastV) return;
-                // 直接覆盖本地内容（包括未发送的编辑）
-                noteLastV = m.v;
-                noteText.value = m.text || '';
-                noteSyncedAt = Date.now();
-                noteUpdateMeta();
-                noteSetStatus('已收到对方内容', true);
-            };
-            noteWs.onclose = () => { noteWs = null; setTimeout(noteConnectWs, 2000); };
-            noteWs.onerror = () => { try { noteWs.close(); } catch (_) {} };
-        }
-
-        async function getServerUrl() {
-            try {
-                const response = await apiFetch('/info');
-                const info = await response.json();
-                const el = document.getElementById('serverUrl');
-                const text = '地址：' + info.url;
-                el.textContent = text;
-                el.title = text; // 整行可点开看全文（长路径会被省略号截断）
-            } catch (error) {
-                document.getElementById('serverUrl').textContent = '地址：' + window.location.href;
-            }
-        }
-
-        getServerUrl();
-        noteInit();
-    </script>
+<script src="/app.js" defer></script>
 </body>
 </html>

@@ -4,6 +4,7 @@ mod config;
 mod gui;
 mod http;
 mod net;
+mod tls;
 mod web;
 
 use config::Config;
