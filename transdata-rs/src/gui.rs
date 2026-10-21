@@ -458,7 +458,10 @@ pub fn run_gui(cfg: Arc<Config>, port: u16) {
     // 写回一份：用户能直接打开 settings.json 改更新地址
     settings.save();
     let theme = settings.theme;
-    // 在线更新的状态：启动时先查一次版本，设置面板里直接能看到"最新版本"
+    // 在线更新的状态：只有打开设置面板/点「检查更新」时才会去问更新服务器
+    //
+    // 故意**不在启动时联网**：这个工具可能几年不更新，每次启动都去 GitHub
+    // 问一次版本纯属浪费（还会把本机 IP 暴露给 GitHub）。平时它是纯离线的。
     let update_slot: Arc<std::sync::Mutex<crate::update::UpdateStatus>> =
         Arc::new(std::sync::Mutex::new(crate::update::UpdateStatus::Idle));
     // egui Context, captured when eframe creates the window; the WS note
@@ -466,33 +469,6 @@ pub fn run_gui(cfg: Arc<Config>, port: u16) {
     let ctx_holder: Arc<std::sync::Mutex<Option<eframe::egui::Context>>> =
         Arc::new(std::sync::Mutex::new(None));
     let ctx_holder_gui = ctx_holder.clone();
-    {
-        let url = settings.update_url.clone();
-        let slot = update_slot.clone();
-        let ctx_holder_check = ctx_holder.clone();
-        std::thread::spawn(move || {
-            let result = match crate::update::fetch_release(&url) {
-                Ok(rel) => {
-                    if crate::update::is_newer(&rel.version, crate::update::APP_VERSION) {
-                        crate::update::UpdateStatus::Available(rel)
-                    } else {
-                        crate::update::UpdateStatus::UpToDate(rel.version)
-                    }
-                }
-                Err(e) if e == crate::update::NO_RELEASE => {
-                    crate::update::UpdateStatus::UpToDate(
-                        crate::update::APP_VERSION.to_string(),
-                    )
-                }
-                Err(e) => crate::update::UpdateStatus::Failed(e),
-            };
-            *slot.lock().unwrap() = result;
-            eprintln!("update check: {:?}", slot.lock().unwrap());
-            if let Some(ctx) = ctx_holder_check.lock().unwrap().clone() {
-                ctx.request_repaint();
-            }
-        });
-    }
     // Number of transfers currently in flight (the status dot in the window).
     let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let active_gui = active.clone();
@@ -977,8 +953,14 @@ impl GuiApp {
     fn toggle_settings(&mut self, ctx: &eframe::egui::Context) {
         self.settings_open = !self.settings_open;
         if self.settings_open {
-            // 打开就顺手查一次有没有新版本
-            self.start_update_check(ctx);
+            // 第一次打开时查一次版本；之后不再自动查（想刷新点「检查更新」）
+            let first_time = matches!(
+                *self.update.lock().unwrap(),
+                crate::update::UpdateStatus::Idle
+            );
+            if first_time {
+                self.start_update_check(ctx);
+            }
         }
         ctx.request_repaint();
     }
