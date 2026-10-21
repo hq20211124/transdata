@@ -458,9 +458,9 @@ pub fn run_gui(cfg: Arc<Config>, port: u16) {
     // 写回一份：用户能直接打开 settings.json 改更新地址
     settings.save();
     let theme = settings.theme;
-    // 在线更新的状态：只有打开设置面板/点「检查更新」时才会去问更新服务器
+    // 在线更新的状态：只有用户点「检查更新」时才会去问更新服务器
     //
-    // 故意**不在启动时联网**：这个工具可能几年不更新，每次启动都去 GitHub
+    // 故意**完全不做主动检测**：这个工具可能几年不更新，每次启动都去 GitHub
     // 问一次版本纯属浪费（还会把本机 IP 暴露给 GitHub）。平时它是纯离线的。
     let update_slot: Arc<std::sync::Mutex<crate::update::UpdateStatus>> =
         Arc::new(std::sync::Mutex::new(crate::update::UpdateStatus::Idle));
@@ -951,17 +951,8 @@ impl GuiApp {
 
     /// 打开 / 关闭设置面板
     fn toggle_settings(&mut self, ctx: &eframe::egui::Context) {
+        // 打开面板**不**联网：想看有没有新版本自己点「检查更新」
         self.settings_open = !self.settings_open;
-        if self.settings_open {
-            // 第一次打开时查一次版本；之后不再自动查（想刷新点「检查更新」）
-            let first_time = matches!(
-                *self.update.lock().unwrap(),
-                crate::update::UpdateStatus::Idle
-            );
-            if first_time {
-                self.start_update_check(ctx);
-            }
-        }
         ctx.request_repaint();
     }
 
