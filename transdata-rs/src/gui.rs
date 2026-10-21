@@ -1479,8 +1479,37 @@ impl GuiApp {
                     .inner_margin(eframe::egui::Margin::symmetric(18.0, 12.0)),
             )
             .show(ctx, |ui| {
+                // ---- 高度怎么分：上半部分（地址/目录/扫码）+ 下半部分（快捷文本）
+                //
+                // 之前便签卡的高度是「用剩下的空间」算出来的：窗口一矮，剩下
+                // 的空间不够放整张卡，卡就被裁到窗口外，底下的「复制 / 发送」
+                // 按钮跟着一起没了。现在改成**先把高度分配好**：
+                // 快捷文本卡固定占住底部一块，主区拿剩下的 → 按钮永远在。
+                const NOTE_MIN_H: f32 = 186.0; // 94 + 输入框 80 + 外边距 12
+                let panel = ui.available_rect_before_wrap();
+                let avail_h = panel.height();
+                // 便签卡占 34%（最多 360），剩下的给上面的主区
+                let note_h = (avail_h * 0.34).clamp(NOTE_MIN_H, 360.0);
+                // 94 = 卡片内边距 28 + 标题行 18 + 两处 8 + 按钮行 32，外边距 12
+                let input_h = (note_h - 106.0).clamp(80.0, 360.0);
+                let row_h = (avail_h - note_h - 12.0).max(140.0);
+                // 窗口矮的时候，主区里可有可无的说明文字先让位
+                let compact = row_h < 300.0;
+                let compact2 = row_h < 250.0;
 
-                // ---- Main: left (地址 + 传输目录) | right (手机扫码), centered
+                // 两块区域的矩形直接算出来，不靠布局流推：
+                // 上半部分（地址/目录/扫码）+ 下半部分（快捷文本，贴死底部）
+                let main_rect = eframe::egui::Rect::from_min_max(
+                    panel.min,
+                    eframe::egui::pos2(panel.right(), panel.top() + row_h),
+                );
+                let note_rect = eframe::egui::Rect::from_min_max(
+                    eframe::egui::pos2(panel.left(), panel.bottom() - note_h),
+                    panel.max,
+                );
+
+                // ---- Main: left (地址 + 传输目录) | right (手机扫码)
+                ui.allocate_ui_at_rect(main_rect, |ui| {
                 ui.with_layout(
                     eframe::egui::Layout::left_to_right(eframe::egui::Align::Center),
                     |ui| {
@@ -1492,7 +1521,7 @@ impl GuiApp {
                         // max-sized ui instead.
                         let right_w = 186.0_f32;
                         let left_w = (ui.available_width() - right_w - 12.0).max(240.0);
-                        let max_h = ui.available_height();
+                        let max_h = row_h;
 
                         // Left column
                         ui.allocate_ui_with_layout(
@@ -1524,7 +1553,7 @@ impl GuiApp {
                                 ui.label(RichText::new(shown).font(url_font).color(pal::now().accent));
                                 // Hotspot / second NIC: the default-route IP may not be
                                 // the one the phone can reach — list all IPs.
-                                if self.ips.len() > 1 {
+                                if self.ips.len() > 1 && !compact {
                                     ui.add_space(4.0);
                                     let tip = format!(
                                         "全部IP：{}（热点用 192.168.137.1）",
@@ -1556,17 +1585,19 @@ impl GuiApp {
                                     ctx.request_repaint();
                                 }
                                 if self.cfg.tls_on() {
-                                    ui.add_space(4.0);
-                                    ui.add(
-                                        eframe::egui::Label::new(
-                                            RichText::new(
-                                                "手机首次打开会提示一次「证书不受信任」：Chrome 点「高级 → 继续前往」，Safari 点「显示详细信息 → 访问此网站」。",
+                                    if !compact {
+                                        ui.add_space(4.0);
+                                        ui.add(
+                                            eframe::egui::Label::new(
+                                                RichText::new(
+                                                    "手机首次打开会提示一次「证书不受信任」：Chrome 点「高级 → 继续前往」，Safari 点「显示详细信息 → 访问此网站」。",
+                                                )
+                                                .size(10.5)
+                                                .color(pal::now().muted),
                                             )
-                                            .size(10.5)
-                                            .color(pal::now().muted),
-                                        )
-                                        .wrap(),
-                                    );
+                                            .wrap(),
+                                        );
+                                    }
                                     if let Some(m) = self.cfg.tls_material() {
                                         ui.add_space(4.0);
                                         ui.horizontal(|ui| {
@@ -1587,14 +1618,16 @@ impl GuiApp {
                                         });
                                     }
                                 } else {
-                                    ui.add(
-                                        eframe::egui::Label::new(
-                                            RichText::new("不开启时为明文 HTTP，同一网络内可被旁观。")
-                                                .size(10.5)
-                                                .color(pal::now().muted),
-                                        )
-                                        .wrap(),
-                                    );
+                                    if !compact {
+                                        ui.add(
+                                            eframe::egui::Label::new(
+                                                RichText::new("不开启时为明文 HTTP，同一网络内可被旁观。")
+                                                    .size(10.5)
+                                                    .color(pal::now().muted),
+                                            )
+                                            .wrap(),
+                                        );
+                                    }
                                 }
                             });
                             ui.add_space(12.0);
@@ -1634,17 +1667,19 @@ impl GuiApp {
                                     .color(pal::now().fg),
                                 );
                                 ui.add_space(6.0);
-                                ui.add(
-                                    eframe::egui::Label::new(
-                                        RichText::new(
-                                            "关闭窗口即停止服务器；「打开」进入目录，「更改」切换位置",
+                                if !compact2 {
+                                    ui.add(
+                                        eframe::egui::Label::new(
+                                            RichText::new(
+                                                "关闭窗口即停止服务器；「打开」进入目录，「更改」切换位置",
+                                            )
+                                            .size(11.0)
+                                            .color(pal::now().muted)
+                                            .weak(),
                                         )
-                                        .size(11.0)
-                                        .color(pal::now().muted)
-                                        .weak(),
-                                    )
-                                    .wrap(),
-                                );
+                                        .wrap(),
+                                    );
+                                }
                             });
                             },
                         );
@@ -1665,6 +1700,8 @@ impl GuiApp {
                                         .color(pal::now().muted),
                                 );
                                 ui.add_space(8.0);
+                                // 二维码跟着窗口高度缩：窗口矮了也不能把码裁掉
+                                let qr_px = (row_h - 120.0).clamp(72.0, 118.0);
                                 ui.vertical_centered(|ui| {
                                     if let Some(handle) = &self.qr_handle {
                                         eframe::egui::Frame::none()
@@ -1681,7 +1718,7 @@ impl GuiApp {
                                                         handle,
                                                     )
                                                     .max_size(eframe::egui::vec2(
-                                                        118.0_f32, 118.0_f32,
+                                                        qr_px, qr_px,
                                                     )),
                                                 );
                                             });
@@ -1727,25 +1764,17 @@ impl GuiApp {
                             });
                         },
                     );
-                    },
+                    }
                 );
+                });
                 ui.add_space(12.0);
 
                 // ---- Quick-note card: 贴住窗口底部，共享文本框与手机页实时同步
                 // 复制 = 复制框内文字到本机剪贴板；发送 = 推给另一端（自动填入）。
                 // 远端内容总是覆盖本地编辑。
-                // 卡片高度 = 剩余空间，输入框把剩余高度吃掉，窗口底部不留空白。
-                let leftover = ui.available_height();
-                // 输入框吃掉剩余空间（窗口最大化时输入框变高，中间不留灰洞）
-                // 94 = 卡片内边距 28 + 标题行 18 + 两处 8 + 按钮行 32
-                let input_h = (leftover - 94.0).clamp(80.0, 360.0);
-                ui.with_layout(
-                    eframe::egui::Layout::bottom_up(eframe::egui::Align::Min),
-                    |ui| {
-                    // 卡片内部要恢复成从上到下（bottom_up 会把里面的顺序也倒过来）
-                    ui.with_layout(
-                        eframe::egui::Layout::top_down(eframe::egui::Align::Min),
-                        |ui| {
+                // 高度上面已经算好并直接给出矩形 —— 窗口再矮，底下的
+                // 「复制 / 发送」也不会被裁掉。
+                ui.allocate_ui_at_rect(note_rect, |ui| {
                     card(ui, |ui| {
                         ui.horizontal(|ui| {
                             section_label(ui, "快捷文本");
@@ -1825,10 +1854,7 @@ impl GuiApp {
                             self.note_local = Some(self.text_buf.clone());
                         }
                     });
-                        },
-                    );
-                    },
-                );
+                });
 
             });
 
@@ -2427,10 +2453,21 @@ mod tests {
     ///
     /// 连画好几帧：设置面板是带淡入动画的，只画一帧的话它还没出现。
     fn render_png(ctx: &egui::Context, app: &mut GuiApp, path: &str) {
+        render_png_size(ctx, app, path, WIN_W, WIN_H);
+    }
+
+    /// 指定窗口大小渲染一张 PNG
+    fn render_png_size(
+        ctx: &egui::Context,
+        app: &mut GuiApp,
+        path: &str,
+        w: f32,
+        h: f32,
+    ) {
         let mut input = egui::RawInput::default();
         input.screen_rect = Some(egui::Rect::from_min_size(
             egui::pos2(0.0, 0.0),
-            egui::vec2(WIN_W, WIN_H),
+            egui::vec2(w, h),
         ));
         let mut out = egui::FullOutput::default();
         for i in 0..20 {
@@ -2439,10 +2476,21 @@ mod tests {
                 app.draw(ctx);
             });
         }
+        render_shapes_to_png(ctx, out, path, w, h);
+    }
+
+    /// 把 egui 画出来的三角形光栅化成 PNG
+    fn render_shapes_to_png(
+        ctx: &egui::Context,
+        out: egui::FullOutput,
+        path: &str,
+        w: f32,
+        h: f32,
+    ) {
         let shapes = ctx.tessellate(out.shapes, out.pixels_per_point);
         let mut img = image::RgbaImage::from_pixel(
-            WIN_W as u32,
-            WIN_H as u32,
+            w as u32,
+            h as u32,
             image::Rgba([244, 245, 249, 255]),
         );
         for cp in shapes {
@@ -2540,6 +2588,66 @@ mod tests {
         assert_eq!(r - l, 640, "宽度不能小于最小值");
         let (_l, t, _r, b) = resize_rect(start, ResizeEdge::Bottom, 0, -1000, 640, 470);
         assert_eq!(b - t, 470, "高度不能小于最小值");
+    }
+
+    /// 窗口越变越小，底下的「复制 / 发送」按钮必须还在（不能被裁掉）
+    #[test]
+    #[ignore]
+    fn render_small_sizes() {
+        for (w, h) in [
+            (880.0_f32, 570.0_f32),
+            (880.0, 500.0),
+            (880.0, 470.0), // 允许的最小高度
+            (880.0, 440.0),
+            (700.0, 470.0),
+        ] {
+            let ctx = egui::Context::default();
+            let mut style = (*ctx.style()).clone();
+            style.visuals = egui::Visuals::light();
+            ctx.set_style(style);
+            crate::settings::set_theme(crate::settings::Theme::Light);
+            let mut app = GuiApp::new(
+                std::sync::Arc::new(Config::new()),
+                9999,
+                std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+                crate::settings::Settings {
+                    theme: crate::settings::Theme::Light,
+                    update_url: String::new(),
+                },
+                std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::update::UpdateStatus::Idle,
+                )),
+                #[cfg(windows)]
+                0,
+            );
+            let path = format!("target/gui_{w}x{h}.png");
+            render_png_size(&ctx, &mut app, &path, w, h);
+            // 「发送」按钮是主色填充的：找主色像素，看它有没有被裁到窗外
+            let img = image::open(&path).unwrap().to_rgba8();
+            let accent = image::Rgb([0x5A, 0x6E, 0xE8]);
+            let mut found = 0;
+            let mut max_y = 0i32;
+            for (x, y, px) in img.enumerate_pixels() {
+                let [r, g, b, _] = px.0;
+                if (r as i32 - accent[0] as i32).abs() < 12
+                    && (g as i32 - accent[1] as i32).abs() < 12
+                    && (b as i32 - accent[2] as i32).abs() < 12
+                    && y > 60
+                {
+                    found += 1;
+                    max_y = max_y.max(y as i32);
+                }
+            }
+            println!(
+                "{w}x{h}: 主色按钮像素 {found} 个, 最下到 y={max_y} (窗口高 {h}) {}",
+                if max_y > 0 && (max_y as f32) < h - 4.0 {
+                    "OK"
+                } else {
+                    "按钮被裁掉了!"
+                }
+            );
+        }
     }
 
     /// 标题栏里月亮 / 齿轮按钮的位置（逻辑坐标，窗口左上角为原点）
