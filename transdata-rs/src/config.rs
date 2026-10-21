@@ -150,6 +150,10 @@ impl Config {
         }
         dir = dir.join("uploads");
         std::fs::create_dir_all(&dir).ok();
+        // Older versions wrote the whole zip to a temp file first. If the
+        // program was killed while that was going on, a huge half-written
+        // archive is left behind — it is worthless, so drop it at startup.
+        cleanup_stale_zip_temps(&dir);
 
         let (note_tx, _) = broadcast::channel::<String>(32);
         let (tls_tx, _) = watch::channel(false);
@@ -363,6 +367,25 @@ impl Config {
     }
 }
 
+/// Delete leftover `*.zip.tmp` files in the transfer directory.
+///
+/// Older versions built the whole archive in a temp file before sending it.
+/// If the program was killed (or the machine rebooted) while that was going
+/// on, a half-written archive of arbitrary size was left behind — and
+/// nothing ever removed it. The streaming writer does not create temp files
+/// any more, so anything matching this pattern is a leftover.
+pub fn cleanup_stale_zip_temps(dir: &std::path::Path) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') && name.ends_with(".zip.tmp") && e.path().is_file() {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
 /// gzip-compress a buffer (used for the index page).
 pub fn gzip(data: &[u8]) -> Vec<u8> {
     use flate2::write::GzEncoder;
@@ -423,4 +446,34 @@ pub fn disk_free(path: &std::path::Path) -> Option<u64> {
 #[cfg(not(windows))]
 pub fn disk_free(_path: &std::path::Path) -> Option<u64> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A leftover temp archive from an interrupted build must be gone after
+    /// a restart — it can be huge and it is worthless.
+    #[test]
+    fn stale_zip_temps_are_removed_at_startup() {
+        let dir = std::env::temp_dir().join(format!(
+            "transdata_stale_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let leftover = dir.join(".docs-ab12cd.zip.tmp");
+        std::fs::write(&leftover, b"half written archive").unwrap();
+        let keep = dir.join("keep-me.txt");
+        std::fs::write(&keep, b"real file").unwrap();
+
+        cleanup_stale_zip_temps(&dir);
+
+        assert!(!leftover.exists(), "the stale temp archive must be gone");
+        assert!(keep.exists(), "real files must not be touched");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

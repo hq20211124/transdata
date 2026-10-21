@@ -675,6 +675,11 @@
             dlExpanded = !dlExpanded;
             renderFiles();
         });
+        // 打包是边压边传的：点了之后浏览器马上开始下载，浏览器自己的下载
+        // 框里能看到进度。这里只补一句提示，免得以为没反应。
+        $('zipAll').addEventListener('click', function () {
+            notice($('dlNotice'), '正在打包并下载…文件越大越慢，可以先去做别的事。', 'info');
+        });
         loadFiles();
     }
 
@@ -836,6 +841,9 @@
             var zip = el('a', 'btn btn--soft btn--sm', '打包');
             zip.href = '/zip/' + encPath(node.path);
             zip.title = '把「' + node.name + '」整个文件夹压成 zip 下载';
+            zip.addEventListener('click', function () {
+                notice($('dlNotice'), '正在打包「' + node.name + '」…边压边传，浏览器里能看到进度。', 'info');
+            });
             actions.appendChild(zip);
         } else {
             var dl = el('a', 'btn btn--soft btn--sm', '下载');

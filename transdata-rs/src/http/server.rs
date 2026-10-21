@@ -1557,18 +1557,24 @@ fn hex_lower(b: &[u8]) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// zip download of a subdirectory (streamed from a blocking thread)
+// zip download of a subdirectory (streamed while it is being built)
 
 /// `GET /zip/<dir>` — streams a whole subdirectory as a zip so the receiver
-/// gets the folder structure in one download. Memory stays flat: each file is
-/// read into 1 MiB chunks, compressed, and pushed to the socket.
+/// gets the folder structure in one download.
+///
+/// The archive is compressed **while it is being sent**: the browser gets
+/// the first bytes within milliseconds (so it shows a real progress bar),
+/// the client may walk away at any time (the build stops at the next chunk)
+/// and the transfer directory never needs a second copy of the data on disk.
+///
+/// The zip format wants a seekable output (it patches the CRC and the sizes
+/// into the local file header once the data is written). `new_stream` solves
+/// that with a data descriptor, so the archive can be produced in one pass.
 async fn zip_dir(
     sock: &mut impl Conn,
     cfg: &Arc<Config>,
     path: &std::path::Path,
 ) -> Result<(), std::io::Error> {
-    use std::io::{Read as _Read, Write as _Write};
-
     let dir = path.to_path_buf();
     if !dir.is_dir() {
         return write_json_err(sock, "Not Found").await;
@@ -1578,10 +1584,6 @@ async fn zip_dir(
     // to be canonicalized as well — otherwise strip_prefix fails and every
     // entry ends up with an empty name.
     let dir = dir.canonicalize().unwrap_or(dir);
-    // The zip crate needs a *seekable* output (it patches each entry's CRC
-    // after the data), so build the archive in a temp file inside the
-    // transfer dir, then stream it to the socket and delete it. Memory
-    // stays flat; disk cost is one compressed copy while zipping.
     let root = cfg.upload_dir();
     // The walk starts at a canonicalized path (see `resolve_rel`), so the
     // root has to be canonicalized as well for `strip_prefix` to work
@@ -1592,112 +1594,6 @@ async fn zip_dir(
         .ok()
         .map(|s| s.to_string_lossy().replace('\\', "/"))
         .unwrap_or_default();
-    let top = rel.split('/').next().unwrap_or("");
-    let safe: String = top
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-        .collect();
-    // Unique per request: two parallel zips must not share a temp file.
-    let mut rnd = [0u8; 6];
-    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut rnd);
-    let suffix: String = rnd.iter().map(|b| format!("{b:02x}")).collect();
-    let tmp_name = if safe.is_empty() {
-        format!(".files-{suffix}.zip.tmp")
-    } else {
-        format!(".{safe}-{suffix}.zip.tmp")
-    };
-    let tmp = root.join(tmp_name);
-
-    let dir_b = dir.clone();
-    let tmp_b = tmp.clone();
-    let root_b = root_canon.clone();
-    let build = tokio::task::spawn_blocking(move || -> std::io::Result<usize> {
-        let mut file = std::fs::File::create(&tmp_b)?;
-        let mut zip = zip::ZipWriter::new(&mut file);
-        let opts = zip::write::FileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated);
-        let mut n = 0usize;
-        let mut stack: Vec<(std::path::PathBuf, usize)> = vec![(dir_b.clone(), 0)];
-        while let Some((d, depth)) = stack.pop() {
-            if depth > MAX_WALK_DEPTH {
-                break;
-            }
-            if let Ok(rd) = std::fs::read_dir(&d) {
-                for e in rd.flatten() {
-                    let p = e.path();
-                    // Skip symlinks (they can point outside the dir or form
-                    // cycles).
-                    match e.file_type() {
-                        Ok(ft) if ft.is_symlink() => continue,
-                        Err(_) => continue,
-                        _ => {}
-                    }
-                    if p.is_dir() {
-                        // Skip dot-directories too (our own .trash recycle bin
-                        // must not end up in the archive).
-                        if p.file_name()
-                            .map(|n| n.to_string_lossy().starts_with('.'))
-                            .unwrap_or(false)
-                        {
-                            continue;
-                        }
-                        stack.push((p, depth + 1));
-                    } else {
-                        // Skip dotfiles (incl. our own temp archives).
-                        if p.file_name()
-                            .map(|n| n.to_string_lossy().starts_with('.'))
-                            .unwrap_or(false)
-                        {
-                            continue;
-                        }
-                        let relname = p
-                            .strip_prefix(&root_b)
-                            .ok()
-                            .map(|s| s.to_string_lossy().replace('\\', "/"));
-                        let name = relname.unwrap_or_default();
-                        if zip.start_file(name.as_str(), opts).is_err() {
-                            continue;
-                        }
-                        let mut buf = vec![0u8; 1 << 20];
-                        let mut fh = match std::fs::File::open(&p) {
-                            Ok(f) => f,
-                            Err(_) => continue,
-                        };
-                        let mut ok = true;
-                        loop {
-                            match fh.read(&mut buf) {
-                                Ok(0) => break,
-                                Ok(k) => {
-                                    if zip.write_all(&buf[..k]).is_err() {
-                                        ok = false;
-                                        break;
-                                    }
-                                }
-                                Err(_) => {
-                                    ok = false;
-                                    break;
-                                }
-                            }
-                        }
-                        if !ok {
-                            break;
-                        }
-                        n += 1;
-                    }
-                }
-            }
-        }
-        zip.finish()?;
-        Ok(n)
-    })
-    .await;
-    match build {
-        Ok(Ok(_)) => {}
-        _ => {
-            let _ = std::fs::remove_file(&tmp);
-            return write_json_err(sock, "zip build failed").await;
-        }
-    }
 
     let fname = rel.replace('/', ".");
     let zip_name = if fname.is_empty() {
@@ -1709,6 +1605,9 @@ async fn zip_dir(
     let mut out = Vec::with_capacity(512);
     out.extend_from_slice(b"HTTP/1.1 200 OK\r\n");
     out.extend_from_slice(b"Content-Type: application/zip\r\n");
+    // The size is not known in advance (the archive is still being built),
+    // so the body is sent with chunked transfer encoding.
+    out.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
     out.extend_from_slice(
         format!(
             "Content-Disposition: attachment; filename=\"{zip_name}\"; filename*=UTF-8''{encoded}\r\n"
@@ -1719,31 +1618,227 @@ async fn zip_dir(
     out.extend_from_slice(b"Connection: close\r\n");
     out.extend_from_slice(b"\r\n");
     sock.write_all(&out).await?;
+    sock.flush().await?;
 
-    // Stream the finished archive to the client, then clean up.
-    let f = match tokio::fs::File::open(&tmp).await {
-        Ok(f) => f,
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e);
-        }
-    };
-    let mut reader = BufReader::with_capacity(1 << 20, f);
-    let mut chunk = vec![0u8; 1 << 20];
-    loop {
-        match reader.read(&mut chunk).await {
-            Ok(0) => break,
-            Ok(k) => {
-                if sock.write_all(&chunk[..k]).await.is_err() {
-                    break; // client left mid-transfer
-                }
+    let _active = ActiveGuard::new(cfg);
+
+    // The builder runs on a blocking thread and hands the archive over in
+    // chunks. The channel is bounded: a client that stops reading slows the
+    // builder down instead of filling up the memory.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+
+    let dir_b = dir.clone();
+    let root_b = root_canon.clone();
+    let build = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        let mut zip = zip::ZipWriter::new_stream(ChunkWriter::new(tx));
+        match build_entries(&mut zip, &dir_b, &root_b) {
+            Ok(()) => {
+                // Writes the central directory, then closes the chunked body.
+                let mut w = zip
+                    .finish()
+                    .map_err(|e| std::io::Error::other(e.to_string()))?
+                    .into_inner();
+                w.finish()
             }
-            Err(_) => break,
+            Err(e) => {
+                // Close the writer instead of dropping it: the crate would
+                // otherwise try to write a central directory into a socket
+                // that is already gone — and complain about it on stderr.
+                let _ = zip.finish();
+                Err(e)
+            }
+        }
+    });
+
+    // Pump the archive to the client. If the client disappears the write
+    // fails, we drop the receiver and the builder stops at the next chunk.
+    let mut client_gone = false;
+    while let Some(buf) = rx.recv().await {
+        if sock.write_all(&buf).await.is_err() {
+            client_gone = true;
+            break;
         }
     }
-    let _ = std::fs::remove_file(&tmp);
+    // Must happen before awaiting the builder: a builder that is waiting for
+    // room in the channel only notices the dead client when the receiver is
+    // gone.
+    drop(rx);
+    let built = build.await;
+
+    if client_gone {
+        // The client is not there anymore — nothing left to do.
+        return Ok(());
+    }
+    if built.is_err() {
+        // No terminating chunk: the client sees a truncated download and
+        // reports it instead of saving a broken archive.
+        let _ = tokio::io::AsyncWriteExt::shutdown(sock).await;
+        return Ok(());
+    }
     let _ = tokio::io::AsyncWriteExt::shutdown(sock).await;
     Ok(())
+}
+
+/// "The client hung up" — the builder uses it to stop early.
+fn broken_pipe() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::BrokenPipe, "client hung up")
+}
+
+/// Add every file below `dir` to the archive.
+///
+/// `root` is the transfer directory: the names inside the archive are
+/// relative to it, so the folder structure survives the round trip.
+fn build_entries<W: std::io::Write>(
+    zip: &mut zip::ZipWriter<zip::write::StreamWriter<W>>,
+    dir: &std::path::Path,
+    root: &std::path::Path,
+) -> std::io::Result<()> {
+    use std::io::{Read as _, Write as _};
+
+    let opts = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    let mut stack: Vec<(std::path::PathBuf, usize)> = vec![(dir.to_path_buf(), 0)];
+    while let Some((d, depth)) = stack.pop() {
+        if depth > MAX_WALK_DEPTH {
+            break;
+        }
+        if let Ok(rd) = std::fs::read_dir(&d) {
+            for e in rd.flatten() {
+                let p = e.path();
+                // Skip symlinks (they can point outside the dir or form
+                // cycles).
+                match e.file_type() {
+                    Ok(ft) if ft.is_symlink() => continue,
+                    Err(_) => continue,
+                    _ => {}
+                }
+                if p.is_dir() {
+                    // Skip dot-directories too (our own .trash recycle bin
+                    // must not end up in the archive).
+                    if p.file_name()
+                        .map(|n| n.to_string_lossy().starts_with('.'))
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    stack.push((p, depth + 1));
+                    continue;
+                }
+                // Skip dotfiles.
+                if p.file_name()
+                    .map(|n| n.to_string_lossy().starts_with('.'))
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                let relname = p
+                    .strip_prefix(root)
+                    .ok()
+                    .map(|s| s.to_string_lossy().replace('\\', "/"));
+                let name = relname.unwrap_or_default();
+                if zip.start_file(name.as_str(), opts).is_err() {
+                    return Err(broken_pipe());
+                }
+                let mut buf = vec![0u8; 1 << 20];
+                let mut fh = match std::fs::File::open(&p) {
+                    Ok(f) => f,
+                    Err(_) => continue,
+                };
+                let mut ok = true;
+                loop {
+                    match fh.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(k) => {
+                            if zip.write_all(&buf[..k]).is_err() {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        Err(_) => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if !ok {
+                    // The client is gone (or the disk failed): stop the
+                    // build instead of compressing a package nobody is
+                    // waiting for.
+                    return Err(broken_pipe());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// How much of the archive is buffered before it is handed to the socket.
+const ZIP_CHUNK: usize = 256 * 1024;
+
+/// A [`std::io::Write`] that frames the archive as HTTP chunked-transfer
+/// encoding and hands the pieces to the async side through a channel.
+///
+/// The channel is bounded, so a client that stops reading throttles the
+/// builder instead of letting it buffer the whole archive in memory.
+struct ChunkWriter {
+    tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    buf: Vec<u8>,
+    broken: bool,
+}
+
+impl ChunkWriter {
+    fn new(tx: tokio::sync::mpsc::Sender<Vec<u8>>) -> Self {
+        ChunkWriter {
+            tx,
+            buf: Vec::with_capacity(ZIP_CHUNK + 64),
+            broken: false,
+        }
+    }
+
+    /// Send what is left and close the chunked body.
+    fn finish(&mut self) -> std::io::Result<()> {
+        self.flush_chunk()?;
+        self.tx
+            .blocking_send(b"0\r\n\r\n".to_vec())
+            .map_err(|_| broken_pipe())
+    }
+
+    fn flush_chunk(&mut self) -> std::io::Result<()> {
+        if self.broken {
+            return Err(broken_pipe());
+        }
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        let mut out = Vec::with_capacity(self.buf.len() + 32);
+        out.extend_from_slice(format!("{:x}\r\n", self.buf.len()).as_bytes());
+        out.extend_from_slice(&self.buf);
+        out.extend_from_slice(b"\r\n");
+        self.buf.clear();
+        if self.tx.blocking_send(out).is_err() {
+            // The receiver is gone: the client hung up.
+            self.broken = true;
+            return Err(broken_pipe());
+        }
+        Ok(())
+    }
+}
+
+impl std::io::Write for ChunkWriter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if self.broken {
+            return Err(broken_pipe());
+        }
+        self.buf.extend_from_slice(data);
+        if self.buf.len() >= ZIP_CHUNK {
+            self.flush_chunk()?;
+        }
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.flush_chunk()
+    }
 }
 // ---------------------------------------------------------------------------
 // url_decode
@@ -3131,21 +3226,123 @@ mod folder_tests {
         assert!(!dir.join("docs").exists(), "tree must be gone");
     }
 
+    /// Split an HTTP response into head and body.
+    fn split_response(resp: &[u8]) -> (String, Vec<u8>) {
+        let pos = resp
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("no head terminator");
+        (
+            String::from_utf8_lossy(&resp[..pos]).to_string(),
+            resp[pos + 4..].to_vec(),
+        )
+    }
+
+    /// Decode an HTTP chunked-transfer body.
+    fn dechunk(body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i < body.len() {
+            let nl = body[i..]
+                .iter()
+                .position(|&b| b == b'\n')
+                .expect("truncated chunk header")
+                + i;
+            let line = String::from_utf8_lossy(&body[i..nl]);
+            let size = usize::from_str_radix(line.trim().split(';').next().unwrap().trim(), 16)
+                .expect("bad chunk size");
+            i = nl + 1;
+            if size == 0 {
+                break;
+            }
+            assert!(i + size <= body.len(), "truncated chunk body");
+            out.extend_from_slice(&body[i..i + size]);
+            i += size + 2; // the CRLF after the chunk
+        }
+        out
+    }
+
     #[tokio::test]
     async fn zip_smoke_test() {
         let (port, dir) = setup("zip", &[("docs/a.txt", b"AAA"), ("docs/sub/b.txt", b"BBBB")]).await;
         let resp = http_bytes(port, "GET /zip/docs HTTP/1.1\r\nHost: t\r\nX-TD-Secret: test-secret\r\n\r\n").await;
-        let text = String::from_utf8_lossy(&resp);
-        assert!(text.starts_with("HTTP/1.1 200"), "head: {}", &text[..text.len().min(60)]);
-        assert!(resp.windows(4).any(|w| w == b"PK\x03\x04"), "no zip local header");
-        assert!(text.contains("docs/a.txt"), "entry a missing");
-        assert!(text.contains("docs/sub/b.txt"), "entry b missing");
-        // temp archive cleaned up
+        let (head, body) = split_response(&resp);
+        assert!(head.starts_with("HTTP/1.1 200"), "head: {head}");
+        assert!(head.contains("Transfer-Encoding: chunked"), "head: {head}");
+        assert!(head.contains("filename=\"docs.zip\""), "head: {head}");
+
+        // The body must be a real, readable zip archive.
+        let zip = dechunk(&body);
+        let mut ar = zip::ZipArchive::new(std::io::Cursor::new(zip)).expect("not a valid zip");
+        let read_entry = |ar: &mut zip::ZipArchive<std::io::Cursor<Vec<u8>>>, name: &str| {
+            use std::io::Read as _;
+            let mut f = ar.by_name(name).expect("entry missing");
+            let mut s = String::new();
+            f.read_to_string(&mut s).unwrap();
+            s
+        };
+        assert_eq!(read_entry(&mut ar, "docs/a.txt"), "AAA");
+        assert_eq!(read_entry(&mut ar, "docs/sub/b.txt"), "BBBB");
+
+        // The archive is streamed, so nothing is ever written to disk.
         let leftovers: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()
             .flatten()
             .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
             .collect();
         assert!(leftovers.is_empty(), "temp zip not cleaned up");
+    }
+
+    /// The browser tab is closed while the archive is still being built:
+    /// the server must stop compressing instead of building a package
+    /// nobody is waiting for.
+    #[tokio::test]
+    async fn zip_client_disconnect_stops_the_build() {
+        // 48 MB of incompressible data: the deflate takes long enough that
+        // the client is gone before the archive is finished.
+        let mut big = vec![0u8; 48 * 1024 * 1024];
+        let mut seed = 0x1234_5678u32;
+        for b in big.iter_mut() {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *b = (seed >> 24) as u8;
+        }
+        let (port, dir) = setup("zipabort", &[("docs/big.bin", &big)]).await;
+        drop(big);
+
+        // Send the request and hang up immediately (the browser tab is
+        // closed while the download is still pending).
+        {
+            let mut c = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            c.write_all(b"GET /zip/docs HTTP/1.1\r\nHost: t\r\nX-TD-Secret: test-secret\r\n\r\n")
+                .await
+                .unwrap();
+            c.flush().await.unwrap();
+            drop(c);
+        }
+
+        // Nothing may be left behind, and the server has to keep working.
+        for _ in 0..100 {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let leftovers: Vec<_> = std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+                .collect();
+            assert!(
+                leftovers.is_empty(),
+                "temp zip survived the disconnect: {:?}",
+                leftovers
+                    .iter()
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        // The server is still alive and serving other requests.
+        let resp = http_text(port, "GET /files HTTP/1.1\r\nHost: t\r\nX-TD-Secret: test-secret\r\n\r\n")
+            .await;
+        assert!(resp.contains("\"success\":true"), "resp: {resp}");
     }
 }
