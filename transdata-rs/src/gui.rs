@@ -6,9 +6,9 @@ use eframe::{App, Frame};
 
 use crate::config::Config;
 
-/// 主窗口尺寸（初始大小；可以拖边缘改大小，测试也按这个尺寸模拟布局）
-const WIN_W: f32 = 880.0;
-const WIN_H: f32 = 570.0;
+/// 主窗口尺寸（初始就是最小尺寸：省地方，嫌小可以随时拉大）
+const WIN_W: f32 = 640.0;
+const WIN_H: f32 = 470.0;
 /// 最小尺寸：拖边缘时不能缩到比这更小（否则内容挤不下）
 const WIN_MIN_W: f32 = 640.0;
 const WIN_MIN_H: f32 = 470.0;
@@ -1630,8 +1630,7 @@ impl GuiApp {
                                     }
                                 }
                             });
-                            ui.add_space(12.0);
-
+                            // 卡片之间的间距：card() 的外边距(6) + 布局间距(8)
                             card(ui, |ui| {
                                 ui.horizontal(|ui| {
                                     section_label(ui, "传输目录");
@@ -1886,7 +1885,8 @@ fn card(ui: &mut eframe::egui::Ui, add: impl FnOnce(&mut eframe::egui::Ui)) {
             left: 0.0,
             right: 0.0,
             top: 0.0,
-            bottom: 12.0,
+            // 卡片之间的间距靠这个 + 布局的 item_spacing(8) = 14
+            bottom: 6.0,
         })
         .show(ui, add);
 }
@@ -2595,7 +2595,8 @@ mod tests {
     #[ignore]
     fn render_small_sizes() {
         for (w, h) in [
-            (880.0_f32, 570.0_f32),
+            (WIN_W, WIN_H), // 打开时的默认尺寸（= 最小尺寸）
+            (880.0_f32, 570.0),
             (880.0, 500.0),
             (880.0, 470.0), // 允许的最小高度
             (880.0, 440.0),
