@@ -302,7 +302,7 @@ README 加 3 行"传输速度低"的排查说明（网卡链路速率/杀软/Wi-
 
 **桌面端 UI**
 - 便签文本不再每帧克隆两遍（打字时 60fps 拷贝长文本）：改用常驻 `text_buf`，
-  只在真��敲了字时才留副本
+  只在真的敲了字时才留副本
 - 窗口标题栏新增「● 传输中 (n)」：后台线程每 2s 轮询 `/info` 拿活动传输数
   （传输发生在浏览器里，之前桌面端完全看不出在传东西）
 
@@ -317,76 +317,84 @@ README 加 3 行"传输速度低"的排查说明（网卡链路速率/杀软/Wi-
 
 
 
-## ׷�ӣ�ͬ�գ���UI ���� + ��ȫ�ع���"���ʦ˵ UI �� + ����ȫ"�����ģ�
+## 追加（同日）：UI 重做 + 安全重构（"设计师说 UI 太丑 + 不够安全"）
 
-### һ��UI ������web/ ��� index.html + app.css + app.js��
-- �Ӿ���ǳɫ/��ɫ˫���⣨prefers-color-scheme �Զ��л�����CSS �������ơ�Բ�ǿ�Ƭ + �����Ӱ��
-  ϵͳ����ջ��12/13/14px �ֺŽ��ݣ��ɰ���ɫ���� + emoji ͼ�� + ���� onclick ȫ������
-- �ṹ������˫�����ϴ� | ���أ����ŵȸߣ��ֻ������ѵ������� = Ʒ�� + ����״̬���� + ���Ƶ�ַ
-- �ϴ�����ק����������������ļ��б��ͼ��/��С/�����Ƴ������������ٶ���ʣ��ʱ�䡢��ȡ��
-- ���أ��ļ��з��� + ���������ť��ÿ���������/ɾ������״̬�廭������ 200 ��ض���ʾ
-- ��ǩ������ͳ�� + ���ͬ��ʱ��������� / ����
-- ������ȫ�� addEventListener �󶨣������� handler�����û����ݣ��ļ����ȣ�һ�� textContent д�룬
-  ����ƴ innerHTML �� �������ϸ� CSP
+> 本节原文在早期一次编码事故里变成了乱码（UTF-8 被按 GBK 解读后又被替换成
+> U+FFFD，原始字节已不可还原）。2026-10-28 按上下文与代码现状重写，事实以代码为准。
 
-### ������ȫ�ع������ģ����Ʋ��ٹ�����
-- ����Ƶ������ˣ�`GET /` �� token ֱ������ HTML ���ظ��κ��� �� ͬһ�������κ��豸
-  `curl` һ�¼�ӵ��ȫȨ�ޣ���Ŀ¼ / ���� / ɾ�� / �ϴ�����token ֻ��ס��"�����վ"��
-  ����ס"ͬ���ε���"�������"���ͱ���"������ԭ��
-- ��ģ�ͣ��豸����ԣ���һ�� `HttpOnly; SameSite=Strict` �Ự Cookie��ҳ���ﲻ���κ�ƾ��
-  - �����Կֻ���������洰�ڣ���ά�� URL Ƭ�� `#k=`��Ƭ�β����ϴ���������+ 8 λ�����
-  - �Ự 12 Сʱ�޲���ʧЧ��ÿ�豸 5 ���� 10 �����٣�ȫ�� 30 ��ʧ�ܼ�����
-  - ����������� `X-TD-Secret` ͷ�����������������һ���� Cookie
-  - ƾ�ݱȽϸĳ���ʱ�� `ct_eq`��ɾ�� URL �ϵ� `?t=`�����������ʷ / ��־��
-- д����У�� Origin����վ���� 403������˲������κ� CORS ͷ
-- ·���ӹ̣�`..` / ����·�� / �̷� / UNC / Windows ��������CON��NUL��COM1..��/ �Ƿ��ַ�
-  `<>:"|?*` / β���ո� ȫ�ܣ����������� junction ������������Ŀ¼��canonicalize + ǰ׺У�飩
-- ��������ʣ��ռ䶯̬���㣨�� 1GB�������޷��� 507�������ϴ����� 8����ǩ���������� 4MB
-- ��Ӧͷ���ϸ� CSP��`script-src 'self'`��`style-src 'self'`���������ű���ʽ��+ nosniff
-  + X-Frame-Options + Referrer-Policy + COOP/CORP + Permissions-Policy
-- zip ��ʱ�ļ�������������Ⲣ�������า�ǣ�Ŀ¼���������������ӡ�������� 24 �����
+### 一、UI 重做（web/ 三件套 index.html + app.css + app.js）
 
-### ������֤
-- `cargo test` 22/22 ͨ������������Ȩ���衢��վ�ܾ���URL ��������Ȩ��Σ��·���ܾ���
-  ��Գɹ�/ʧ�ܡ���Ժ�ҳ�治����Կ����ȫ��Ӧͷ���������˵�����������̣�
-- Playwright + ��ʵ Chrome ��Ⱦ���飺����ǳɫ / ������ɫ / iPhone 13 �ֻ� / ���ҳ��
-  �� console ������� CSP Υ��
-- ��֪�߽磨��д�� README������ TLS�����������ģ��м��˿ɶ������ޡ������ߡ���ť
-  �� ��һ������ѡ HTTPS����ǩ֤�飩
+- 视觉：浅色/深色双主题（`prefers-color-scheme` 自动切换）+ CSS 变量；
+  圆角卡片 + 柔和阴影；系统字体栈 12/13/14px 字号递进；可点击元素用主色；
+  emoji 图标；**去掉所有内联 onclick**
+- 结构：顶部双 Tab（上传 | 下载），卡片等高；手机端底部吸底输入框；
+  顶部 = 品牌 + 连接状态胶囊 + 复制地址
+- 上传：拖拽区；文件列表带图标/大小/进度/移除；显示已传/总量、百分比、
+  实时速度、剩余时间、取消
+- 下载：文件行分组 + 下载/删除按钮；超过 200 条截断提示
+- 便签：字数统计 + 最近同步时间；复制 / 发送
+- 安全写法：全部 `addEventListener` 绑定（无内联 handler），用户数据（文件名等）
+  一律 `textContent` 写入、不拼 `innerHTML` —— 这样才能配严格 CSP
 
-## ׷�ӣ�ͬ�գ���HTTPS ���أ�Ĭ�Ϲرգ�+ ��ǩ֤�� + ���������
+### 二、安全重构（换模型，令牌不再下发给任何人）
 
-### һ��HTTPS����ѡ��Ĭ�Ϲأ�
-- ���ڡ����ʵ�ַ����Ƭ���������ء����� HTTPS�����ܴ��䣩��������������Ч���˿ڲ��䡢
-  Э���л�����ַ���ά���Զ����ű䣻������� watch ͨ����֪�仯������ bind
-- ֤����ǩ��rcgen 0.13 + rustls 0.23/ring + tokio-rustls 0.26����
-  - SAN ���Ǳ������� IPv4 + localhost��IP ���˲���ǩ
-  - ֤����˽Կ�־û��ڳ���Ŀ¼������д���� %LOCALAPPDATA%\TransData����
-    **�־û�������**���������ס�����֤�������⡹�� �ֻ�ֻ��ʾһ��
-  - ������ʾ SHA-256 ֤��ָ�ƣ������ֻ�֤������˶�
-- ͬһ���˿�ͬʱ�ᡸ��̽�����ֽڣ�0x16 �� TLS�����������Ĳ���һ��
-  ������� https://����ҳ�棨���������û�����һ���������
-- HTTPS ģʽ��ͬԴУ�鰴 https �ж�����ǰ�̶�ֻ�� http������ https ����Ա��ܡ���
-  ��ʵ���������ʱץ���� bug��
-- ��Ӧ����ͳһ�� close_notify��TLS �¿ͻ��˲��ٱ� unexpected EOF��
-- ��Է��� Cookie �� HTTPS ģʽ�´� Secure
-- ����� handler ȫ�����ͻ��� `trait Conn`��AsyncRead+AsyncWrite����HTTP / HTTPS
-  ��ͬһ�״���
+- 问题：`GET /` 把 token 直接注入 HTML 发给**任何**请求者 —— 同一局域网任何设备
+  `curl` 一下即拥有全权限（列目录/下载/删除/上传）。token 只挡得住「跨站网页」，
+  挡不住「同网段设备」，不符合「配对才能用」的初衷
+- 新模型：设备级配对，一次 `HttpOnly; SameSite=Strict` 会话 Cookie；页面里不放任何凭据
+- 配对码只出现在桌面窗口；二维码用 URL 片段 `#k=`（片段不会发给服务器）+ 8 位数字码
+- 会话 12 小时无操作失效；每设备 5 分钟 10 次限速；30 次失败锁定
+  （v1.2.0 把「永久锁定」改成了 5 分钟冷却 + 一键换码）
+- 桌面端自己用 `X-TD-Secret` 头（同机、不经网络边界）
+- 凭据比较改常量时间 `ct_eq`；删掉 URL 上的 `?t=`（不进浏览器历史/日志）
+- 写操作校验 `Origin`，跨站 403；任何响应都不带 CORS 头
+- 路径加固：`..` / 绝对路径 / 盘符 / UNC / Windows 保留名（CON、NUL、COM1..）/
+  非法字符 `<>:"|?*` / 尾随空格 全部拦；符号链接与 junction 不能跳出传输目录
+  （canonicalize + 前缀校验）
+- 磁盘：按剩余空间动态算（至少留 1GB），超出 507；并发上传上限 8；便签 4MB
+- 响应头：严格 CSP（`script-src 'self'` / `style-src 'self'`，无内联脚本/样式）
+  + nosniff + X-Frame-Options + Referrer-Policy + COOP/CORP + Permissions-Policy
+- zip：边压边传，不落临时文件；跳过点目录/点文件
 
-### ��������˾���
-- ɾ��������Աߵġ����ơ���ť��û��Ե��豸�ղ���ճ�������������Ļ�ϣ�����
-- ����˲��ٵ� HTTP �ͻ��ˣ�ԭ��Ϊ�ˡ�Զ�˱�ǩ����ʱ�ػ洰�ڡ�����һ��
-  WebSocket �ͻ��� + ÿ 2 ����ѯ /info�����ڸĳɽ�����ֱ�Ӷ�����״̬
-  ��note �汾�� / ������� / ������豸������400 ms ��ѯһ�ξ���Ҫ��Ҫ�ػ�
-  ���� ˳���ɵ��� TLS ģʽ��������Լ�ҲҪ�� TLS �ͻ��˵��鷳
-- ���� 880��720��������Ŀռ�� HTTPS ���� + ָ�ƣ�
+### 三、验证
 
-### ������֤
-- `cargo test` 24/24 ͨ����������HTTPS ģʽ��ͨ���� API��http ���� https �˿ڵ�
-  ��ʾҳ��ͬԴУ����Э���л���WS ��Ȩ��
-- ��ʵ Chrome + Playwright �� HTTPS ȫ���̣����ҳ �� ����뱻�� �� ������Ӧ��
-  �� �ϴ� �� У��ͨ�� �� �����������б��`location.protocol = https:`
-- ���洰���� egui ��ͷ��Ⱦ PNG ���˲���
+- `cargo test` 22/22
+- Playwright + 真实 Chrome 渲染检查：浅色 / 深色 / iPhone 13 / 桌面页，
+  console 无错误、无 CSP 违规
+- 已知边界写进 README：默认不加密（另开可选 HTTPS 开关）
+
+## 追加（同日）：HTTPS 开关（默认关闭）+ 自签证书 + 指纹校验
+
+### 一、HTTPS（可选，默认关）
+
+- 窗口「访问地址」卡片下面的开关，勾上立刻生效（端口不变、协议切换、
+  地址和二维码自动跟着变）；服务端用 watch 通道感知变化后重新 bind
+- 证书自签（rcgen 0.13 + rustls 0.23/ring + tokio-rustls 0.26）：
+  - SAN 覆盖本机所有 IPv4 + localhost
+  - 证书与私钥**持久化**在程序目录（不可写则落 `%LOCALAPPDATA%\TransData`），
+    重启复用，只有本机 IP 变了才重签 —— 手机只提示一次
+  - 窗口显示 SHA-256 证书指纹，和手机证书详情里的指纹对得上
+- 同一端口探测首字节（`0x16` = TLS）：不是 TLS 就给一张「请改用 https」的页面，
+  而不是一堆看不懂的网络错误
+- HTTPS 模式下同源校验按 https 判断（写死 http 会误伤自己 —— 实测踩到过）
+- 响应统一 `close_notify`，TLS 客户端不再报 unexpected EOF
+- 配对 Cookie 在 HTTPS 模式下带 `Secure`
+- 所有 handler 泛型化到 `trait Conn`（AsyncRead + AsyncWrite），HTTP / HTTPS 共用一套代码
+
+### 二、桌面端精简
+
+- 删掉「复制」旁边的手动刷新按钮（没有别的设备时刷新毫无意义）
+- 不再内置 HTTP 客户端（原来为了「远端标签」定时回窗口）：改成一条 WebSocket
+  推送 + 每 2 秒轮询 `/info`；note 版本号变化才触发重绘
+- 窗口 880×720，给 HTTPS 开关 + 指纹留位置
+
+### 三、验证
+
+- `cargo test` 24/24（HTTPS 模式下跑通全部 API；http 打 https 端口的提示页；
+  同源校验按协议切换；WS 鉴权）
+- 真实 Chrome + Playwright 跑 HTTPS 全流程：配对 → 上传 → 校验通过 →
+  下载 → 打包
+- 窗口用 egui 无头渲染出 PNG 人工核对
 
 ## 追加（2026-10-20）：界面大改版（用户按手机实机反馈逐条返工）
 
@@ -498,3 +506,157 @@ o-cache + ETag（304 依旧很便宜）
 - 「访问地址」和「传输目录」两张卡片之间的间距：原来卡片外边距 12 + 额外
   add_space(12) + 布局间距 8 = 32px，太散 → 去掉多余的 add_space，
   外边距降到 6 → 现在 14px
+
+---
+
+## 修复计划：v1.2.0（2026-10-28，通读源码 review 后）
+
+来源：一轮对抗式通读（server.rs 3674 / gui.rs 3148 / app.js 1014 / config / tls / update / net）。
+现状基线：`cargo test` 38 passed + 4 ignored（ignore 的全是 GUI 出图）；工作区另有 977 行未提交改动。
+下面每一条都标了「改哪里 / 怎么改 / 怎么证明改对了 / 风险」，按批次独立提交，随时可停。
+
+### 批次 0：先立基线（30 分钟）
+
+| 项 | 做法 |
+|---|---|
+| 0.1 | 把当前 977 行改动（重命名/活动日志/设备列表/临时文件原子发布）作为基线提交，否则后续 diff 分不清谁改的 |
+| 0.2 | `.gitignore` 加 `.workbuddy-ai/`（现在是 untracked 的裸目录） |
+| 0.3 | 版本号 1.1.0 → **1.2.0**（改动含行为变更，不是补丁号） |
+
+### 批次 A：P0 确定性 bug（半天，全部是低风险局部改动）
+
+**A1 上传列表「×」失效/删错行** — `web/app.js:419-441`
+- 改法：闭包里不再用循环变量 `idx`，改成按对象引用删（`removeSelected(it)` → `selected.indexOf(it)`），并抽成独立函数便于测试。
+- 验证：Playwright 走真实页面，选 3 个文件点第 2 行 ×，断言剩 2 个且剩下的是第 1、3 个；折叠态（选 12 个只显示 8 行）再点一次 ×，断言删的是点中的那一行。
+- 风险：无（纯前端局部）。
+
+**A2 HTTPS 下 `/info` 仍给 http 地址** — `server.rs:659`
+- 改法：按 `cfg.tls_on()` 选 scheme；GUI 侧 `base_url()` 已正确，不动。
+- 验证：扩展现有 `https_mode_serves_the_api`，断言 `/info` 的 `url` 以 `https://` 开头；http 模式断言 `http://`。
+- 风险：无。
+
+**A3 路径双重 URL 解码** — `server.rs:303` + `749/755/766`
+- 改法：`parse_request` 只解码一次并保留 `raw_path` 给前缀匹配；`/download/`、`/delete/`、`/zip/` 的 handler 直接切片，**不再二次 `url_decode`**。
+- 影响面：所有带路径参数的路由（download / delete / zip / zip-all 不受影响）。客户端 `encPath()` 是逐段 `encodeURIComponent`，一次解码即还原，兼容。
+- 验证：新增单测 `percent_in_filename_roundtrips`：上传名为 `50%41.txt` 的文件 → `/files` 列出 → `/download` 200 且字节一致 → `DELETE` 200；再加 `a%2Fb.txt` 边界（解码成子目录路径，应 404 而不是穿越）。
+- 风险：中低。这是本批唯一触碰公共解析路径的改动，单独一个 commit，改完先跑全量测试再动别的。
+
+**A4 `/verify` 超 2 万文件集体误报 missing** — `server.rs:39 / 1594 / 1622`
+- 根因：`VERIFY_CAP` 同时限制了清单条数和磁盘清单，DFS 走满 2 万就停。
+- 改法：删掉「全量扫目录 + HashMap」的做法，改成**按清单逐条 stat**（path 已经过 `safe_rel` + 解析，直接 `metadata` 即可）。`VERIFY_CAP` 保留为「单请求清单条数上限」，与客户端 15000 一批对齐。
+- 收益：顺带把大目录下 O(全目录) 的扫描降到 O(清单条数)，2 万条 stat 比遍历 2 万文件更便宜。
+- 验证：脚本造 25000 个小文件 → 一次 `/verify` 提交 15000 条 → 断言 `all_ok:true`（旧代码会报 missing）；现有 `verify_reports_status` 三态用例保持绿。
+- 风险：中低。注意 symlink 语义：原实现跳过 symlink，新实现需对 `metadata` 前先 `symlink_metadata` 判断并跳过。
+
+**A5 列表截断静默** — `server.rs:37` + `app.js:669/690/274/777`
+- 改法：`dlTruncated` 接上 UI，列表尾部加一行「仅显示前 10000 项，其余请用「全部打包下载」」；`RENDER_CAP=200` 触发时同样加「仅渲染前 200 行，共 N 行」。新增 `.listmore` 样式。
+- 验证：Playwright 拦截 `/files` 返回 `truncated:true` 与 300 条数据，断言两条提示都出现。
+
+### 批次 B：P1 安全与健壮性（一天）
+
+**B1 WS 便签绕过 4MB 上限** — `server.rs:976`
+- 改法：`WsMsg::Text(t)` 里判 `t.len() > NOTE_MAX_BYTES` → 丢弃并回一条错误帧（不广播）；同时给 `accept_async` 传 `WebSocketConfig`，把 `max_message_size` 设成 4MB+ 余量。
+- 验证：新增单测：连 WS 发 5MB 文本 → 连接被关闭 / `read_note` 内容不变；发 1MB → 正常同步。
+
+**B2 配对锁可被 DoS** — `config.rs:18` + `server.rs:797/843`
+- 现状：30 次失败全局永久锁，只增不减，无解锁入口 → 局域网任意人 30 次错码即可锁死配对。
+- 改法（建议）：`pair_locked: AtomicBool` → `pair_locked_until: Mutex<Option<Instant>>`，失败达阈值进入 **5 分钟冷却**（冷却结束自动清零，不再永久锁）；同时设置面板加「重新生成配对码」按钮（`reset_pairing()`：换 code + 换 secret + 清失败计数 + 清冷却 + 刷新二维码）。
+- 验证：单测 `pair_lockout_cools_down`（直接把 `locked_until` 设成过去时间再配对，应成功）、`reset_pairing_clears_state`。
+
+**B3 更新链路可被装进非 exe** — `update.rs:152/236` + `settings.rs`
+- 改法四条：
+  1. 资产只认 `.exe` 结尾，删掉 `or_else(|| list.first())` 兜底，找不到就报「这个版本没有可下载的 exe」；
+  2. sha256 **强制**：GitHub 的 `digest` 有则必须校验，自定义清单没写 sha256 → 拒绝更新（不再「可选」）；
+  3. `update_url` 只接受 `https://`，http 直接拒绝并提示；
+  4. 下载完再校验 PE 头（前两字节 `MZ`），防「文件对但根本不是程序」。
+- 验证：单测 `non_exe_asset_is_rejected` / `http_update_url_is_rejected` / `missing_sha256_is_rejected` / `non_pe_payload_is_rejected`；现有 `update_roundtrip` 需同步补 sha256 与 MZ 头。
+- 风险：中。会让「自己服务器返回不带 sha256 的清单」失效，需在 README 更新源章节写明。
+
+**B4 磁盘配额只是启动时快照** — `config.rs:236/271/278`
+- 改法：`quota_left` 语义改为「本次运行已写字节」；507 判定改成上传前现算：`disk_free(dir)` 不足 `DISK_RESERVE + 本批已写` 就 507。`set_upload_dir` 时重置计数。
+- 验证：单测 `quota_follows_current_dir`（切换目录后配额按新盘重算）；现有 `upload_quota_is_enforced` 改成按「人为把 quota_left 设小」的方式保留。
+- 风险：中。`disk_free` 每次上传调一次 Win32，成本可忽略。
+
+**B5 第二个实例毁掉第一个实例的上传** — `config.rs:517`
+- 现状：启动即删 `.td-tmp-*.part`，可能删掉另一个实例正在写的文件；进程内 `UPLOAD_LOCK` 也管不到跨进程重名。
+- 改法：启动时先取实例锁（`%LOCALAPPDATA%\TransData\transdata.lock` 的独占文件锁，Windows 用 `CreateFileW` + 无共享），拿不到就弹窗「已经有一个 TransData 在运行」并退出；`cleanup_stale_zip_temps` 只在拿到锁之后执行。
+- 验证：单测 `second_instance_cannot_start`（同进程内模拟两次取锁）；手动双开确认第二个窗口提示后退出。
+
+**B6 页面缺 `Vary: Accept-Encoding`** — `server.rs:1116`
+- 改法：200 与 304 两条路径都加 `Vary: Accept-Encoding`（304 尤其容易漏）。
+- 验证：单测断言两条响应都含该头。
+
+### 批次 C：P2 工程卫生与体验（半天到一天）
+
+| 项 | 内容 |
+|---|---|
+| C1 | README 补齐 v1.2.0 的新能力：重命名/移动、活动日志、已连接设备、上传原子发布、`/verify` 语义变化、更新源必须 https+sha256 |
+| C2 | `PLAN.md` 第 320-390 行是**真实乱码**（不是终端显示问题，文件里就是坏字节）→ 按上下文重写该段 |
+| C3 | `transdata.exe.old` 永久残留（运行中 exe 删不掉，`update.rs:268` 静默失败）→ 启动时尝试删 `*.exe.old`，删不掉就留着下次再试 |
+| C4 | 便签「远端总是覆盖本地」→ 桌面端有未发送改动时改为「不覆盖 + 顶栏提示『另一端已更新，点击载入』」，避免打字被清空 |
+| C5 | 剪贴板：`GlobalLock` 失败仍写空数据 → 释放句柄并返回失败；重试 `sleep` 从 50ms×20 降到 10ms×5，且只在 OpenClipboard 失败时 sleep |
+| C6 | 测试卫生：`https_mode_serves_the_api` 硬编码 19876 → 改为绑定 `:0` 取端口；证书写入 `temp_dir` 而不是 target 目录（给 `tls::load_or_create` 加一个可注入目录的重载） |
+| C7 | （可选）把 `buildTree` / `buildBatches` / `mergePicked` / `removeSelected` 抽到 `web/logic.js`（UMD 导出），加 `web/test/logic.test.mjs`（node:test，零依赖），给前端补上回归网——A1 那类 bug 就是没有这层网才漏出去的 |
+
+### 批次 D：验收与交付
+
+1. `cargo test`：38 个原用例全绿 + 新增约 12 个（A2/A3/A4/B1/B2/B3/B4/B5/B6）；
+2. `cargo build --release`，替换 `target/release/transdata.exe`；
+3. e2e 脚本：curl 走 `/info`、`%41` 文件名、25000 文件 verify；Playwright 走 × 按钮、截断提示、配对冷却；
+4. 手动：双开实例、HTTPS 下复制地址、便签冲突；
+5. 分 6 个 commit：基线 / P0 / WS+配对 / 更新链路 / 配额+实例锁 / 文档+卫生。
+
+### 待确认（批准后开工）
+
+1. **B2 配对锁**：选「5 分钟冷却 + GUI 重置配对码」（推荐），还是只做冷却不做重置按钮？
+2. **B3 sha256**：自定义清单不带 sha256 时，是「拒绝更新」（推荐，安全优先）还是「明确警告后仍可继续」？
+3. **C4 便签**：改成「不覆盖 + 提示载入」会改变现有交互（现在是远端无条件覆盖），确认要改？
+4. **C7**：是否引入 `web/logic.js` + node 测试（多一个静态资源，但前端从此有回归网）？
+5. 批次 A 先做还是 A+B 一起做？（建议 A 单独交付一次，先让 P0 上线）
+
+风险总评：A 批全是局部确定性修复，风险最低；B3/B4/B5 会改行为语义，需要 README 同步；C7 是唯一「新增结构」的改动，可以最后再决定。
+
+### 执行记录（2026-10-28，用户批准后实施）
+
+**用户批复**
+1. 配对锁 → **冷却 + 重置按钮**（并追问「服务端和客户端知道被锁了吗」→ 客户端知道、桌面端不知道，本轮补上）；
+2. sha256 → **警告不拦截**（只挂 GitHub Release，不接受「清单必须带 sha256」的强制要求）；
+3. 便签冲突 → **保持覆盖 + 仅提示**（不改交互，但覆盖要说明白）；
+4. `web/logic.js` → 确认引入，但要求「成品不能变大」→ 改为编译期拼接进 `/app.js`，请求数和体积都不变；
+5. 节奏 → **A+B+C 一起做**，不着急上线。
+
+**已完成**
+
+| 项 | 结果 |
+|---|---|
+| 0 | 基线提交（977 行）+ `.gitignore` 加 `.workbuddy-ai/` + 版本 1.2.0 |
+| A1 | × 按钮改按对象引用删（`L.removeItem`），闭包不再捕获循环变量 |
+| A2 | `/info` 按 `tls_on()` 给 http/https；HTTPS 用例里加了断言 |
+| A3 | `parse_request` 只解码一次，三个 handler 去掉二次 `url_decode` |
+| A4 | `/verify` 改逐条 `symlink_metadata`，删掉「全量扫目录 + 2 万上限」 |
+| A5 | `dlTruncated` 接上 UI + `RENDER_CAP` 超限提示（新增 `.listmore`） |
+| B1 | WS 便签 4MB 上限 + `WebSocketConfig::max_message_size` |
+| B2 | 配对锁 → `pair_locked_until` 冷却 5 分钟；`/pair` 回剩余秒数；`/info` 带 `pair_locked`；桌面端配对卡片显示剩余时间；设置面板加「重新生成配对码」（`reset_pairing()`） |
+| B3 | 只认 `.exe` 附件（删掉 `list.first()` 兜底）；`ensure_https`；下载后 `verify_pe` 校验 MZ 头；缺 sha256 时设置面板黄字提示 |
+| B4 | `set_upload_dir` 重算配额；每次上传前 `clamp_quota_to_disk`（只收缩） |
+| B5 | 新增 `src/instance.rs`（CreateFileW 独占）；`main` 先取锁再清理 |
+| B6 | 页面 200/304 都带 `Vary: Accept-Encoding` |
+| C1 | README 补齐：重命名/活动记录/设备列表/单实例/更新硬规矩/配对冷却 |
+| C2 | PLAN 两段乱码（320-390）按上下文重写并标注「原文不可还原」 |
+| C3 | 启动时清 `*.exe.old` |
+| C4 | 便签保持覆盖，但状态栏改成「已收到对方内容，本地未发送的改动被覆盖」 |
+| C5 | 剪贴板 `GlobalLock` 失败不再写空数据、返回 bool 如实提示；重试 10ms×20；「复制」不再清 `note_local` |
+| C6 | HTTPS 用例端口改 `:0` 分配；证书写临时目录（`tls::load_or_create_in`） |
+| C7 | `web/logic.js`（UMD）+ `web/test/logic.test.js`（node:test，11 用例）；`src/web.rs::app_js()` 编译期拼接 |
+
+**验证**
+- `cargo test`：**50 passed / 0 failed / 5 ignored**（原 38 + 新增 12；ignored 是 4 个 GUI 出图 + 1 个造 2 万文件的 verify 用例）
+- `cargo test verify_handles_more_files_than_the_old_cap -- --ignored`：通过（20 500 个文件，45s）
+- `node --test web/test/logic.test.js`：**11 passed**
+- `cargo build --release` 通过；真 exe 冒烟：`/` 200 + `Vary` 头 + CSP、`/app.js` 44503 字节（logic.js 已拼入）、未授权 `/files` 401
+- 未做：便签覆盖后的「撤销」按钮（用户只要提示）；配对冷却时长的可视化倒计时（只在触发请求时刷新）
+
+**遗留（下次再说）**
+- `/files` 仍是「全量遍历 + 2 秒缓存」，超大目录首次请求仍慢（A4 只优化了 verify）
+- 便签仍是 last-writer-wins，没有冲突合并
+- GUI 只有 Windows 实现，非 Windows 分支的剪贴板/单实例是空桩
