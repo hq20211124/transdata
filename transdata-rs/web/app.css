@@ -134,6 +134,8 @@ body {
 .btn--danger:hover { background: var(--danger-soft); color: var(--danger); }
 
 .btn--sm { height: 30px; padding: 0 10px; font-size: 12.5px; }
+/* 列表行内的小按钮：跟行高齐平，不把行撑高 */
+.btn--xs { height: 18px; padding: 0 6px; font-size: 11px; border-radius: 5px; font-weight: 600; gap: 3px; }
 .btn--wide { width: 100%; height: 42px; }
 
 /* ----------------------------------------------------------------- chips */
@@ -322,13 +324,13 @@ body {
 .dropzone {
     display: flex;
     align-items: center;
-    gap: 12px;
+    gap: 8px;
     border: 1.5px dashed var(--border-strong);
-    border-radius: var(--radius);
+    border-radius: var(--radius-sm);
     background: var(--surface-2);
-    padding: 12px 14px;
+    padding: 6px 10px;
     cursor: pointer;
-    min-height: 64px;
+    min-height: 44px;
     flex: 0 0 auto;
     transition: border-color .15s ease, background .15s ease;
 }
@@ -338,10 +340,18 @@ body {
 .dropzone.is-over { border-color: var(--accent); background: var(--accent-soft); }
 
 .dz-icon { color: var(--accent); flex: none; }
-.dz-text { flex: 1; min-width: 0; }
-.dz-title { margin: 0; font-weight: 600; font-size: 13.5px; }
-.dz-sub { margin: 1px 0 0; font-size: 12px; }
-.dz-actions { display: flex; gap: 8px; flex: none; }
+/* 两行文案并成一行：宽屏一定同排，窄屏才折行 */
+.dz-text {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0 5px;
+}
+.dz-title { margin: 0; font-weight: 600; font-size: 13px; line-height: 1.35; }
+.dz-sub { margin: 0; font-size: 12px; line-height: 1.35; }
+.dz-actions { display: flex; gap: 6px; flex: none; }
 
 /* --------------------------------------------------------------- listbar */
 
@@ -363,7 +373,7 @@ body {
     padding: 0;
     display: flex;
     flex-direction: column;
-    gap: 6px;
+    gap: 2px;
     flex: 0 1 auto;
 }
 .filelist:empty { display: none; }
@@ -381,15 +391,17 @@ body {
     flex: 0 0 auto;
 }
 
+/* 一行只占内容高度：上下不留空，单行行高最小；名字长了才向下撑成多行 */
 .filelist li {
     display: flex;
     align-items: center;
-    gap: 10px;
-    padding: 7px 10px;
+    gap: 4px;
+    padding: 1px 5px;
     border: 1px solid var(--border);
-    border-radius: var(--radius-sm);
+    border-radius: 7px;
     background: var(--surface-2);
     min-width: 0;
+    line-height: 1.25;
 }
 
 /* 文件夹行：底色和文件行区分开，一眼能看出这是个目录 */
@@ -400,40 +412,43 @@ body {
 
 .filelist .fi-icon {
     flex: none;
-    width: 26px; height: 26px;
+    width: 17px; height: 17px;
     display: grid; place-items: center;
-    border-radius: 7px;
+    border-radius: 5px;
     background: var(--accent-soft);
     color: var(--accent-soft-fg);
 }
-.filelist .fi-icon svg { width: 15px; height: 15px; }
+.filelist .fi-icon svg { width: 11px; height: 11px; }
 
+/* 名字占满剩余宽度并靠左，整名显示；单行最窄，超长自动换行撑高 */
 .filelist .fi-main {
-    flex: 1;
+    flex: 1 1 auto;
     min-width: 0;
-    display: flex;
-    align-items: baseline;
-    gap: 8px;
+    display: block;
 }
 
 .filelist .fi-name {
-    font-size: 13px;
+    font-size: 12.5px;
     font-weight: 500;
+    line-height: 1.25;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+    padding: 0;
+}
+
+/* 大小 / 文件夹信息：靠右、完整显示（宁可让名字换行也不截断数字），紧跟按钮 */
+.filelist .fi-sub {
+    flex: none;
+    font-size: 10.5px;
+    line-height: 1.25;
+    color: var(--fg-muted);
+    font-variant-numeric: tabular-nums;
     white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    min-width: 0;
+    text-align: right;
 }
 
-.filelist .fi-sub { font-size: 11.5px; color: var(--fg-muted); flex: none; }
-
-/* 目录行：名字一行、副标题一行，名字才不会被截断 */
-.filelist .fi-main.fi-col {
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 1px;
-}
-.filelist .fi-main.fi-col .fi-name { width: 100%; }
+/* 目录行（is-dir）跟文件行同一套行高，靠底色区分，不再单独占两行 */
 
 /* 目录树的展开/收起箭头 */
 .filelist .fi-toggle {
@@ -441,9 +456,9 @@ body {
     border: none;
     background: none;
     color: var(--fg-muted);
-    width: 18px;
-    height: 18px;
-    border-radius: 5px;
+    width: 13px;
+    height: 16px;
+    border-radius: 4px;
     display: grid;
     place-items: center;
     cursor: pointer;
@@ -451,11 +466,10 @@ body {
     line-height: 1;
     padding: 0;
     flex: none;
-    margin-left: -2px;
 }
 .filelist .fi-toggle:hover { background: var(--accent-soft); color: var(--accent-soft-fg); }
 .filelist .fi-toggle:focus-visible { outline: none; box-shadow: var(--ring); }
-.filelist .fi-toggle-space { width: 18px; flex: none; margin-left: -2px; }
+.filelist .fi-toggle-space { width: 13px; flex: none; }
 
 .filelist .fi-more {
     justify-content: center;
@@ -463,24 +477,26 @@ body {
     font-size: 12.5px;
     background: none;
     border-style: dashed;
-    padding: 2px;
+    padding: 1px;
 }
 
-.filelist .fi-actions { display: flex; align-items: center; gap: 4px; flex: none; }
+.filelist .fi-actions { display: flex; align-items: center; gap: 1px; flex: none; }
 
 .icon-btn {
     appearance: none;
     border: 1px solid transparent;
     background: none;
     color: var(--fg-muted);
-    width: 28px; height: 28px;
-    border-radius: 8px;
+    width: 18px; height: 18px;
+    border-radius: 5px;
     display: grid; place-items: center;
     cursor: pointer;
     text-decoration: none;
-    font-size: 13px;
+    font-size: 11px;
+    padding: 0;
     transition: background .15s ease, color .15s ease;
 }
+.icon-btn svg { width: 12px; height: 12px; }
 
 .icon-btn:hover { background: var(--danger-soft); color: var(--danger); }
 .icon-btn:focus-visible { outline: none; box-shadow: var(--ring); }
@@ -658,10 +674,10 @@ body {
     .panel { padding: 12px; border-radius: 12px; gap: 10px; }
 
     /* 手机上省出高度，让「开始上传」不被吸底发送框挡住 */
-    .filelist li { padding: 6px 10px; }
+    .filelist li { padding: 1px 5px; }
 
-    .dropzone { flex-wrap: wrap; padding: 10px 12px; }
-    .dz-text { min-width: 140px; }
+    .dropzone { flex-wrap: wrap; padding: 6px 10px; row-gap: 6px; }
+    .dz-text { min-width: 0; }
     .dz-actions { width: 100%; }
     .dz-actions .btn { flex: 1; }
 

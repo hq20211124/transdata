@@ -62,6 +62,7 @@
     var ICON_FILE = 'M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8l-5-5Z M14 3v5h5';
     var ICON_FOLDER = 'M4 7.5 12 3l8 4.5v9L12 21l-8-4.5v-9Z m8 4.5 8-4.5';
     var ICON_TRASH = 'M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6';
+    var ICON_PENCIL = 'M12 20h9 M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5Z';
 
     /* -------------------------------------------------------------- network */
 
@@ -271,9 +272,9 @@
     var BATCH_MAX_FILES = 32;
     var BATCH_MAX_BYTES = 256 * 1024 * 1024;
     var RENDER_CAP = 200;
-    /* 折叠状态下只显示前几行，展开后列表自己滚动 —— 页面永远不会被撑长 */
-    var UPLOAD_COLLAPSED_ROWS = 5;
-    var DL_COLLAPSED_ROWS = 5;
+    /* 折叠状态下显示 8 行，超出才出现「展开」；展开后列表自己滚动 —— 页面永远不会被撑长 */
+    var UPLOAD_COLLAPSED_ROWS = 8;
+    var DL_COLLAPSED_ROWS = 8;
     var filesExpanded = false;
     var dlExpanded = false;
 
@@ -425,8 +426,8 @@
 
             var main = el('div', 'fi-main');
             main.appendChild(el('div', 'fi-name', it.path));
-            main.appendChild(el('div', 'fi-sub', fmtSize(it.file.size)));
             li.appendChild(main);
+            li.appendChild(el('span', 'fi-sub', fmtSize(it.file.size)));
 
             var actions = el('div', 'fi-actions');
             var rm = el('button', 'icon-btn');
@@ -803,7 +804,7 @@
 
     function treeRow(node, depth) {
         var li = el('li');
-        li.style.paddingLeft = (10 + depth * 14) + 'px';
+        li.style.paddingLeft = (5 + depth * 10) + 'px';
         if (node.dir) li.classList.add('is-dir');
 
         if (node.dir) {
@@ -818,8 +819,9 @@
                 renderFiles();
             });
             li.appendChild(chev);
-        } else {
-            // 文件行留一个同样宽的占位，名字和目录行对齐
+        } else if (depth > 0) {
+            // 只有真的在某个文件夹里（二级及以下）才留箭头占位做对齐；
+            // 顶层的文件本身就是一级，不留白
             li.appendChild(el('span', 'fi-toggle-space'));
         }
 
@@ -828,17 +830,16 @@
         li.appendChild(ic);
 
         var main = el('div', 'fi-main');
-        if (node.dir) main.classList.add('fi-col');   // 目录：名字独占一行，别被副标题挤没
         main.appendChild(el('div', 'fi-name', node.name));
-        main.appendChild(el('div', 'fi-sub', node.dir
-            ? '文件夹 · ' + node.files + ' 个文件 · ' + fmtSize(node.size)
-            : fmtSize(node.size)));
         li.appendChild(main);
+        li.appendChild(el('span', 'fi-sub', node.dir
+            ? node.files + ' 项 · ' + fmtSize(node.size)
+            : fmtSize(node.size)));
 
         var actions = el('div', 'fi-actions');
         if (node.dir) {
             // 只有目录才提供「打包」
-            var zip = el('a', 'btn btn--soft btn--sm', '打包');
+            var zip = el('a', 'btn btn--soft btn--xs', '打包');
             zip.href = '/zip/' + encPath(node.path);
             zip.title = '把「' + node.name + '」整个文件夹压成 zip 下载';
             zip.addEventListener('click', function () {
@@ -846,13 +847,38 @@
             });
             actions.appendChild(zip);
         } else {
-            var dl = el('a', 'btn btn--soft btn--sm', '下载');
+            var dl = el('a', 'btn btn--soft btn--xs', '下载');
             dl.href = '/download/' + encPath(node.path);
             actions.appendChild(dl);
         }
+        actions.appendChild(renameButton(node));
         actions.appendChild(deleteButton(node.path, node.name, node.dir));
         li.appendChild(actions);
         return li;
+    }
+
+    /* 重命名 / 移动：同一个接口（服务端 rename 是原子的，见 /rename） */
+    function renameButton(node) {
+        var btn = el('button', 'icon-btn icon-btn--ok');
+        btn.type = 'button';
+        btn.title = '重命名 / 移动';
+        btn.setAttribute('aria-label', '重命名 ' + node.name);
+        btn.appendChild(icon(ICON_PENCIL));
+        btn.addEventListener('click', function () {
+            var next = prompt('新的名字（可以带子目录，例如 归档/' + node.name + '）', node.path);
+            if (next == null) return;
+            next = next.trim().replace(/^\/+|\/+$/g, '');
+            if (!next || next === node.path) return;
+            apiJson('/rename', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ from: node.path, to: next })
+            }).then(function (j) {
+                if (j && j.success) { loadFiles(); }
+                else { alert('重命名失败：' + ((j && j.error) || '未知错误')); }
+            }).catch(function () { alert('重命名失败（网络错误）'); });
+        });
+        return btn;
     }
 
     function deleteButton(path, name, isDir) {

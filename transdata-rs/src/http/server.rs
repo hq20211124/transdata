@@ -646,7 +646,15 @@ async fn handle_conn(
             let dir = cfg.upload_dir();
             let count = dir
                 .read_dir()
-                .map(|d| d.filter_map(|e| e.ok()).filter(|f| f.path().is_file()).count())
+                .map(|d| {
+                    d.filter_map(|e| e.ok())
+                        .filter(|f| f.path().is_file())
+                        // 正在上传的临时文件不算
+                        .filter(|f| {
+                            !f.file_name().to_string_lossy().starts_with(".td-tmp-")
+                        })
+                        .count()
+                })
                 .unwrap_or(0);
             let url = format!("http://{}:{}", crate::net::display_ip(), cfg.port);
             let dir_s = dir.to_string_lossy().replace('"', "\\\"");
@@ -692,6 +700,13 @@ async fn handle_conn(
                         if p.is_dir() {
                             stack.push((p.to_path_buf(), depth + 1));
                         } else {
+                            // 正在上传的临时文件不算「已有文件」
+                            if p.file_name()
+                                .map(|n| is_temp_name(&n.to_string_lossy()))
+                                .unwrap_or(false)
+                            {
+                                continue;
+                            }
                             let rel = p
                                 .strip_prefix(&dir)
                                 .ok()
@@ -732,28 +747,31 @@ async fn handle_conn(
         }
         ("GET", p) if p.starts_with("/download/") => {
             match resolve_rel(cfg, &url_decode(&p["/download/".len()..])) {
-                Some(p) => download(&mut sock, cfg, &p).await,
+                Some(p) => download(&mut sock, cfg, &p, peer).await,
                 None => write_json_err(&mut sock, "Bad path").await,
             }
         }
         ("DELETE", p) if p.starts_with("/delete/") => {
             match resolve_rel(cfg, &url_decode(&p["/delete/".len()..])) {
-                Some(p) => delete(&mut sock, cfg, &p).await,
+                Some(p) => delete(&mut sock, cfg, &p, peer).await,
                 None => write_json_err(&mut sock, "Bad path").await,
             }
         }
-        ("POST", "/upload") => upload(&mut sock, cfg, &req.boundary, &mut pending).await,
+        ("POST", "/upload") => {
+            upload(&mut sock, cfg, &req.boundary, &mut pending, peer).await
+        }
+        ("POST", "/rename") => rename_path(&mut sock, cfg, &req, &mut pending, peer).await,
         ("POST", "/verify") => verify(&mut sock, cfg, &req, &mut pending).await,
         ("GET", p) if p.starts_with("/zip/") => {
             match resolve_rel(cfg, &url_decode(&p["/zip/".len()..])) {
-                Some(p) => zip_dir(&mut sock, cfg, &p).await,
+                Some(p) => zip_dir(&mut sock, cfg, &p, peer).await,
                 None => write_json_err(&mut sock, "Bad path").await,
             }
         }
         // 打包整个传输目录（根目录下有多个文件夹/文件时也能一把全下）
         ("GET", "/zip-all") => {
             let root = cfg.upload_dir();
-            zip_dir(&mut sock, cfg, &root).await
+            zip_dir(&mut sock, cfg, &root, peer).await
         }
         _ => write_json_err(&mut sock, "Not Found").await,
     }
@@ -830,7 +848,7 @@ async fn pair(
         return write_json_status(sock, "401 Unauthorized", "配对码不正确").await;
     }
 
-    let sid = cfg.new_session();
+    let sid = cfg.new_session(peer);
     // `Secure` when the server speaks HTTPS: the session id must never
     // travel in clear text.
     let secure = if cfg.tls_on() { "; Secure" } else { "" };
@@ -1222,6 +1240,18 @@ fn is_reserved_name(seg: &str) -> bool {
 /// the longest existing ancestor is canonicalized and must still be inside
 /// the canonicalized transfer dir, so a junction/symlink inside the
 /// directory can never be used to read or delete files outside of it.
+/// Path as shown in the activity log: relative to the transfer dir, `/`
+/// separated. Falls back to the file name if it somehow sits outside.
+fn rel_display(cfg: &Config, p: &std::path::Path) -> String {
+    p.strip_prefix(cfg.upload_dir())
+        .map(|r| r.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default()
+        })
+}
+
 fn resolve_rel(cfg: &Config, rel: &str) -> Option<std::path::PathBuf> {
     let rel = safe_rel(rel)?;
     let base = cfg.upload_dir();
@@ -1260,6 +1290,7 @@ async fn download(
     sock: &mut impl Conn,
     cfg: &Arc<Config>,
     path: &std::path::Path,
+    peer: &str,
 ) -> Result<(), std::io::Error> {
     let file = path.to_path_buf();
     if !file.is_file() {
@@ -1277,6 +1308,13 @@ async fn download(
         .filter(|c| *c != '"' && *c != '\\' && !c.is_control())
         .collect();
     let encoded = percent_encode(&raw_name);
+    // 记一笔：谁下载了什么（取消/断线也算，因为请求已经发出去了）
+    cfg.log_activity(
+        peer,
+        crate::config::ActKind::Download,
+        &rel_display(cfg, &file),
+        len,
+    );
     let mut out = Vec::with_capacity(512);
     out.extend_from_slice(b"HTTP/1.1 200 OK\r\n");
     out.extend_from_slice(format!("Content-Type: {mime}\r\n").as_bytes());
@@ -1372,10 +1410,20 @@ async fn delete(
     sock: &mut impl Conn,
     cfg: &Arc<Config>,
     path: &std::path::Path,
+    peer: &str,
 ) -> Result<(), std::io::Error> {
     let p = path.to_path_buf();
     if p.is_file() {
+        let size = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
         if std::fs::remove_file(&p).is_ok() {
+            // 删掉的文件把配额还回去（否则删了也传不进新东西）
+            give_quota(cfg, size);
+            cfg.log_activity(
+                peer,
+                crate::config::ActKind::Delete,
+                &rel_display(cfg, &p),
+                size,
+            );
             cfg.invalidate_files();
             return write_json(sock, r#"{"success":true}"#).await;
         }
@@ -1396,13 +1444,122 @@ async fn delete(
                 }
             }
         }
+        let freed: u64 = files
+            .iter()
+            .filter_map(|f| std::fs::metadata(f).ok())
+            .map(|m| m.len())
+            .sum();
         let _ = files.iter().map(|f| std::fs::remove_file(f)).count();
         let _ = dirs.into_iter().rev().map(|d| std::fs::remove_dir(d)).count();
         let _ = std::fs::remove_dir(&p);
+        give_quota(cfg, freed);
+        if p.exists() {
+            // 目录还在：里面多半有文件正被上传/下载占用（Windows 删不掉打开的文件）
+            cfg.invalidate_files();
+            return write_json_err(
+                sock,
+                "文件夹里还有文件正被上传或下载占用，请稍后再删",
+            )
+            .await;
+        }
+        let dir_name = format!("{}/", rel_display(cfg, &p));
+        cfg.log_activity(peer, crate::config::ActKind::Delete, &dir_name, 0);
         cfg.invalidate_files();
         return write_json(sock, r#"{"success":true}"#).await;
     }
+    if p.exists() {
+        // 还在，说明删不掉：多半是另一台设备正在下载 / 正在往里传
+        return write_json_err(sock, "文件正被占用（可能正在下载或上传），请稍后再删").await;
+    }
     write_json_err(sock, "Not Found").await
+}
+
+// ---------------------------------------------------------------------------
+// rename / move
+
+/// `POST /rename` with `{"from":"a/b.txt","to":"a/c.txt"}`.
+///
+/// 重命名和移动是同一件事（同一块盘内的 rename 是原子操作）。整段在
+/// UPLOAD_LOCK 里做：跟上传发布、删除互斥，所以不会出现「检查完目标不
+/// 存在 → 别人刚好建了一个 → 覆盖掉」这种竞态。
+async fn rename_path(
+    sock: &mut impl Conn,
+    cfg: &Arc<Config>,
+    req: &Request,
+    pending: &mut Vec<u8>,
+    peer: &str,
+) -> Result<(), std::io::Error> {
+    let len = req.content_length.min(8192);
+    let mut raw = Vec::with_capacity(len);
+    while raw.len() < len {
+        let take = (len - raw.len()).min(4096);
+        let mut chunk = vec![0u8; take];
+        match read_body_exact(sock, pending, &mut chunk).await {
+            Ok(_) => raw.extend_from_slice(&chunk),
+            Err(_) => break,
+        }
+    }
+    let json: serde_json::Value =
+        serde_json::from_slice(&raw).unwrap_or(serde_json::Value::Null);
+    let from = json.get("from").and_then(|v| v.as_str()).unwrap_or("");
+    let to = json.get("to").and_then(|v| v.as_str()).unwrap_or("");
+    if from.is_empty() || to.is_empty() {
+        return write_json_err(sock, "参数不完整").await;
+    }
+    let Some(src) = resolve_rel(cfg, from) else {
+        return write_json_err(sock, "找不到原文件").await;
+    };
+    if !src.exists() {
+        return write_json_err(sock, "找不到原文件").await;
+    }
+    // 新名字同样要过安全校验（不能跳出传输目录、不能有非法字符）
+    let Some(to_rel) = safe_rel(to) else {
+        return write_json_err(sock, "新名字不合法").await;
+    };
+    let dir = cfg.upload_dir();
+    let dst = dir.join(&to_rel);
+    if let Some(parent) = dst.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            return write_json_err(sock, &format!("建目录失败：{e}")).await;
+        }
+        // 目标目录必须仍在传输目录里（软链接/junction 不能成为出口）
+        if let (Ok(p), Ok(b)) = (parent.canonicalize(), dir.canonicalize()) {
+            if !p.starts_with(&b) {
+                return write_json_err(sock, "新路径超出了传输目录").await;
+            }
+        }
+    }
+
+    let outcome: Result<(), String> = {
+        let _guard = UPLOAD_LOCK.lock().ok();
+        // 只差大小写（Windows）算同一个文件，允许改；真的撞名就拒绝，
+        // 绝不覆盖别人的文件。
+        let same_file = dst
+            .to_string_lossy()
+            .to_lowercase()
+            == src.to_string_lossy().to_lowercase();
+        if dst.exists() && !same_file {
+            Err("同名文件已存在".to_string())
+        } else {
+            match std::fs::rename(&src, &dst) {
+                Ok(()) => Ok(()),
+                Err(e) => Err(format!("改不了：{e}（可能正在被下载或上传）")),
+            }
+        }
+    };
+    match outcome {
+        Ok(()) => {
+            cfg.invalidate_files();
+            cfg.log_activity(
+                peer,
+                crate::config::ActKind::Rename,
+                &format!("{from} → {to}"),
+                0,
+            );
+            write_json(sock, r#"{"success":true}"#).await
+        }
+        Err(msg) => write_json_err(sock, &msg).await,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1574,6 +1731,7 @@ async fn zip_dir(
     sock: &mut impl Conn,
     cfg: &Arc<Config>,
     path: &std::path::Path,
+    peer: &str,
 ) -> Result<(), std::io::Error> {
     let dir = path.to_path_buf();
     if !dir.is_dir() {
@@ -1601,6 +1759,13 @@ async fn zip_dir(
     } else {
         format!("{fname}.zip")
     };
+    // 打包下载也记一笔（大小是压缩前的总量，实际 zip 会小一些）
+    cfg.log_activity(
+        peer,
+        crate::config::ActKind::Download,
+        &format!("{zip_name}（打包）"),
+        0,
+    );
     let encoded = percent_encode(&zip_name);
     let mut out = Vec::with_capacity(512);
     out.extend_from_slice(b"HTTP/1.1 200 OK\r\n");
@@ -1937,6 +2102,7 @@ async fn upload(
     cfg: &Arc<Config>,
     boundary: &Option<String>,
     pending: &mut Vec<u8>,
+    peer: &str,
 ) -> Result<(), std::io::Error> {
     let boundary = match boundary {
         Some(b) => b,
@@ -1984,6 +2150,10 @@ async fn upload(
     // `tokio::fs::File` so the disk writes go through the blocking pool
     // instead of stalling a runtime worker thread.
     let mut file: Option<tokio::io::BufWriter<tokio::fs::File>> = None;
+    // 正在写的这一部分的临时文件 + 最终名字（传完才改名）
+    let mut open_part: Option<(std::path::PathBuf, String)> = None;
+    // 所有开过的临时文件：中途失败要一起删掉
+    let mut temps: Vec<std::path::PathBuf> = Vec::new();
     let mut wrote_any = false;
     let mut body_done = false; // set when we hit the terminal delimiter
     // Bytes written in this request (for the quota bookkeeping).
@@ -2038,22 +2208,17 @@ async fn upload(
                             // Hold the lock only across the existence check +
                             // create (a Send-able scope; the guard must not
                             // live across an await below).
-                            let create_res: std::io::Result<(
-                                std::fs::File,
-                                std::path::PathBuf,
-                            )> = {
-                                let _guard = UPLOAD_LOCK.lock().ok();
-                                create_unique_file(&dir, &fname)
-                            };
-                            match create_res {
-                                Ok((f, p)) => {
+                            // 先写临时文件（同目录），传完再改名成最终名字
+                            match create_temp_file(&dir, &fname) {
+                                Ok((f, tmp)) => {
                                     // 1 MiB write buffer: fewer blocking-pool
                                     // round trips per megabyte.
                                     file = Some(tokio::io::BufWriter::with_capacity(
                                         1 << 20,
                                         tokio::fs::File::from_std(f),
                                     ));
-                                    created.push(p);
+                                    temps.push(tmp.clone());
+                                    open_part = Some((tmp, fname));
                                 }
                                 Err(e) => {
                                     return write_json_err(
@@ -2140,9 +2305,25 @@ async fn upload(
                             after += 2;
                         }
                         window.drain(..after);
-                        // Close the current part's file.
+                        // Close the current part's file, then publish it:
+                        // the temp file only becomes visible under its real
+                        // name once it is complete.
                         if let Some(mut f) = file.take() {
                             tokio::io::AsyncWriteExt::flush(&mut f).await?;
+                            drop(f);
+                        }
+                        if let Some((tmp, fname)) = open_part.take() {
+                            match publish_temp(&dir, &tmp, &fname) {
+                                Ok(done) => created.push(done),
+                                Err(e) => {
+                                    let _ = std::fs::remove_file(&tmp);
+                                    return write_json_err(
+                                        sock,
+                                        &format!("finalise file failed: {e}"),
+                                    )
+                                    .await;
+                                }
+                            }
                         }
                         if is_close {
                             body_done = true;
@@ -2189,6 +2370,9 @@ async fn upload(
         for p in &created {
             let _ = std::fs::remove_file(p);
         }
+        for p in &temps {
+            let _ = std::fs::remove_file(p);
+        }
         give_quota(cfg, written);
         return write_json_status(
             sock,
@@ -2204,8 +2388,18 @@ async fn upload(
         for p in &created {
             let _ = std::fs::remove_file(p);
         }
+        for p in &temps {
+            let _ = std::fs::remove_file(p);
+        }
         give_quota(cfg, written);
         return write_json_err(sock, "Upload aborted").await;
+    }
+
+    // 上传成功：每个落盘的文件都记一笔（大小用真实字节数）
+    for p in &created {
+        let size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+        let rel = rel_display(cfg, p);
+        cfg.log_activity(peer, crate::config::ActKind::Upload, &rel, size);
     }
 
     if wrote_any {
@@ -2285,13 +2479,13 @@ fn safe_leaf(name: &str) -> String {
     }
 }
 
-/// Create a unique file in `dir` with the given (relative) name, appending
-/// `_1`, `_2`, ... if the name already exists. Parent directories are
-/// created as needed. Returns (file, absolute path).
-fn create_unique_file(
+/// A path for `name` inside `dir` that does not exist yet (`a.txt` →
+/// `a_1.txt`, `a_2.txt` …). Parent directories are created as needed and
+/// must stay inside the transfer directory.
+fn unique_path(
     dir: &std::path::Path,
     name: &str,
-) -> std::io::Result<(std::fs::File, std::path::PathBuf)> {
+) -> std::io::Result<std::path::PathBuf> {
     let path = dir.join(name);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -2307,7 +2501,7 @@ fn create_unique_file(
         }
     }
     if !path.exists() {
-        return Ok((std::fs::File::create(&path)?, path));
+        return Ok(path);
     }
     let p = std::path::Path::new(name);
     let stem = p
@@ -2329,8 +2523,53 @@ fn create_unique_file(
     let i = (1..)
         .find(|i| !parent.join(format!("{stem}_{i}{ext}")).exists())
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "name conflict"))?;
-    let target = parent.join(format!("{stem}_{i}{ext}"));
-    Ok((std::fs::File::create(&target)?, target))
+    Ok(parent.join(format!("{stem}_{i}{ext}")))
+}
+
+/// 上传先写同目录下的临时文件 `.td-tmp-<rand>.part`，传完再改名成最终
+/// 名字 —— 这样别人（列表 / 下载 / 打包）永远看不到「半个文件」。
+fn create_temp_file(
+    dir: &std::path::Path,
+    name: &str,
+) -> std::io::Result<(std::fs::File, std::path::PathBuf)> {
+    let target = dir.join(name);
+    let parent = target
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| dir.to_path_buf());
+    std::fs::create_dir_all(&parent)?;
+    if let (Ok(p), Ok(b)) = (parent.canonicalize(), dir.canonicalize()) {
+        if !p.starts_with(&b) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "path escapes the transfer directory",
+            ));
+        }
+    }
+    let mut bytes = [0u8; 8];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut bytes);
+    let tag: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let tmp = parent.join(format!(".td-tmp-{tag}.part"));
+    Ok((std::fs::File::create(&tmp)?, tmp))
+}
+
+/// 临时文件改名成最终名字。同一目录内的 rename 是原子的：别人要么看不到
+/// 这个文件，要么看到的就是完整内容。整个过程在 UPLOAD_LOCK 里，重名
+/// 检查和改名之间不会被另一个上传插进来。
+fn publish_temp(
+    dir: &std::path::Path,
+    tmp: &std::path::Path,
+    name: &str,
+) -> std::io::Result<std::path::PathBuf> {
+    let _guard = UPLOAD_LOCK.lock().ok();
+    let final_path = unique_path(dir, name)?;
+    std::fs::rename(tmp, &final_path)?;
+    Ok(final_path)
+}
+
+/// 列表 / 打包时要跳过的上传中间文件。
+fn is_temp_name(name: &str) -> bool {
+    name.starts_with(".td-tmp-") && name.ends_with(".part")
 }
 
 // ---------------------------------------------------------------------------
@@ -2374,7 +2613,7 @@ mod tests {
         // The secret works (that is how the desktop app talks to itself).
         assert!(authorized(&cfg, &mk("X-TD-Secret: secret\r\n")));
         // A session cookie works.
-        let sid = cfg.new_session();
+        let sid = cfg.new_session("127.0.0.1:5555");
         assert!(authorized(&cfg, &mk(&format!("Cookie: td_sid={sid}\r\n"))));
         // A pairing *code* is not a session credential.
         assert!(!authorized(&cfg, &mk("Cookie: td_sid=87654321\r\n")));
@@ -2957,6 +3196,13 @@ mod tests {
         assert!(resp.contains("success\":true"), "unexpected response: {resp}");
         let saved = std::fs::read(cfg.upload_dir().join("a.txt")).unwrap();
         assert_eq!(saved, data);
+        // 上传要记进「设备操作记录」
+        let acts = cfg.recent_activity(1);
+        assert_eq!(acts.len(), 1);
+        assert_eq!(acts[0].kind, crate::config::ActKind::Upload);
+        assert_eq!(acts[0].name, "a.txt");
+        assert_eq!(acts[0].size, data.len() as u64);
+        assert_eq!(acts[0].ip, "127.0.0.1", "端口要从 IP 里去掉");
     }
 
     #[tokio::test]
@@ -3168,6 +3414,86 @@ mod folder_tests {
         drop(c);
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         assert!(!dir.join("big/x.bin").exists(), "partial file must be removed");
+    }
+
+    /// 重命名：能改名/移动，撞名拒绝且不覆盖，越界路径拒绝。
+    #[tokio::test]
+    async fn rename_moves_and_refuses_overwrite() {
+        let (port, dir) = setup("rename", &[("a.txt", b"AAA"), ("b.txt", b"BBB")]).await;
+        let post = |body: String| {
+            let req = format!(
+                "POST /rename HTTP/1.1\r\nHost: t\r\nX-TD-Secret: test-secret\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            async move { http_text(port, &req).await }
+        };
+        // 改名 + 顺手移动到子目录（子目录会自动建）
+        let resp = post(r#"{"from":"a.txt","to":"docs/c.txt"}"#.to_string()).await;
+        assert!(resp.contains("\"success\":true"), "{resp}");
+        assert!(!dir.join("a.txt").exists(), "原名应该没了");
+        assert_eq!(std::fs::read(dir.join("docs/c.txt")).unwrap(), b"AAA");
+
+        // 撞名：拒绝，两边都不能少
+        let resp = post(r#"{"from":"b.txt","to":"docs/c.txt"}"#.to_string()).await;
+        assert!(resp.contains("同名文件已存在"), "{resp}");
+        assert_eq!(std::fs::read(dir.join("b.txt")).unwrap(), b"BBB");
+        assert_eq!(std::fs::read(dir.join("docs/c.txt")).unwrap(), b"AAA");
+
+        // 越界：拒绝，原文件还在
+        let resp = post(r#"{"from":"b.txt","to":"../escape.txt"}"#.to_string()).await;
+        assert!(!resp.contains("\"success\":true"), "{resp}");
+        assert!(dir.join("b.txt").exists(), "越界改名不能动原文件");
+
+        // 原文件不存在
+        let resp = post(r#"{"from":"nope.txt","to":"x.txt"}"#.to_string()).await;
+        assert!(resp.contains("找不到原文件"), "{resp}");
+    }
+
+    /// 上传成功后目录里只能有成品，不能留 `.td-tmp-*` 中间文件。
+    #[tokio::test]
+    async fn upload_leaves_no_temp_files() {
+        let (port, dir) = setup("tmpclean", &[]).await;
+        let boundary = "Tb";
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"docs/a.txt\"\r\n\r\nhello\r\n--{boundary}--\r\n"
+        );
+        let req = format!(
+            "POST /upload HTTP/1.1\r\nHost: t\r\nX-TD-Secret: test-secret\r\nContent-Type: multipart/form-data; boundary={boundary}\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let resp = http_text(port, &format!("{req}{body}")).await;
+        assert!(resp.contains("\"success\":true"), "resp: {resp}");
+        assert_eq!(std::fs::read(dir.join("docs/a.txt")).unwrap(), b"hello");
+        let leftovers: Vec<String> = std::fs::read_dir(dir.join("docs"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with(".td-tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "临时文件没清掉: {leftovers:?}");
+    }
+
+    /// 删除要把配额还回来，否则删完还是传不进新东西。
+    #[tokio::test]
+    async fn delete_returns_quota() {
+        let (port, _dir) = setup("quota-back", &[("a.txt", b"0123456789")]).await;
+        fn quota_of(r: &str) -> u64 {
+            r.split("\"quota_left\":")
+                .nth(1)
+                .and_then(|s| s.chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().ok())
+                .unwrap_or(0)
+        }
+        let info = "GET /info HTTP/1.1\r\nHost: t\r\nX-TD-Secret: test-secret\r\n\r\n";
+        let before = quota_of(&http_text(port, info).await);
+        let resp = http_text(
+            port,
+            "DELETE /delete/a.txt HTTP/1.1\r\nHost: t\r\nX-TD-Secret: test-secret\r\n\r\n",
+        )
+        .await;
+        assert!(resp.contains("\"success\":true"), "{resp}");
+        let after = quota_of(&http_text(port, info).await);
+        assert!(after >= before + 10, "配额没还回来: before={before} after={after}");
     }
 
     #[tokio::test]

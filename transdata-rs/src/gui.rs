@@ -616,6 +616,9 @@ struct GuiApp {
     /// 标题栏左侧的应用图标（复用窗口图标那张 PNG）
     icon_handle: Option<eframe::egui::TextureHandle>,
     qr_dirty: bool,
+    /// 二维码 / 配对码是否被隐藏（点眼睛按钮切换）。
+    /// 远程协助 / 投屏时按一下，别人就扫不到码、也看不到数字。
+    pair_hidden: bool,
     /// 窗口是否已最大化（自绘标题栏的按钮图标要用）
     maximized: bool,
     /// 配对码点击复制后的提示
@@ -697,6 +700,7 @@ impl GuiApp {
             qr_handle: None,
             icon_handle: None,
             qr_dirty: true,
+            pair_hidden: false,
             maximized: false,
             pair_msg: String::new(),
             note_focused: false,
@@ -1544,6 +1548,107 @@ impl GuiApp {
                                     );
                                 }
 
+                                // ---- 已连接设备：谁正连着（IP + 多久前活跃）
+                                if !compact2 {
+                                    let peers = self.cfg.session_peers();
+                                    ui.add_space(4.0);
+                                    let txt = if peers.is_empty() {
+                                        "已连接设备：无".to_string()
+                                    } else {
+                                        let list: Vec<String> = peers
+                                            .iter()
+                                            .take(3)
+                                            .map(|(ip, idle)| {
+                                                format!("{}（{}）", ip_only(ip), fmt_ago(*idle))
+                                            })
+                                            .collect();
+                                        let more = if peers.len() > 3 {
+                                            format!(" 等 {} 台", peers.len())
+                                        } else {
+                                            String::new()
+                                        };
+                                        format!("已连接 {} 台：{}{}", peers.len(), list.join("、"), more)
+                                    };
+                                    let resp = ui.add(
+                                        eframe::egui::Label::new(
+                                            RichText::new(txt)
+                                                .size(10.5)
+                                                .color(pal::now().muted),
+                                        )
+                                        .wrap(),
+                                    );
+                                    // 悬停：每台设备各自最近 3 条操作
+                                    if !peers.is_empty() {
+                                        let mut tip = String::new();
+                                        for (ip, _) in peers.iter().take(3) {
+                                            let mine = self.cfg.recent_activity_for(ip, 3);
+                                            if !tip.is_empty() {
+                                                tip.push('\n');
+                                            }
+                                            tip.push_str(&format!("{} 最近操作", ip_only(ip)));
+                                            if mine.is_empty() {
+                                                tip.push_str("\n（还没有操作）");
+                                                continue;
+                                            }
+                                            for a in &mine {
+                                                tip.push_str(&format!(
+                                                    "\n{} {} {}（{}）· {}",
+                                                    a.kind.arrow(),
+                                                    a.kind.label(),
+                                                    a.name,
+                                                    fmt_size(a.size),
+                                                    fmt_ago(a.at.elapsed().as_secs())
+                                                ));
+                                            }
+                                        }
+                                        resp.on_hover_text(tip);
+                                    }
+                                }
+
+                                // ---- 最近操作：谁传了什么（悬停看更多）
+                                if !compact {
+                                    let acts = self.cfg.recent_activity(8);
+                                    if !acts.is_empty() {
+                                        ui.add_space(2.0);
+                                        let head: Vec<String> = acts
+                                            .iter()
+                                            .take(2)
+                                            .map(|a| {
+                                                format!(
+                                                    "{} {} · {}",
+                                                    a.kind.arrow(),
+                                                    elide_plain(&a.name, 20),
+                                                    fmt_ago(a.at.elapsed().as_secs())
+                                                )
+                                            })
+                                            .collect();
+                                        let mut tip = String::from("最近操作（新 → 旧）");
+                                        for a in &acts {
+                                            tip.push_str(&format!(
+                                                "\n{} {} {}（{}）· {} · {}",
+                                                a.kind.arrow(),
+                                                a.kind.label(),
+                                                a.name,
+                                                fmt_size(a.size),
+                                                a.ip,
+                                                fmt_ago(a.at.elapsed().as_secs())
+                                            ));
+                                        }
+                                        ui.add(
+                                            eframe::egui::Label::new(
+                                                RichText::new(format!(
+                                                    "最近：{}",
+                                                    head.join(" · ")
+                                                ))
+                                                .size(10.5)
+                                                .color(pal::now().muted),
+                                            )
+                                            .wrap(),
+                                        )
+                                        .on_hover_text(tip);
+                                    }
+                                }
+
                                 // ---- HTTPS 开关
                                 ui.add_space(10.0);
                                 let mut tls_on = self.cfg.tls_on();
@@ -1665,17 +1770,63 @@ impl GuiApp {
                             eframe::egui::vec2(right_w, max_h),
                             eframe::egui::Layout::top_down(eframe::egui::Align::Min),
                             |ui| {
+                                let hidden = self.pair_hidden;
+                                let mut toggle = false;
                                 card(ui, |ui| {
-                                ui.label(
-                                    RichText::new("扫码连接  或用配对码")
-                                        .size(12.0)
-                                        .color(pal::now().muted),
-                                );
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        RichText::new("扫码连接  或用配对码")
+                                            .size(12.0)
+                                            .color(pal::now().muted),
+                                    );
+                                    ui.with_layout(
+                                        eframe::egui::Layout::right_to_left(
+                                            eframe::egui::Align::Center,
+                                        ),
+                                        |ui| {
+                                            // 眼睛按钮：隐藏后别人从远程看屏幕也扫不到码
+                                            let tip = if hidden {
+                                                "显示二维码和配对码"
+                                            } else {
+                                                "隐藏二维码和配对码"
+                                            };
+                                            if eye_button(ui, hidden).on_hover_text(tip).clicked() {
+                                                toggle = true;
+                                            }
+                                        },
+                                    );
+                                });
                                 ui.add_space(8.0);
                                 // 二维码跟着窗口高度缩：窗口矮了也不能把码裁掉
-                                let qr_px = (row_h - 120.0).clamp(72.0, 118.0);
+                                let qr_px = (row_h - 124.0).clamp(72.0, 118.0);
                                 ui.vertical_centered(|ui| {
-                                    if let Some(handle) = &self.qr_handle {
+                                    if hidden {
+                                        // 隐藏时留同样大小的占位，卡片高度不跳动
+                                        eframe::egui::Frame::none()
+                                            .fill(pal::now().soft_bg)
+                                            .rounding(10.0)
+                                            .stroke(eframe::egui::Stroke::new(
+                                                1.0_f32,
+                                                pal::now().card_border,
+                                            ))
+                                            .inner_margin(eframe::egui::Margin::same(8.0))
+                                            .show(ui, |ui| {
+                                                let (r, resp) = ui.allocate_exact_size(
+                                                    eframe::egui::vec2(qr_px, qr_px),
+                                                    eframe::egui::Sense::click(),
+                                                );
+                                                ui.painter().text(
+                                                    r.center(),
+                                                    eframe::egui::Align2::CENTER_CENTER,
+                                                    "已隐藏\n点眼睛显示",
+                                                    eframe::egui::FontId::proportional(11.0),
+                                                    pal::now().muted,
+                                                );
+                                                if resp.clicked() {
+                                                    toggle = true;
+                                                }
+                                            });
+                                    } else if let Some(handle) = &self.qr_handle {
                                         eframe::egui::Frame::none()
                                             .fill(eframe::egui::Color32::WHITE)
                                             .rounding(10.0)
@@ -1706,12 +1857,21 @@ impl GuiApp {
                                                 .size(11.0)
                                                 .color(pal::now().muted),
                                         );
+                                        let shown = if hidden {
+                                            "••••••••".to_string()
+                                        } else {
+                                            self.pair_code.clone()
+                                        };
                                         ui.label(
-                                            RichText::new(&self.pair_code)
+                                            RichText::new(shown)
                                                 .size(20.0)
                                                 .strong()
                                                 .monospace()
-                                                .color(pal::now().fg),
+                                                .color(if hidden {
+                                                    pal::now().muted
+                                                } else {
+                                                    pal::now().fg
+                                                }),
                                         );
                                     });
                                     code_rect = row.response.rect;
@@ -1722,8 +1882,13 @@ impl GuiApp {
                                     eframe::egui::Sense::click(),
                                 );
                                 if code_resp.clicked() {
-                                    ctx.copy_text(self.pair_code.clone());
-                                    self.pair_msg = "配对码已复制".to_string();
+                                    if hidden {
+                                        // 隐藏状态下点码 = 先显示，不复制
+                                        toggle = true;
+                                    } else {
+                                        ctx.copy_text(self.pair_code.clone());
+                                        self.pair_msg = "配对码已复制".to_string();
+                                    }
                                 }
                                 if !self.pair_msg.is_empty() {
                                     ui.add_space(2.0);
@@ -1734,6 +1899,10 @@ impl GuiApp {
                                     );
                                 }
                             });
+                                if toggle {
+                                    self.pair_hidden = !self.pair_hidden;
+                                    self.pair_msg.clear();
+                                }
                         },
                     );
                     }
@@ -1924,6 +2093,48 @@ fn btn_link(ui: &mut eframe::egui::Ui, label: &str) -> bool {
             .min_size(eframe::egui::vec2(34.0, 18.0)),
     )
     .clicked()
+}
+
+/// 眼睛按钮（自己画，不依赖 emoji 字体）：显示 / 隐藏二维码与配对码。
+/// 隐藏状态画一道斜杠，颜色也用主色提示「现在是不显示」。
+fn eye_button(ui: &mut eframe::egui::Ui, hidden: bool) -> eframe::egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(
+        eframe::egui::vec2(26.0, 22.0),
+        eframe::egui::Sense::click(),
+    );
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, 5.0, pal::now().btn_hover);
+    }
+    let c = rect.center();
+    let col = if hidden {
+        pal::now().accent
+    } else {
+        pal::now().muted
+    };
+    let (w, h) = (7.5_f32, 4.4_f32);
+    let stroke = eframe::egui::Stroke::new(1.3_f32, col);
+    // 上下两条弧线拼成杏仁形的眼睛轮廓
+    let mut top = Vec::with_capacity(13);
+    let mut bot = Vec::with_capacity(13);
+    for i in 0..=12 {
+        let x = -1.0 + 2.0 * (i as f32 / 12.0);
+        let y = (1.0 - x * x).max(0.0).powf(0.62) * h;
+        top.push(eframe::egui::pos2(c.x + x * w, c.y - y));
+        bot.push(eframe::egui::pos2(c.x + x * w, c.y + y));
+    }
+    let mut pts = top;
+    pts.extend(bot.into_iter().rev());
+    let p = ui.painter();
+    p.add(eframe::egui::Shape::closed_line(pts, stroke));
+    p.circle_filled(c, 1.8, col);
+    if hidden {
+        let a = eframe::egui::pos2(c.x - w * 0.95, c.y + h * 1.7);
+        let b = eframe::egui::pos2(c.x + w * 0.95, c.y - h * 1.7);
+        // 先用卡片底色把眼睛「切开」，斜杠才看得清
+        p.line_segment([a, b], eframe::egui::Stroke::new(3.2_f32, pal::now().surface));
+        p.line_segment([a, b], eframe::egui::Stroke::new(1.4_f32, col));
+    }
+    resp
 }
 
 /// Load the app icon as a texture for the self-drawn title bar.
@@ -2143,13 +2354,63 @@ fn win_button(
 }
 
 /// Truncate `text` with a trailing ellipsis so it fits within `max` pixels.
+/// `192.168.1.7:53211` -> `192.168.1.7`（也兼容 `[::1]:1234`）。
+fn ip_only(peer: &str) -> &str {
+    let host = match peer.rfind(':') {
+        Some(i) if !peer.ends_with(']') => &peer[..i],
+        _ => peer,
+    };
+    host.trim_start_matches('[').trim_end_matches(']')
+}
+
+/// 「12 秒前 / 3 分钟前 / 2 小时前」
+fn fmt_ago(secs: u64) -> String {
+    if secs < 10 {
+        "刚刚".to_string()
+    } else if secs < 60 {
+        format!("{secs} 秒前")
+    } else if secs < 3600 {
+        format!("{} 分钟前", secs / 60)
+    } else {
+        format!("{} 小时前", secs / 3600)
+    }
+}
+
+/// 1024 进制的大小，跟网页上显示的一致
+fn fmt_size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut v = bytes as f64 / 1024.0;
+    let mut i = 0;
+    while v >= 1024.0 && i < UNITS.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if v < 10.0 {
+        format!("{v:.1} {}", UNITS[i])
+    } else {
+        format!("{:.0} {}", v, UNITS[i])
+    }
+}
+
+/// 按字符数截断（中文按 1 个算），超出加省略号
+fn elide_plain(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max_chars.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
 fn elide(
     ctx: &eframe::egui::Context,
     text: &str,
     font: eframe::egui::FontId,
     max: f32,
-) -> String {
-    let width_of = |s: &str| {
+) -> String {    let width_of = |s: &str| {
         ctx.fonts(|f| f.layout_delayed_color(s.to_string(), font.clone(), f32::INFINITY).rect.width())
     };
     if width_of(text) <= max {
@@ -2319,6 +2580,64 @@ fn note_text_edit(
 mod tests {
     use super::*;
     use eframe::egui;
+
+    /// 眼睛按钮的两种状态各渲染一张，肉眼确认画得对不对：
+    ///
+    /// ```text
+    /// cargo test render_pair_hidden -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn render_pair_hidden() {
+        let cfg = std::sync::Arc::new(Config::new());
+        let ctx = egui::Context::default();
+        let mut style = (*ctx.style()).clone();
+        style.visuals = eframe::egui::Visuals::light();
+        ctx.set_style(style);
+        if let Some((bytes, index)) = cjk_font() {
+            let font_data = eframe::egui::FontData {
+                font: std::borrow::Cow::Owned(bytes),
+                index,
+                tweak: eframe::egui::FontTweak::default(),
+            };
+            let mut definitions = eframe::egui::FontDefinitions::default();
+            definitions.font_data.insert("cjk".to_owned(), font_data);
+            definitions
+                .families
+                .insert(eframe::egui::FontFamily::Proportional, vec!["cjk".to_owned()]);
+            ctx.set_fonts(definitions);
+        }
+        let mut app = GuiApp::new(
+            cfg.clone(),
+            9999,
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            crate::settings::Settings::load(),
+            std::sync::Arc::new(std::sync::Mutex::new(
+                crate::update::UpdateStatus::Idle,
+            )),
+            #[cfg(windows)]
+            0,
+        );
+        app.pair_hidden = false;
+        // 塞一台设备 + 两条操作记录，顺便确认这两行不会把卡片撑爆
+        cfg.new_session("192.168.1.7:5000");
+        cfg.log_activity(
+            "192.168.1.7:5000",
+            crate::config::ActKind::Upload,
+            "会议纪要-2024-06-18-产品评审.docx",
+            384211,
+        );
+        cfg.log_activity(
+            "192.168.1.7:5000",
+            crate::config::ActKind::Download,
+            "a.txt",
+            233,
+        );
+        render_png(&ctx, &mut app, "target/gui_pair_shown.png");
+        app.pair_hidden = true;
+        render_png(&ctx, &mut app, "target/gui_pair_hidden.png");
+    }
 
     /// Render the window headlessly to `target/gui_render.png` so the layout
     /// can be inspected without a desktop session:

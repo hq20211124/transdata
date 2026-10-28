@@ -7,3 +7,6 @@ Thumbs.db
 *.swp
 .idea/
 .vscode/
+
+# 本地工作目录（会话记忆/临时脚本）
+.workbuddy-ai/

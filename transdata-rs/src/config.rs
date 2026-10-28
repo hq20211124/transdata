@@ -30,6 +30,68 @@ pub const QUOTA_FALLBACK: u64 = 50 * 1024 * 1024 * 1024;
 /// space entirely because of a transfer.
 const DISK_RESERVE: u64 = 1024 * 1024 * 1024;
 
+/// `192.168.1.7:53211` -> `192.168.1.7`（也兼容 `[::1]:1234`）。
+fn peer_host(peer: &str) -> &str {
+    let host = match peer.rfind(':') {
+        Some(i) if !peer.ends_with(']') => &peer[..i],
+        _ => peer,
+    };
+    host.trim_start_matches('[').trim_end_matches(']')
+}
+
+/// What a device did — one line in the activity log.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ActKind {
+    Upload,
+    Download,
+    Delete,
+    Rename,
+}
+
+impl ActKind {
+    /// 一行里的箭头：↑ 上传 / ↓ 下载 / ✕ 删除
+    pub fn arrow(self) -> &'static str {
+        match self {
+            ActKind::Upload => "↑",
+            ActKind::Download => "↓",
+            ActKind::Delete => "✕",
+            ActKind::Rename => "→",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ActKind::Upload => "上传",
+            ActKind::Download => "下载",
+            ActKind::Delete => "删除",
+            ActKind::Rename => "重命名",
+        }
+    }
+}
+
+/// One recorded operation (who did what, when, how big).
+#[derive(Clone, Debug)]
+pub struct Activity {
+    pub at: Instant,
+    /// Peer address as seen by the server (`ip:port`).
+    pub ip: String,
+    pub kind: ActKind,
+    /// Relative path inside the transfer dir.
+    pub name: String,
+    pub size: u64,
+}
+
+/// How many operations are kept for the desktop window.
+const ACTIVITY_CAP: usize = 300;
+
+/// One paired device: when it was last seen and where it came from.
+pub struct Session {
+    /// Last request time (touched on every authorized request).
+    pub at: Instant,
+    /// Peer address as seen by the server (`ip:port`).
+    pub ip: String,
+}
+
 /// Shared, runtime-mutable server configuration.
 ///
 /// The HTTP handler reads these atomically per request, so the GUI can
@@ -62,8 +124,10 @@ pub struct Config {
     /// 8-digit pairing code shown in the desktop window, for devices that
     /// cannot scan the QR code.
     pub pair_code: String,
-    /// Live sessions: session id -> last time it was used.
-    pub sessions: RwLock<HashMap<String, Instant>>,
+    /// Live sessions: session id -> (last used, peer address).
+    pub sessions: RwLock<HashMap<String, Session>>,
+    /// Ring buffer of recent operations (upload / download / delete).
+    pub activity: Mutex<std::collections::VecDeque<Activity>>,
     /// Pairing attempts per peer address (ip -> timestamps).
     pub pair_attempts: Mutex<HashMap<String, Vec<Instant>>>,
     /// Set once the brute-force lockout trips.
@@ -187,6 +251,7 @@ impl Config {
             pair_secret: secret,
             pair_code: code,
             sessions: RwLock::new(HashMap::new()),
+            activity: Mutex::new(std::collections::VecDeque::new()),
             pair_attempts: Mutex::new(HashMap::new()),
             pair_locked: AtomicBool::new(false),
             pair_failures: AtomicU32::new(0),
@@ -266,14 +331,20 @@ impl Config {
 
     // ---- sessions ---------------------------------------------------------
 
-    /// Create a new session and return its id.
-    pub fn new_session(&self) -> String {
+    /// Create a new session for `peer` and return its id.
+    pub fn new_session(&self, peer: &str) -> String {
         let mut bytes = [0u8; 16];
         rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut bytes);
         let sid: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
         let mut map = self.sessions.write().unwrap();
-        map.insert(sid.clone(), Instant::now());
-        map.retain(|_, at| at.elapsed() < SESSION_TTL);
+        map.insert(
+            sid.clone(),
+            Session {
+                at: Instant::now(),
+                ip: peer.to_string(),
+            },
+        );
+        map.retain(|_, s| s.at.elapsed() < SESSION_TTL);
         sid
     }
 
@@ -281,8 +352,8 @@ impl Config {
     pub fn session_valid(&self, sid: &str) -> bool {
         let mut map = self.sessions.write().unwrap();
         match map.get_mut(sid) {
-            Some(at) if at.elapsed() < SESSION_TTL => {
-                *at = Instant::now();
+            Some(s) if s.at.elapsed() < SESSION_TTL => {
+                s.at = Instant::now();
                 true
             }
             Some(_) => {
@@ -295,6 +366,70 @@ impl Config {
 
     pub fn session_count(&self) -> usize {
         self.sessions.read().unwrap().len()
+    }
+
+    /// Currently connected devices as `(ip, seconds since last activity)`,
+    /// most recently active first. Used by the desktop window.
+    ///
+    /// One device can hold several sessions (two browser tabs), so this
+    /// dedupes by address and keeps the freshest timestamp.
+    pub fn session_peers(&self) -> Vec<(String, u64)> {
+        let map = self.sessions.read().unwrap();
+        let mut best: HashMap<String, u64> = HashMap::new();
+        for s in map.values() {
+            if s.at.elapsed() >= SESSION_TTL {
+                continue;
+            }
+            let idle = s.at.elapsed().as_secs();
+            // 同一个 IP 的不同端口（两个标签页）算同一台设备
+            let host = peer_host(&s.ip).to_string();
+            best.entry(host)
+                .and_modify(|cur| {
+                    if idle < *cur {
+                        *cur = idle;
+                    }
+                })
+                .or_insert(idle);
+        }
+        let mut out: Vec<(String, u64)> = best.into_iter().collect();
+        out.sort_by_key(|(_, idle)| *idle);
+        out
+    }
+
+    // ---- activity log -----------------------------------------------------
+
+    /// Record one operation. The log is a ring buffer, so it never grows
+    /// without bound even for a 10k-file folder upload.
+    pub fn log_activity(&self, ip: &str, kind: ActKind, name: &str, size: u64) {
+        let mut log = self.activity.lock().unwrap();
+        log.push_back(Activity {
+            at: Instant::now(),
+            ip: peer_host(ip).to_string(),
+            kind,
+            name: name.to_string(),
+            size,
+        });
+        while log.len() > ACTIVITY_CAP {
+            log.pop_front();
+        }
+    }
+
+    /// Newest first, at most `n` entries.
+    pub fn recent_activity(&self, n: usize) -> Vec<Activity> {
+        let log = self.activity.lock().unwrap();
+        log.iter().rev().take(n).cloned().collect()
+    }
+
+    /// Newest first, only for one address (used by the device tooltip).
+    pub fn recent_activity_for(&self, ip: &str, n: usize) -> Vec<Activity> {
+        let host = peer_host(ip);
+        let log = self.activity.lock().unwrap();
+        log.iter()
+            .rev()
+            .filter(|a| a.ip == host)
+            .take(n)
+            .cloned()
+            .collect()
     }
 
     // ---- shared quick-note -------------------------------------------------
@@ -367,20 +502,27 @@ impl Config {
     }
 }
 
-/// Delete leftover `*.zip.tmp` files in the transfer directory.
+/// Delete leftover `*.zip.tmp` / `.td-tmp-*.part` files in the transfer
+/// directory.
 ///
 /// Older versions built the whole archive in a temp file before sending it.
 /// If the program was killed (or the machine rebooted) while that was going
 /// on, a half-written archive of arbitrary size was left behind — and
 /// nothing ever removed it. The streaming writer does not create temp files
 /// any more, so anything matching this pattern is a leftover.
+///
+/// `.td-tmp-*.part` is an upload in progress: at startup no upload can be
+/// running (the server has not started yet), so any such file is debris
+/// from a crash.
 pub fn cleanup_stale_zip_temps(dir: &std::path::Path) {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return;
     };
     for e in rd.flatten() {
         let name = e.file_name().to_string_lossy().to_string();
-        if name.starts_with('.') && name.ends_with(".zip.tmp") && e.path().is_file() {
+        let stale_zip = name.starts_with('.') && name.ends_with(".zip.tmp");
+        let stale_upload = name.starts_with(".td-tmp-") && name.ends_with(".part");
+        if (stale_zip || stale_upload) && e.path().is_file() {
             let _ = std::fs::remove_file(e.path());
         }
     }
@@ -475,5 +617,44 @@ mod tests {
         assert!(!leftover.exists(), "the stale temp archive must be gone");
         assert!(keep.exists(), "real files must not be touched");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 操作记录：新的在前，超过上限丢掉最旧的。
+    #[test]
+    fn activity_log_is_newest_first_and_bounded() {
+        let cfg = Config::new();
+        assert!(cfg.recent_activity(5).is_empty());
+        cfg.log_activity("192.168.1.7:5000", ActKind::Upload, "a.txt", 10);
+        cfg.log_activity("192.168.1.8:6000", ActKind::Download, "b.zip", 20);
+        let acts = cfg.recent_activity(5);
+        assert_eq!(acts.len(), 2);
+        assert_eq!(acts[0].name, "b.zip", "最新的排最前");
+        assert_eq!(acts[0].ip, "192.168.1.8", "端口不写进记录");
+        assert_eq!(acts[1].name, "a.txt");
+        // 只取某台设备的记录
+        let mine = cfg.recent_activity_for("192.168.1.7:1234", 5);
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].name, "a.txt");
+        // 超过上限时丢最旧的
+        for i in 0..(ACTIVITY_CAP + 20) {
+            cfg.log_activity("10.0.0.1:1", ActKind::Delete, &format!("f{i}"), 0);
+        }
+        let acts = cfg.recent_activity(ACTIVITY_CAP + 50);
+        assert_eq!(acts.len(), ACTIVITY_CAP);
+        assert_eq!(acts[0].name, format!("f{}", ACTIVITY_CAP + 19));
+    }
+
+    /// 窗口上「已连接设备」按 IP 去重：同一个手机开两个标签页算一台。
+    #[test]
+    fn session_peers_dedupes_by_address() {
+        let cfg = Config::new();
+        assert!(cfg.session_peers().is_empty());
+        cfg.new_session("192.168.1.7:5000");
+        cfg.new_session("192.168.1.7:5001");
+        cfg.new_session("192.168.1.8:6000");
+        let peers = cfg.session_peers();
+        assert_eq!(peers.len(), 2, "两个标签页算一台设备");
+        assert!(peers.iter().any(|(ip, _)| ip.starts_with("192.168.1.7")));
+        assert!(peers.iter().any(|(ip, _)| ip.starts_with("192.168.1.8")));
     }
 }
