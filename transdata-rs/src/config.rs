@@ -109,6 +109,20 @@ pub struct Session {
     pub at: Instant,
     /// Peer address as seen by the server (`ip:port`).
     pub ip: String,
+    /// 这台设备能不能「删除 / 修改」。**关掉不等于断开**：上传、下载、打包
+    /// 一律不看这个开关。新配对默认允许；不落盘，重启后全部恢复允许。
+    pub allow_write: bool,
+}
+
+/// 设备表里的一行：一台设备（同一 IP 的多个标签页算一台）。
+#[derive(Clone, Debug)]
+pub struct DeviceInfo {
+    pub ip: String,
+    /// 距上次请求过了多少秒。
+    pub idle_secs: u64,
+    /// 这台设备开了几个会话（几个标签页）。
+    pub sessions: usize,
+    pub allow_write: bool,
 }
 
 /// Shared, runtime-mutable server configuration.
@@ -455,6 +469,7 @@ impl Config {
             Session {
                 at: Instant::now(),
                 ip: peer.to_string(),
+                allow_write: true,
             },
         );
         map.retain(|_, s| s.at.elapsed() < SESSION_TTL);
@@ -479,6 +494,92 @@ impl Config {
 
     pub fn session_count(&self) -> usize {
         self.sessions.read().unwrap().len()
+    }
+
+    // ---- 设备授权（删除 / 修改）--------------------------------------------
+    //
+    // 术语固定：**删除 / 修改** = 授权开关（管 `DELETE /delete/*` 和
+    // `POST /rename`）；**传输** = 上传 + 下载 + 打包，永远可用；**断开** =
+    // 踢掉会话，对方要重新配对。三件事互相独立。
+
+    /// 设备表：活跃在前，按 IP 去重（同一 IP 的多个标签页算一台）。
+    pub fn device_list(&self) -> Vec<DeviceInfo> {
+        let map = self.sessions.read().unwrap();
+        let mut acc: HashMap<String, (u64, usize, bool)> = HashMap::new();
+        for s in map.values() {
+            if s.at.elapsed() >= SESSION_TTL {
+                continue;
+            }
+            let host = peer_host(&s.ip).to_string();
+            let idle = s.at.elapsed().as_secs();
+            acc.entry(host)
+                .and_modify(|(cur_idle, n, w)| {
+                    if idle < *cur_idle {
+                        *cur_idle = idle;
+                    }
+                    *n += 1;
+                    // 同一台设备上的会话授权一致（set_device_write 一起写），
+                    // 万一不一致按「有任何一个被禁就算禁」保守处理。
+                    *w = *w && s.allow_write;
+                })
+                .or_insert((idle, 1, s.allow_write));
+        }
+        let mut out: Vec<DeviceInfo> = acc
+            .into_iter()
+            .map(|(ip, (idle_secs, sessions, allow_write))| DeviceInfo {
+                ip,
+                idle_secs,
+                sessions,
+                allow_write,
+            })
+            .collect();
+        out.sort_by_key(|d| d.idle_secs);
+        out
+    }
+
+    /// 给某台设备（该 IP 下所有会话）设置「删除 / 修改」权限。返回改了几条。
+    pub fn set_device_write(&self, ip: &str, on: bool) -> usize {
+        let host = peer_host(ip);
+        let mut map = self.sessions.write().unwrap();
+        let mut n = 0;
+        for s in map.values_mut() {
+            if peer_host(&s.ip) == host {
+                s.allow_write = on;
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// 这个会话还有没有「删除 / 修改」权限。
+    ///
+    /// 会话不存在（过期/被踢）时返回 false —— 调用方本来也会先过
+    /// `session_valid`，这里只是保守兜底。
+    pub fn session_can_write(&self, sid: &str) -> bool {
+        self.sessions
+            .read()
+            .unwrap()
+            .get(sid)
+            .map(|s| s.allow_write && s.at.elapsed() < SESSION_TTL)
+            .unwrap_or(false)
+    }
+
+    /// 会话属于哪台设备（`/info` 用来自查权限）。
+    pub fn session_ip(&self, sid: &str) -> Option<String> {
+        self.sessions
+            .read()
+            .unwrap()
+            .get(sid)
+            .map(|s| peer_host(&s.ip).to_string())
+    }
+
+    /// 断开某台设备（踢掉它所有会话），返回删了几条。
+    pub fn drop_client(&self, ip: &str) -> usize {
+        let host = peer_host(ip);
+        let mut map = self.sessions.write().unwrap();
+        let before = map.len();
+        map.retain(|_, s| peer_host(&s.ip) != host);
+        before - map.len()
     }
 
     /// Currently connected devices as `(ip, seconds since last activity)`,
@@ -792,5 +893,58 @@ mod tests {
         assert_eq!(peers.len(), 2, "两个标签页算一台设备");
         assert!(peers.iter().any(|(ip, _)| ip.starts_with("192.168.1.7")));
         assert!(peers.iter().any(|(ip, _)| ip.starts_with("192.168.1.8")));
+    }
+
+    /// 一台设备一个开关：关掉只影响那一台，同一 IP 的多个标签页一起生效。
+    #[test]
+    fn device_write_flag_is_per_device() {
+        let cfg = Config::new();
+        let a1 = cfg.new_session("192.168.1.7:5000");
+        let a2 = cfg.new_session("192.168.1.7:5001");
+        let b = cfg.new_session("192.168.1.8:6000");
+
+        // 默认全部允许
+        assert!(cfg.session_can_write(&a1) && cfg.session_can_write(&b));
+
+        assert_eq!(cfg.set_device_write("192.168.1.7", false), 2, "同一 IP 的会话要一起写");
+        assert!(!cfg.session_can_write(&a1));
+        assert!(!cfg.session_can_write(&a2), "两个标签页算一台设备");
+        assert!(cfg.session_can_write(&b), "不能牵连别的设备");
+
+        let list = cfg.device_list();
+        assert_eq!(list.len(), 2);
+        let a = list.iter().find(|d| d.ip == "192.168.1.7").unwrap();
+        assert!(!a.allow_write);
+        assert_eq!(a.sessions, 2);
+        assert!(list.iter().find(|d| d.ip == "192.168.1.8").unwrap().allow_write);
+
+        assert_eq!(cfg.set_device_write("192.168.1.7", true), 2);
+        assert!(cfg.session_can_write(&a1));
+    }
+
+    /// 断开 = 删掉该设备的会话（可恢复：对方重新配对即可），别人不受影响。
+    #[test]
+    fn drop_client_kills_its_sessions() {
+        let cfg = Config::new();
+        let a = cfg.new_session("192.168.1.7:5000");
+        cfg.new_session("192.168.1.7:5001");
+        let b = cfg.new_session("192.168.1.8:6000");
+        assert_eq!(cfg.session_count(), 3);
+
+        assert_eq!(cfg.drop_client("192.168.1.7"), 2);
+        assert_eq!(cfg.session_count(), 1);
+        assert!(!cfg.session_valid(&a), "旧会话要立刻失效");
+        assert!(cfg.session_valid(&b));
+        assert_eq!(cfg.device_list().len(), 1);
+        // 断开一台不存在的设备：什么也不做
+        assert_eq!(cfg.drop_client("10.0.0.1"), 0);
+    }
+
+    /// 未知会话（过期/被踢）一律当作没有权限。
+    #[test]
+    fn unknown_session_has_no_write() {
+        let cfg = Config::new();
+        assert!(!cfg.session_can_write("nope"));
+        assert!(cfg.session_ip("nope").is_none());
     }
 }
