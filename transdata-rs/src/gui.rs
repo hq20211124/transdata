@@ -6,12 +6,31 @@ use eframe::{App, Frame};
 
 use crate::config::Config;
 
-/// 主窗口尺寸（初始就是最小尺寸：省地方，嫌小可以随时拉大）
-const WIN_W: f32 = 640.0;
-const WIN_H: f32 = 470.0;
-/// 最小尺寸：拖边缘时不能缩到比这更小（否则内容挤不下）
+/// v1.3 管理端的三栏界面（目录 / 设备 / 详情）
+mod workspace;
+
+/// 主窗口尺寸：v1.3 起是**管理端**，一屏三栏（目录 / 连接+设备 / 设备详情）。
+/// 尺寸是算出来的：内宽 1168 = 目录 516 + 设备 296 + 详情 336 + 两处 10px 间距。
+const WIN_W: f32 = 1200.0;
+const WIN_H: f32 = 760.0;
+/// 最小尺寸：再小就放不下三栏，右两栏收起，标题栏出现「设备 (n)」抽屉按钮。
 const WIN_MIN_W: f32 = 640.0;
 const WIN_MIN_H: f32 = 470.0;
+
+/// 三栏的固定宽度与间距
+const COL_DEVICE_W: f32 = 296.0;
+const COL_DETAIL_W: f32 = 336.0;
+const COL_GAP: f32 = 10.0;
+/// 窄于这个宽度就收起右两栏（三栏放不下，不做横向滚动）
+const WIDE_MIN_W: f32 = 1000.0;
+/// 目录行高 / 设备行高 / 详情行高
+const ROW_H: f32 = 30.0;
+const DEV_ROW_H: f32 = 30.0;
+const ACT_ROW_H: f32 = 26.0;
+/// 渲染上限（防手机/大目录把界面拖死）
+const RENDER_CAP: usize = 500;
+/// 便签条高度（两行输入 + 按钮）
+const NOTE_STRIP_H: f32 = 76.0;
 /// 自绘标题栏的高度（原来这块是系统标题栏，深色模式下是一条黑边）
 const TITLEBAR_H: f32 = 42.0;
 
@@ -510,6 +529,52 @@ pub fn run_gui(cfg: Arc<Config>, port: u16) {
         });
     }
 
+    // ---- 目录列表的后台刷新 -------------------------------------------
+    //
+    // `ops::list` 在 1 万文件的目录上要几十到上百毫秒，放在 UI 线程里每帧
+    // 跑一遍会把界面拖卡。所以单独一个线程读目录，结果通过 mpsc 交回主线程
+    // （和便签 / `/info` 的轮询是同一个模式）：3 秒节流，最小化时不刷，
+    // 删改后可以立刻催一次。
+    let (files_tx, files_rx) = std::sync::mpsc::channel::<crate::ops::Snapshot>();
+    let refresh_now = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let window_visible = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    {
+        let cfg_files = cfg.clone();
+        let ctx_holder_files = ctx_holder.clone();
+        let refresh_flag = refresh_now.clone();
+        let visible_flag = window_visible.clone();
+        std::thread::spawn(move || {
+            let gui_ctx = loop {
+                if let Some(ctx) = ctx_holder_files.lock().unwrap().clone() {
+                    break ctx;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            };
+            let mut last = std::time::Instant::now() - std::time::Duration::from_secs(10);
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                let forced = refresh_flag.swap(false, std::sync::atomic::Ordering::SeqCst);
+                let due = last.elapsed() >= std::time::Duration::from_secs(3);
+                if !forced && !due {
+                    continue;
+                }
+                if !visible_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    // 最小化：不刷，但别把 forced 丢了 —— 一恢复就立刻读
+                    if forced {
+                        refresh_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    continue;
+                }
+                last = std::time::Instant::now();
+                let snap = crate::ops::list(&cfg_files);
+                if files_tx.send(snap).is_err() {
+                    return; // 窗口没了
+                }
+                let _ = gui_ctx.request_repaint();
+            }
+        });
+    }
+
     // The self-signed certificate is created once in the background so the
     // window can show its fingerprint right away.
     {
@@ -596,6 +661,9 @@ pub fn run_gui(cfg: Arc<Config>, port: u16) {
                     paired_gui,
                     settings,
                     update_slot,
+                    files_rx,
+                    refresh_now,
+                    window_visible,
                     #[cfg(windows)]
                     win_shape::find_main_window(),
                 )
@@ -657,6 +725,48 @@ struct GuiApp {
     update: Arc<std::sync::Mutex<crate::update::UpdateStatus>>,
     /// 正在拖动窗口边缘改大小时的状态
     resize: Option<ResizeState>,
+
+    // ---- v1.3 管理端 ------------------------------------------------------
+    /// 后台线程送来的目录快照（`ops::list`，3 秒节流）
+    files_rx: std::sync::mpsc::Receiver<crate::ops::Snapshot>,
+    /// 最近一次拿到的目录快照
+    files: crate::ops::Snapshot,
+    /// 是否正在等第一次列表（工具栏显示「正在读取…」）
+    files_loading: bool,
+    /// 折叠的目录（只在内存里，重启清空）
+    collapsed: std::collections::HashSet<String>,
+    /// 选中的条目（相对路径）
+    selected: Option<String>,
+    /// 正在改名的那一行：路径 + 编辑中的文字
+    renaming: Option<(String, String)>,
+    /// 改名输入框刚打开时要「只选中主文件名」（第一帧做一次）
+    rename_fresh: bool,
+    /// 删除确认窗：路径 / 名字 / 是否目录 / 里面有几个项目
+    confirm_delete: Option<ConfirmDelete>,
+    /// 右栏显示的是哪台设备（点设备表切换）
+    detail_ip: Option<String>,
+    /// 底部状态栏的一句话（错误红字 / 操作结果）
+    status_msg: String,
+    status_is_err: bool,
+    /// 这句话是什么时候写的（6 秒后让位给「已选中」）
+    status_at: Option<std::time::Instant>,
+    /// 窄窗口时右两栏的抽屉是否打开
+    drawer_open: bool,
+    /// 目录里一共有多少个文件夹 / 文件 / 总字节（状态栏用）
+    counts: (usize, usize, u64),
+    /// 叫后台线程立刻重读一次目录（删/改名后马上看到结果）
+    refresh_now: Arc<std::sync::atomic::AtomicBool>,
+    /// 窗口是否可见（最小化时后台不刷目录，省 CPU）
+    window_visible: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// 删除确认窗要显示的东西
+struct ConfirmDelete {
+    rel: String,
+    name: String,
+    is_dir: bool,
+    /// 目录里有多少个项目（文件 + 子目录），文件为 0
+    items: usize,
 }
 
 /// 拖边缘改大小时记下的东西：起始光标位置 + 起始窗口矩形（物理像素）
@@ -687,6 +797,9 @@ impl GuiApp {
         paired_devices: Arc<std::sync::atomic::AtomicUsize>,
         settings: crate::settings::Settings,
         update: Arc<std::sync::Mutex<crate::update::UpdateStatus>>,
+        files_rx: std::sync::mpsc::Receiver<crate::ops::Snapshot>,
+        refresh_now: Arc<std::sync::atomic::AtomicBool>,
+        window_visible: Arc<std::sync::atomic::AtomicBool>,
         #[cfg(windows)] hwnd: isize,
     ) -> Self {
         let (_, last_v) = cfg.read_note();
@@ -720,6 +833,22 @@ impl GuiApp {
             settings_open: false,
             update,
             resize: None,
+            files_rx,
+            files: crate::ops::Snapshot::default(),
+            files_loading: true,
+            collapsed: std::collections::HashSet::new(),
+            selected: None,
+            renaming: None,
+            rename_fresh: false,
+            confirm_delete: None,
+            detail_ip: None,
+            status_msg: String::new(),
+            status_is_err: false,
+            status_at: None,
+            drawer_open: false,
+            counts: (0, 0, 0),
+            refresh_now,
+            window_visible,
         }
     }
 
@@ -873,7 +1002,7 @@ impl GuiApp {
                             let paired =
                                 self.paired_devices.load(std::sync::atomic::Ordering::SeqCst);
                             let status = if paired > 0 {
-                                format!("运行中 · 端口 {} · 已配对 {paired} 台", self.port)
+                                format!("运行中 · 端口 {} · {paired} 台设备", self.port)
                             } else {
                                 format!("运行中 · 端口 {}", self.port)
                             };
@@ -881,6 +1010,41 @@ impl GuiApp {
                         },
                     );
                 });
+
+                // 窄窗口放不下三栏：右两栏收起，这里给一个抽屉入口
+                let narrow = bar.width() < WIDE_MIN_W;
+                let drawer_w = 78.0_f32;
+                if narrow {
+                    let devs = self.cfg.device_list().len();
+                    let r = eframe::egui::Rect::from_min_size(
+                        eframe::egui::pos2(moon_x - drawer_w - 6.0, btn_y),
+                        eframe::egui::vec2(drawer_w, btn_h),
+                    );
+                    let resp = ui.interact(
+                        r,
+                        ui.id().with("device_drawer"),
+                        eframe::egui::Sense::click(),
+                    );
+                    let hovered = resp.hovered();
+                    if hovered {
+                        ui.painter().rect_filled(r, 6.0, pal::now().btn_hover);
+                    }
+                    ui.painter().text(
+                        r.center(),
+                        eframe::egui::Align2::CENTER_CENTER,
+                        format!("设备 ({devs})"),
+                        eframe::egui::FontId::proportional(11.5),
+                        if hovered {
+                            pal::now().fg
+                        } else {
+                            pal::now().muted
+                        },
+                    );
+                    if resp.clicked() {
+                        self.drawer_open = !self.drawer_open;
+                        ctx.request_repaint();
+                    }
+                }
 
                 // 主题切换（现在深色，点一下变浅色）
                 if theme_button(ui, rect_at(moon_x)) {
@@ -912,10 +1076,17 @@ impl GuiApp {
                     ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Minimized(true));
                 }
 
-                // 除按钮外整条都是拖动区（按住拖窗口，双击 = 最大化/还原）
+                // 除按钮外整条都是拖动区（按住拖窗口，双击 = 最大化/还原）。
+                // 注意：拖动区不能盖住「设备 (n)」抽屉按钮 —— egui 里后建的
+                // 交互区在上面，会把按钮的点击吃掉。
+                let drag_right = if narrow {
+                    moon_x - drawer_w - 6.0
+                } else {
+                    moon_x
+                };
                 let drag_rect = eframe::egui::Rect::from_min_max(
                     bar.left_top(),
-                    eframe::egui::pos2(moon_x, bar.bottom()),
+                    eframe::egui::pos2(drag_right, bar.bottom()),
                 );
                 let drag = ui.interact(
                     drag_rect,
@@ -1451,7 +1622,6 @@ impl GuiApp {
             return;
         }
 
-        let url = self.base_url();
         let (shared_text, shared_v) = self.cfg.read_note();
 
         // 拖边缘改大小（要在画界面之前处理，鼠标指针才换得及时）
@@ -1510,572 +1680,8 @@ impl GuiApp {
         // ---- 自绘标题栏（代替系统标题栏，深色系统下那条黑边就没了）
         self.draw_titlebar(ctx);
 
-        eframe::egui::CentralPanel::default()
-            .frame(
-                eframe::egui::Frame::none()
-                    .fill(pal::now().bg)
-                    .inner_margin(eframe::egui::Margin::symmetric(18.0, 12.0)),
-            )
-            .show(ctx, |ui| {
-                // ---- 高度怎么分：上半部分（地址/目录/扫码）+ 下半部分（快捷文本）
-                //
-                // 之前便签卡的高度是「用剩下的空间」算出来的：窗口一矮，剩下
-                // 的空间不够放整张卡，卡就被裁到窗口外，底下的「复制 / 发送」
-                // 按钮跟着一起没了。现在改成**先把高度分配好**：
-                // 快捷文本卡固定占住底部一块，主区拿剩下的 → 按钮永远在。
-                const NOTE_MIN_H: f32 = 186.0; // 94 + 输入框 80 + 外边距 12
-                let panel = ui.available_rect_before_wrap();
-                let avail_h = panel.height();
-                // 便签卡占 34%（最多 360），剩下的给上面的主区
-                let note_h = (avail_h * 0.34).clamp(NOTE_MIN_H, 360.0);
-                // 94 = 卡片内边距 28 + 标题行 18 + 两处 8 + 按钮行 32，外边距 12
-                let input_h = (note_h - 106.0).clamp(80.0, 360.0);
-                let row_h = (avail_h - note_h - 12.0).max(140.0);
-                // 窗口矮的时候，主区里可有可无的说明文字先让位
-                let compact = row_h < 300.0;
-                let compact2 = row_h < 250.0;
+        self.draw_workspace(ctx);
 
-                // 两块区域的矩形直接算出来，不靠布局流推：
-                // 上半部分（地址/目录/扫码）+ 下半部分（快捷文本，贴死底部）
-                let main_rect = eframe::egui::Rect::from_min_max(
-                    panel.min,
-                    eframe::egui::pos2(panel.right(), panel.top() + row_h),
-                );
-                let note_rect = eframe::egui::Rect::from_min_max(
-                    eframe::egui::pos2(panel.left(), panel.bottom() - note_h),
-                    panel.max,
-                );
-
-                // ---- Main: left (地址 + 传输目录) | right (手机扫码)
-                ui.allocate_ui_at_rect(main_rect, |ui| {
-                ui.with_layout(
-                    eframe::egui::Layout::left_to_right(eframe::egui::Align::Center),
-                    |ui| {
-                        ui.spacing_mut().item_spacing.x = 12.0;
-
-                        // A nested ui.vertical in a horizontal layout grabs ALL
-                        // remaining width, which squeezed the QR column to 0 and
-                        // hid it. Constrain each column by allocating an explicit
-                        // max-sized ui instead.
-                        let right_w = 186.0_f32;
-                        let left_w = (ui.available_width() - right_w - 12.0).max(240.0);
-                        let max_h = row_h;
-
-                        // Left column
-                        ui.allocate_ui_with_layout(
-                            eframe::egui::vec2(left_w, max_h),
-                            eframe::egui::Layout::top_down(eframe::egui::Align::Min),
-                            |ui| {
-                                card(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    section_label(ui, "访问地址");
-                                    ui.with_layout(
-                                        eframe::egui::Layout::right_to_left(
-                                            eframe::egui::Align::Center,
-                                        ),
-                                        |ui| {
-                                            if btn_soft(ui, "复制", 11.0, 24.0, 52.0) {
-                                                ctx.copy_text(url.clone());
-                                            }
-                                        },
-                                    );
-                                });
-                                ui.add_space(6.0);
-                                let url_font = eframe::egui::FontId::monospace(13.0);
-                                let shown = elide(
-                                    ctx,
-                                    &url,
-                                    url_font.clone(),
-                                    ui.available_width().max(80.0),
-                                );
-                                ui.label(RichText::new(shown).font(url_font).color(pal::now().accent));
-                                // Hotspot / second NIC: the default-route IP may not be
-                                // the one the phone can reach — list all IPs.
-                                if self.ips.len() > 1 && !compact {
-                                    ui.add_space(4.0);
-                                    let tip = format!(
-                                        "全部IP：{}（热点用 192.168.137.1）",
-                                        self.ips.join("、")
-                                    );
-                                    let tip_font = eframe::egui::FontId::proportional(11.0);
-                                    // 关键信息：不截断，超长换行全量显示（窗口已加宽配合）
-                                    ui.add(
-                                        eframe::egui::Label::new(
-                                            RichText::new(tip)
-                                                .font(tip_font)
-                                                .color(pal::now().muted),
-                                        )
-                                        .wrap(),
-                                    );
-                                }
-
-                                // ---- 已连接设备：谁正连着（IP + 多久前活跃）
-                                if !compact2 {
-                                    let peers = self.cfg.session_peers();
-                                    ui.add_space(4.0);
-                                    let txt = if peers.is_empty() {
-                                        "已连接设备：无".to_string()
-                                    } else {
-                                        let list: Vec<String> = peers
-                                            .iter()
-                                            .take(3)
-                                            .map(|(ip, idle)| {
-                                                format!("{}（{}）", ip_only(ip), fmt_ago(*idle))
-                                            })
-                                            .collect();
-                                        let more = if peers.len() > 3 {
-                                            format!(" 等 {} 台", peers.len())
-                                        } else {
-                                            String::new()
-                                        };
-                                        format!("已连接 {} 台：{}{}", peers.len(), list.join("、"), more)
-                                    };
-                                    let resp = ui.add(
-                                        eframe::egui::Label::new(
-                                            RichText::new(txt)
-                                                .size(10.5)
-                                                .color(pal::now().muted),
-                                        )
-                                        .wrap(),
-                                    );
-                                    // 悬停：每台设备各自最近 3 条操作
-                                    if !peers.is_empty() {
-                                        let mut tip = String::new();
-                                        for (ip, _) in peers.iter().take(3) {
-                                            let mine = self.cfg.recent_activity_for(ip, 3);
-                                            if !tip.is_empty() {
-                                                tip.push('\n');
-                                            }
-                                            tip.push_str(&format!("{} 最近操作", ip_only(ip)));
-                                            if mine.is_empty() {
-                                                tip.push_str("\n（还没有操作）");
-                                                continue;
-                                            }
-                                            for a in &mine {
-                                                tip.push_str(&format!(
-                                                    "\n{} {} {}（{}）· {}",
-                                                    a.kind.arrow(),
-                                                    a.kind.label(),
-                                                    a.name,
-                                                    fmt_size(a.size),
-                                                    fmt_ago(a.at.elapsed().as_secs())
-                                                ));
-                                            }
-                                        }
-                                        resp.on_hover_text(tip);
-                                    }
-                                }
-
-                                // ---- 最近操作：谁传了什么（悬停看更多）
-                                if !compact {
-                                    let acts = self.cfg.recent_activity(8);
-                                    if !acts.is_empty() {
-                                        ui.add_space(2.0);
-                                        let head: Vec<String> = acts
-                                            .iter()
-                                            .take(2)
-                                            .map(|a| {
-                                                format!(
-                                                    "{} {} · {}",
-                                                    a.kind.arrow(),
-                                                    elide_plain(&a.name, 20),
-                                                    fmt_ago(a.at.elapsed().as_secs())
-                                                )
-                                            })
-                                            .collect();
-                                        let mut tip = String::from("最近操作（新 → 旧）");
-                                        for a in &acts {
-                                            tip.push_str(&format!(
-                                                "\n{} {} {}（{}）· {} · {}",
-                                                a.kind.arrow(),
-                                                a.kind.label(),
-                                                a.name,
-                                                fmt_size(a.size),
-                                                a.ip,
-                                                fmt_ago(a.at.elapsed().as_secs())
-                                            ));
-                                        }
-                                        ui.add(
-                                            eframe::egui::Label::new(
-                                                RichText::new(format!(
-                                                    "最近：{}",
-                                                    head.join(" · ")
-                                                ))
-                                                .size(10.5)
-                                                .color(pal::now().muted),
-                                            )
-                                            .wrap(),
-                                        )
-                                        .on_hover_text(tip);
-                                    }
-                                }
-
-                                // ---- HTTPS 开关
-                                ui.add_space(10.0);
-                                let mut tls_on = self.cfg.tls_on();
-                                let resp = ui.checkbox(
-                                    &mut tls_on,
-                                    RichText::new("启用 HTTPS（加密传输）")
-                                        .size(12.5)
-                                        .color(pal::now().fg),
-                                );
-                                if resp.changed() {
-                                    self.set_tls(tls_on);
-                                    ctx.request_repaint();
-                                }
-                                if self.cfg.tls_on() {
-                                    if !compact {
-                                        ui.add_space(4.0);
-                                        ui.add(
-                                            eframe::egui::Label::new(
-                                                RichText::new(
-                                                    "手机首次打开会提示一次「证书不受信任」：Chrome 点「高级 → 继续前往」，Safari 点「显示详细信息 → 访问此网站」。",
-                                                )
-                                                .size(10.5)
-                                                .color(pal::now().muted),
-                                            )
-                                            .wrap(),
-                                        );
-                                    }
-                                    if let Some(m) = self.cfg.tls_material() {
-                                        ui.add_space(4.0);
-                                        ui.horizontal(|ui| {
-                                            ui.label(
-                                                RichText::new("证书指纹")
-                                                    .size(10.5)
-                                                    .color(pal::now().muted),
-                                            );
-                                            let fp_font = eframe::egui::FontId::monospace(10.0);
-                                            ui.label(
-                                                RichText::new(fingerprint_short(&m.fingerprint))
-                                                    .font(fp_font)
-                                                    .color(pal::now().soft_fg),
-                                            );
-                                            if btn_link(ui, "复制") {
-                                                ctx.copy_text(m.fingerprint.clone());
-                                            }
-                                        });
-                                    }
-                                } else {
-                                    if !compact {
-                                        ui.add(
-                                            eframe::egui::Label::new(
-                                                RichText::new("不开启时为明文 HTTP，同一网络内可被旁观。")
-                                                    .size(10.5)
-                                                    .color(pal::now().muted),
-                                            )
-                                            .wrap(),
-                                        );
-                                    }
-                                }
-                            });
-                            // 卡片之间的间距：card() 的外边距(6) + 布局间距(8)
-                            card(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    section_label(ui, "传输目录");
-                                    ui.with_layout(
-                                        eframe::egui::Layout::right_to_left(
-                                            eframe::egui::Align::Center,
-                                        ),
-                                        |ui| {
-                                            let open_hit = btn_soft(ui, "打开", 11.0, 24.0, 52.0);
-                                            let chg_hit = btn_primary(ui, "更改", 11.0, 24.0, 52.0);
-                                            if open_hit {
-                                                open_in_explorer(self.cfg.upload_dir());
-                                            }
-                                            if chg_hit {
-                                                if let Some(d) = choose_dir() {
-                                                    self.set_dir(d);
-                                                }
-                                            }
-                                        },
-                                    );
-                                });
-                                ui.add_space(6.0);
-                                let dir_str = self.cfg.upload_dir().to_string_lossy().to_string();
-                                let font = eframe::egui::FontId::proportional(12.0);
-                                ui.label(
-                                    RichText::new(elide(
-                                        ctx,
-                                        &dir_str,
-                                        font.clone(),
-                                        ui.available_width().max(60.0),
-                                    ))
-                                    .font(font)
-                                    .color(pal::now().fg),
-                                );
-                                ui.add_space(6.0);
-                                if !compact2 {
-                                    ui.add(
-                                        eframe::egui::Label::new(
-                                            RichText::new(
-                                                "关闭窗口即停止服务器；「打开」进入目录，「更改」切换位置",
-                                            )
-                                            .size(11.0)
-                                            .color(pal::now().muted)
-                                            .weak(),
-                                        )
-                                        .wrap(),
-                                    );
-                                }
-                            });
-                            },
-                        );
-                        // NOTE: no ui.add_space here — the horizontal layout's
-                        // item_spacing.x (12) already provides the gap. Adding
-                        // another 12px pushed the right column 12px past the
-                        // panel edge and clipped the QR card.
-
-                        // Right column：只留「扫码连接 或用配对码」+ 二维码 + 配对码
-                        ui.allocate_ui_with_layout(
-                            eframe::egui::vec2(right_w, max_h),
-                            eframe::egui::Layout::top_down(eframe::egui::Align::Min),
-                            |ui| {
-                                let hidden = self.pair_hidden;
-                                let mut toggle = false;
-                                card(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        RichText::new("扫码连接  或用配对码")
-                                            .size(12.0)
-                                            .color(pal::now().muted),
-                                    );
-                                    ui.with_layout(
-                                        eframe::egui::Layout::right_to_left(
-                                            eframe::egui::Align::Center,
-                                        ),
-                                        |ui| {
-                                            // 眼睛按钮：隐藏后别人从远程看屏幕也扫不到码
-                                            let tip = if hidden {
-                                                "显示二维码和配对码"
-                                            } else {
-                                                "隐藏二维码和配对码"
-                                            };
-                                            if eye_button(ui, hidden).on_hover_text(tip).clicked() {
-                                                toggle = true;
-                                            }
-                                        },
-                                    );
-                                });
-                                ui.add_space(8.0);
-                                // 二维码跟着窗口高度缩：窗口矮了也不能把码裁掉
-                                let qr_px = (row_h - 124.0).clamp(72.0, 118.0);
-                                ui.vertical_centered(|ui| {
-                                    if hidden {
-                                        // 隐藏时留同样大小的占位，卡片高度不跳动
-                                        eframe::egui::Frame::none()
-                                            .fill(pal::now().soft_bg)
-                                            .rounding(10.0)
-                                            .stroke(eframe::egui::Stroke::new(
-                                                1.0_f32,
-                                                pal::now().card_border,
-                                            ))
-                                            .inner_margin(eframe::egui::Margin::same(8.0))
-                                            .show(ui, |ui| {
-                                                let (r, resp) = ui.allocate_exact_size(
-                                                    eframe::egui::vec2(qr_px, qr_px),
-                                                    eframe::egui::Sense::click(),
-                                                );
-                                                ui.painter().text(
-                                                    r.center(),
-                                                    eframe::egui::Align2::CENTER_CENTER,
-                                                    "已隐藏\n点眼睛显示",
-                                                    eframe::egui::FontId::proportional(11.0),
-                                                    pal::now().muted,
-                                                );
-                                                if resp.clicked() {
-                                                    toggle = true;
-                                                }
-                                            });
-                                    } else if let Some(handle) = &self.qr_handle {
-                                        eframe::egui::Frame::none()
-                                            .fill(eframe::egui::Color32::WHITE)
-                                            .rounding(10.0)
-                                            .stroke(eframe::egui::Stroke::new(
-                                                1.0_f32,
-                                                pal::now().card_border,
-                                            ))
-                                            .inner_margin(eframe::egui::Margin::same(8.0))
-                                            .show(ui, |ui| {
-                                                ui.add(
-                                                    eframe::egui::widgets::Image::from_texture(
-                                                        handle,
-                                                    )
-                                                    .max_size(eframe::egui::vec2(
-                                                        qr_px, qr_px,
-                                                    )),
-                                                );
-                                            });
-                                    }
-                                });
-                                ui.add_space(10.0);
-                                // 配对码：给不方便扫码的设备（点一下复制）
-                                let mut code_rect = eframe::egui::Rect::NOTHING;
-                                ui.vertical_centered(|ui| {
-                                    let row = ui.horizontal(|ui| {
-                                        ui.label(
-                                            RichText::new("配对码")
-                                                .size(11.0)
-                                                .color(pal::now().muted),
-                                        );
-                                        let shown = if hidden {
-                                            "••••••••".to_string()
-                                        } else {
-                                            self.pair_code.clone()
-                                        };
-                                        ui.label(
-                                            RichText::new(shown)
-                                                .size(20.0)
-                                                .strong()
-                                                .monospace()
-                                                .color(if hidden {
-                                                    pal::now().muted
-                                                } else {
-                                                    pal::now().fg
-                                                }),
-                                        );
-                                    });
-                                    code_rect = row.response.rect;
-                                });
-                                let code_resp = ui.interact(
-                                    code_rect,
-                                    ui.id().with("pair_code"),
-                                    eframe::egui::Sense::click(),
-                                );
-                                if code_resp.clicked() {
-                                    if hidden {
-                                        // 隐藏状态下点码 = 先显示，不复制
-                                        toggle = true;
-                                    } else {
-                                        ctx.copy_text(self.pair_code.clone());
-                                        self.pair_msg = "配对码已复制".to_string();
-                                    }
-                                }
-                                // 配对冷却：以前桌面端完全看不到锁状态，手机一直失败
-                                // 也不知道为什么。这里直接把剩余秒数写出来。
-                                if let Some(secs) = self.cfg.pair_lock_left() {
-                                    ui.add_space(2.0);
-                                    ui.label(
-                                        RichText::new(format!(
-                                            "已锁定，{secs} 秒后可重试（设置里可换码）"
-                                        ))
-                                        .size(10.5)
-                                        .color(pal::now().btn_hover_close),
-                                    );
-                                }
-                                if !self.pair_msg.is_empty() {
-                                    ui.add_space(2.0);
-                                    ui.label(
-                                        RichText::new(&self.pair_msg)
-                                            .size(10.5)
-                                            .color(pal::now().muted),
-                                    );
-                                }
-                            });
-                                if toggle {
-                                    self.pair_hidden = !self.pair_hidden;
-                                    self.pair_msg.clear();
-                                }
-                        },
-                    );
-                    }
-                );
-                });
-                ui.add_space(12.0);
-
-                // ---- Quick-note card: 贴住窗口底部，共享文本框与手机页实时同步
-                // 复制 = 复制框内文字到本机剪贴板；发送 = 推给另一端（自动填入）。
-                // 远端内容总是覆盖本地编辑。
-                // 高度上面已经算好并直接给出矩形 —— 窗口再矮，底下的
-                // 「复制 / 发送」也不会被裁掉。
-                ui.allocate_ui_at_rect(note_rect, |ui| {
-                    card(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            section_label(ui, "快捷文本");
-                            ui.with_layout(
-                                eframe::egui::Layout::right_to_left(eframe::egui::Align::Center),
-                                |ui| {
-                                    // 状态提示放在标题行右侧：放按钮下面会被窗口底边裁掉
-                                    if !self.note_status.is_empty() {
-                                        ui.label(
-                                            RichText::new(&self.note_status)
-                                                .size(11.5)
-                                                .color(pal::now().accent),
-                                        );
-                                    } else {
-                                        ui.label(
-                                            RichText::new("自动同步 · 不限长度")
-                                                .size(11.0)
-                                                .color(pal::now().muted),
-                                        );
-                                    }
-                                },
-                            );
-                        });
-                        ui.add_space(8.0);
-                        // 圆角输入框：聚焦时边框变主色，不再是 egui 默认那圈黑线
-                        let resp = note_text_edit(
-                            ui,
-                            &mut self.text_buf,
-                            input_h,
-                            &mut self.note_focused,
-                        );
-                        let changed = resp.changed;
-                        ui.add_space(8.0);
-                        ui.horizontal(|ui| {
-                            let copy_hit = btn_soft(ui, "复制", 13.0, 32.0, 88.0);
-                            // right_to_left：先放的「发送」贴最右，再放小提示 → 提示在按钮左侧
-                            let send_hit = ui
-                                .with_layout(
-                                    eframe::egui::Layout::right_to_left(
-                                        eframe::egui::Align::Center,
-                                    ),
-                                    |ui| {
-                                        let hit = btn_primary(ui, "发送", 13.0, 32.0, 88.0);
-                                        ui.label(
-                                            RichText::new("Ctrl+Enter 可快捷发送")
-                                                .size(11.0)
-                                                .color(pal::now().muted),
-                                        );
-                                        hit
-                                    },
-                                )
-                                .inner;
-                            if copy_hit {
-                                let ok = win32_set_clipboard(&self.text_buf);
-                                // 复制不等于"已同步"：不要清 note_local，
-                                // 否则下一次远端更新会静默覆盖掉本地改动。
-                                self.note_status = if ok {
-                                    "已复制到剪贴板".to_string()
-                                } else {
-                                    "复制失败：剪贴板被其他程序占用".to_string()
-                                };
-                            }
-                            // Ctrl+Enter 快捷键直接发送（顺带吞掉该按键，避免 TextEdit 插入换行）
-                            let ctrl_enter = ctx.input(|i| {
-                                i.key_pressed(eframe::egui::Key::Enter)
-                                    && i.modifiers.contains(eframe::egui::Modifiers::CTRL)
-                            });
-                            if ctrl_enter {
-                                let _ = ctx.input_mut(|i| {
-                                    i.consume_key(eframe::egui::Modifiers::CTRL, eframe::egui::Key::Enter)
-                                });
-                            }
-                            if send_hit || ctrl_enter {
-                                let v = self.cfg.store_note(&self.text_buf);
-                                self.note_local = None;
-                                self.note_last_v = v;
-                                self.note_status = "已发送，另一端将自动填入".to_string();
-                            }
-                        });
-                        if changed {
-                            // 只有真的敲了字才留一份本地副本（每帧拷贝大文本是浪费）
-                            self.note_local = Some(self.text_buf.clone());
-                        }
-                    });
-                });
-
-            });
 
         if refresh_now {
             // Only schedule a follow-up repaint when the display actually
@@ -2094,22 +1700,6 @@ impl GuiApp {
 // ---------------------------------------------------------------------------
 // layout helpers
 
-/// Rounded card with a 1px border and bottom spacing.
-fn card(ui: &mut eframe::egui::Ui, add: impl FnOnce(&mut eframe::egui::Ui)) {
-    eframe::egui::Frame::none()
-        .fill(pal::now().surface)
-        .rounding(12.0)
-        .stroke(eframe::egui::Stroke::new(1.0_f32, pal::now().card_border))
-        .inner_margin(eframe::egui::Margin::same(14.0))
-        .outer_margin(eframe::egui::Margin {
-            left: 0.0,
-            right: 0.0,
-            top: 0.0,
-            // 卡片之间的间距靠这个 + 布局的 item_spacing(8) = 14
-            bottom: 6.0,
-        })
-        .show(ui, add);
-}
 
 fn section_label(ui: &mut eframe::egui::Ui, text: &str) {
     ui.label(RichText::new(text).size(12.0).color(pal::now().muted));
@@ -2431,16 +2021,6 @@ fn win_button(
     resp.clicked()
 }
 
-/// Truncate `text` with a trailing ellipsis so it fits within `max` pixels.
-/// `192.168.1.7:53211` -> `192.168.1.7`（也兼容 `[::1]:1234`）。
-fn ip_only(peer: &str) -> &str {
-    let host = match peer.rfind(':') {
-        Some(i) if !peer.ends_with(']') => &peer[..i],
-        _ => peer,
-    };
-    host.trim_start_matches('[').trim_end_matches(']')
-}
-
 /// 「12 秒前 / 3 分钟前 / 2 小时前」
 fn fmt_ago(secs: u64) -> String {
     if secs < 10 {
@@ -2471,16 +2051,6 @@ fn fmt_size(bytes: u64) -> String {
     } else {
         format!("{:.0} {}", v, UNITS[i])
     }
-}
-
-/// 按字符数截断（中文按 1 个算），超出加省略号
-fn elide_plain(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        return s.to_string();
-    }
-    let mut out: String = s.chars().take(max_chars.saturating_sub(1)).collect();
-    out.push('…');
-    out
 }
 
 fn elide(
@@ -2707,6 +2277,9 @@ mod tests {
             std::sync::Arc::new(std::sync::Mutex::new(
                 crate::update::UpdateStatus::Idle,
             )),
+            test_files_rx(),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             #[cfg(windows)]
             0,
         );
@@ -2766,6 +2339,9 @@ mod tests {
             std::sync::Arc::new(std::sync::Mutex::new(
                 crate::update::UpdateStatus::Idle,
             )),
+            test_files_rx(),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             #[cfg(windows)]
             0,
         );
@@ -2812,6 +2388,9 @@ mod tests {
             std::sync::Arc::new(std::sync::Mutex::new(
                 crate::update::UpdateStatus::Idle,
             )),
+            test_files_rx(),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             #[cfg(windows)]
             0,
         );
@@ -3002,6 +2581,9 @@ mod tests {
                 std::sync::Arc::new(std::sync::Mutex::new(
                     crate::update::UpdateStatus::Idle,
                 )),
+                test_files_rx(),
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 #[cfg(windows)]
                 0,
             );
@@ -3075,6 +2657,13 @@ mod tests {
     }
 
     /// 一个不联网、不写文件的测试用窗口
+    /// 测试用的目录通道：没有后台线程往里送，界面就显示「正在读取…」。
+    fn test_files_rx() -> std::sync::mpsc::Receiver<crate::ops::Snapshot> {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        std::mem::forget(_tx);
+        rx
+    }
+
     fn test_app(ctx: &egui::Context) -> GuiApp {
         let mut style = (*ctx.style()).clone();
         style.visuals = egui::Visuals::light();
@@ -3104,6 +2693,9 @@ mod tests {
             std::sync::Arc::new(std::sync::Mutex::new(
                 crate::update::UpdateStatus::Idle,
             )),
+            test_files_rx(),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             #[cfg(windows)]
             0,
         )
@@ -3234,6 +2826,133 @@ mod tests {
         assert!(w_new <= WIN_W, "输入框宽度仍失控, 宽 = {w_new}");
         assert!(by_new < WIN_H, "按钮仍被挤出窗口, y = {by_new}");
         assert!(bx_new < WIN_W, "按钮仍被挤出屏幕, x = {bx_new}");
+    }
+
+    // ---- v1.3 管理端：无头测试 --------------------------------------------
+
+    /// 造一份目录快照（GUI 不碰文件系统，测试直接喂数据）
+    fn fake_snapshot() -> crate::ops::Snapshot {
+        use crate::ops::Entry;
+        let mk = |rel: &str, is_dir: bool, size: u64| Entry {
+            rel: rel.to_string(),
+            is_dir,
+            size,
+            mtime: 1_790_000_000,
+        };
+        crate::ops::Snapshot {
+            entries: vec![
+                mk("归档", true, 0),
+                mk("归档/2026-10 报告.pdf", false, 2_400_000),
+                mk("备份", true, 0),
+                mk("备份/旧照片.zip", false, 88_000_000),
+                mk("会议记录.txt", false, 4096),
+            ],
+            truncated: false,
+        }
+    }
+
+    /// 树：文件夹在前、按名排；折叠后子项消失；深度对得上。
+    #[test]
+    fn tree_rows_follow_collapse_state() {
+        let snap = fake_snapshot();
+        let mut collapsed = std::collections::HashSet::new();
+        let rows = super::workspace::build_rows(&snap, &collapsed);
+        let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+        // 文件夹（归档、备份）在前，文件（会议记录.txt）在后
+        assert_eq!(names, vec!["备份", "旧照片.zip", "归档", "2026-10 报告.pdf", "会议记录.txt"]);
+        assert_eq!(rows[1].depth, 1, "子项要缩进一级");
+
+        collapsed.insert("归档".to_string());
+        let rows = super::workspace::build_rows(&snap, &collapsed);
+        let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+        assert!(!names.contains(&"2026-10 报告.pdf"), "折叠后子项不该出现: {names:?}");
+        assert!(names.contains(&"归档"));
+    }
+
+    /// 1200×760 三栏能画出来（出图人工核对）；700×470 走抽屉降级。
+    #[test]
+    fn management_view_renders_and_narrow_uses_drawer() {
+        let ctx = egui::Context::default();
+        let mut style = (*ctx.style()).clone();
+        style.visuals = egui::Visuals::light();
+        ctx.set_style(style);
+        crate::settings::set_theme(crate::settings::Theme::Light);
+
+        let mut app = test_app(&ctx);
+        app.files = fake_snapshot();
+        app.files_loading = false;
+        app.selected = Some("归档/2026-10 报告.pdf".to_string());
+        app.rename_fresh = true;
+        // 两台设备：一台允许、一台禁止（看开关的两种状态）
+        app.cfg.new_session("192.168.1.23:5000");
+        app.cfg.new_session("192.168.1.57:6000");
+        app.cfg.set_device_write("192.168.1.57", false);
+        app.cfg.log_activity(
+            "192.168.1.23:5000",
+            crate::config::ActKind::Upload,
+            "归档/2026-10 报告.pdf",
+            2_400_000,
+        );
+        app.cfg.log_activity(
+            "192.168.1.23:5000",
+            crate::config::ActKind::Download,
+            "备份/旧照片.zip",
+            88_000_000,
+        );
+        app.detail_ip = Some("192.168.1.23".to_string());
+        render_png_size(&ctx, &mut app, "target/gui_manage_1200x760.png", 1200.0, 760.0);
+        assert!(std::path::Path::new("target/gui_manage_1200x760.png").exists());
+
+        // 窄窗口：右两栏收起，标题栏出现「设备 (n)」，点一下开抽屉
+        let (w, h) = (700.0_f32, 470.0_f32);
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(w, h)));
+        for i in 0..20 {
+            input.time = Some(i as f64 * 0.05);
+            let _ = ctx.run(input.clone(), |ctx| app.draw(ctx));
+        }
+        render_png_size(&ctx, &mut app, "target/gui_manage_700x470.png", w, h);
+        assert!(!app.drawer_open, "默认不展开抽屉");
+
+        // 抽屉按钮在主题按钮左边：bar.right() = w - 10
+        let btn_w = 36.0_f32;
+        let win_base_x = (w - 10.0) - btn_w * 3.0;
+        let gear_x = win_base_x - 10.0 - btn_w;
+        let moon_x = gear_x - btn_w;
+        let cx = moon_x - 78.0 - 6.0 + 39.0;
+        let cy = 1.0 + (TITLEBAR_H - 2.0) / 2.0;
+        let mut click = egui::RawInput::default();
+        click.screen_rect = Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(w, h)));
+        click.events.push(egui::Event::PointerMoved(egui::pos2(cx, cy)));
+        for pressed in [true, false] {
+            click.events.push(egui::Event::PointerButton {
+                pos: egui::pos2(cx, cy),
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::default(),
+            });
+        }
+        click.time = Some(2.0);
+        let _ = ctx.run(click, |ctx| app.draw(ctx));
+        assert!(app.drawer_open, "窄窗口点「设备 (n)」应该打开详情抽屉");
+    }
+
+    /// 删除确认窗：目录要说清楚「里面的 N 个项目会一起删除」。
+    #[test]
+    fn delete_confirm_counts_children() {
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        app.files = fake_snapshot();
+        app.files_loading = false;
+        let row = super::workspace::build_rows(&app.files, &app.collapsed)
+            .into_iter()
+            .find(|r| r.rel == "备份")
+            .expect("备份 目录要在列表里");
+        app.ask_delete(&row);
+        let c = app.confirm_delete.as_ref().expect("确认窗要打开");
+        assert!(c.is_dir);
+        assert_eq!(c.items, 1, "备份 里只有一个文件");
+        app.confirm_delete = None;
     }
 
 }

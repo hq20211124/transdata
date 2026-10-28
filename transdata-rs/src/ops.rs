@@ -297,7 +297,10 @@ pub struct DeleteSummary {
     pub rel: String,
     pub is_dir: bool,
     pub files: usize,
+    /// 目录里删掉的子目录数（GUI 的 toast 暂时只用 files）
+    #[allow(dead_code)]
     pub dirs: usize,
+    #[allow(dead_code)]
     pub bytes: u64,
 }
 

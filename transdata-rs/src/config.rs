@@ -65,6 +65,8 @@ impl ActKind {
         }
     }
 
+    /// 文字版（活动日志的悬停提示用；界面上现在用图标，保留给后续）
+    #[allow(dead_code)]
     pub fn label(self) -> &'static str {
         match self {
             ActKind::Upload => "上传",
@@ -565,6 +567,7 @@ impl Config {
     }
 
     /// 会话属于哪台设备（`/info` 用来自查权限）。
+    #[allow(dead_code)]
     pub fn session_ip(&self, sid: &str) -> Option<String> {
         self.sessions
             .read()
@@ -587,6 +590,7 @@ impl Config {
     ///
     /// One device can hold several sessions (two browser tabs), so this
     /// dedupes by address and keeps the freshest timestamp.
+    #[allow(dead_code)]
     pub fn session_peers(&self) -> Vec<(String, u64)> {
         let map = self.sessions.read().unwrap();
         let mut best: HashMap<String, u64> = HashMap::new();
@@ -629,6 +633,7 @@ impl Config {
     }
 
     /// Newest first, at most `n` entries.
+    #[allow(dead_code)]
     pub fn recent_activity(&self, n: usize) -> Vec<Activity> {
         let log = self.activity.lock().unwrap();
         log.iter().rev().take(n).cloned().collect()
