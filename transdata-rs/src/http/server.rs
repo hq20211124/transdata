@@ -417,6 +417,29 @@ fn authorized(cfg: &Config, req: &Request) -> bool {
     false
 }
 
+/// 这台请求方能不能「删除 / 修改」。
+///
+/// **前端置灰不算权限**，真正的判定在这里：
+/// - `X-TD-Secret`（桌面端管理自己）：永远允许 —— 否则关掉某台设备的授权后
+///   自己也删不动了；
+/// - 会话 Cookie：按该会话所在设备的授权开关。
+///
+/// 注意上传 / 下载 / 打包**不看**这个开关 ——「关授权不等于断开」就是这条。
+fn may_write(cfg: &Config, req: &Request) -> bool {
+    if let Some(s) = &req.secret {
+        let expected = cfg.pair_secret.read().unwrap();
+        if ct_eq(s, expected.as_str()) {
+            return true;
+        }
+    }
+    if let Some(c) = &req.cookie {
+        if let Some(sid) = cookie_value(c, "td_sid") {
+            return cfg.session_can_write(sid);
+        }
+    }
+    false
+}
+
 /// Same-origin check for state-changing requests.
 ///
 /// A browser always sends `Origin` on cross-origin POST/DELETE. If it is
@@ -663,8 +686,11 @@ async fn handle_conn(
             // Seconds left on the pairing lockout (0 = not locked). The
             // desktop window shows this; it used to have no idea at all.
             let lock = cfg.pair_lock_left().unwrap_or(0);
+            // 请求方自己那台设备还能不能「删除 / 修改」：网页据此把两个按钮
+            // 置灰并挂黄条。桌面端（X-TD-Secret）永远是 true。
+            let can_write = may_write(cfg, &req);
             let body = format!(
-                r#"{{"success":true,"url":"{url}","files_count":{count},"save_dir":"{dir_s}","active":{active},"paired":{paired},"quota_left":{quota},"pair_locked":{lock}}}"#
+                r#"{{"success":true,"url":"{url}","files_count":{count},"save_dir":"{dir_s}","active":{active},"paired":{paired},"quota_left":{quota},"pair_locked":{lock},"can_write":{can_write}}}"#
             );
             write_json(&mut sock, &body).await
         }
@@ -711,12 +737,30 @@ async fn handle_conn(
             }
         }
         ("DELETE", p) if p.starts_with("/delete/") => {
+            if !may_write(cfg, &req) {
+                return write_json_status(
+                    &mut sock,
+                    "403 Forbidden",
+                    "这台设备已被禁止删除 / 修改",
+                )
+                .await;
+            }
             delete(&mut sock, cfg, &p["/delete/".len()..], peer).await
         }
         ("POST", "/upload") => {
             upload(&mut sock, cfg, &req.boundary, &mut pending, peer).await
         }
-        ("POST", "/rename") => rename_path(&mut sock, cfg, &req, &mut pending, peer).await,
+        ("POST", "/rename") => {
+            if !may_write(cfg, &req) {
+                return write_json_status(
+                    &mut sock,
+                    "403 Forbidden",
+                    "这台设备已被禁止删除 / 修改",
+                )
+                .await;
+            }
+            rename_path(&mut sock, cfg, &req, &mut pending, peer).await
+        }
         ("POST", "/verify") => verify(&mut sock, cfg, &req, &mut pending).await,
         ("GET", p) if p.starts_with("/zip/") => {
             // `req.path` is already decoded — see the note above.
@@ -3182,6 +3226,119 @@ mod folder_tests {
         // 原文件不存在
         let resp = post(r#"{"from":"nope.txt","to":"x.txt"}"#.to_string()).await;
         assert!(resp.contains("找不到原文件"), "{resp}");
+    }
+
+    /// 起一个能用指定 Config 服务的端口（会话由测试直接造，便于模拟不同 IP）。
+    async fn serve_cfg(cfg: Arc<Config>) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                let c = cfg.clone();
+                tokio::spawn(async move {
+                    let _ = handle_conn(sock, &c, "127.0.0.1").await;
+                });
+            }
+        });
+        port
+    }
+
+    fn device_test_cfg(name: &str) -> (Arc<Config>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "transdata_dev_{}_{}",
+            std::process::id(),
+            name
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).ok();
+        std::fs::write(dir.join("a.txt"), b"AAAA").ok();
+        std::fs::write(dir.join("b.txt"), b"BBBB").ok();
+        let cfg = Arc::new(Config::with_secret(
+            TEST_SECRET.to_string(),
+            TEST_CODE.to_string(),
+        ));
+        cfg.set_upload_dir(dir.clone());
+        (cfg, dir)
+    }
+
+    /// 按设备授权：A 关掉「删除 / 修改」后，A 的 Cookie 删不动，
+    /// B 的 Cookie 照常，桌面端（X-TD-Secret）也照常。`/info` 各自正确。
+    #[tokio::test]
+    async fn device_write_flag_is_per_device() {
+        let (cfg, dir) = device_test_cfg("perdevice");
+        let sid_a = cfg.new_session("192.168.1.7:5000");
+        let sid_b = cfg.new_session("192.168.1.8:6000");
+        cfg.set_device_write("192.168.1.7", false);
+        let port = serve_cfg(cfg.clone()).await;
+
+        let del = |cookie: &str| {
+            format!("DELETE /delete/a.txt HTTP/1.1\r\nHost: t\r\nCookie: td_sid={cookie}\r\n\r\n")
+        };
+        // A：403，文件必须还在
+        let resp = http_text(port, &del(&sid_a)).await;
+        assert!(resp.contains("403"), "resp: {resp}");
+        assert!(resp.contains("已被禁止删除"), "resp: {resp}");
+        assert!(dir.join("a.txt").exists(), "被禁止的设备不能真的删掉文件");
+
+        // /info：各看各的
+        let info = |cookie: &str| {
+            format!("GET /info HTTP/1.1\r\nHost: t\r\nCookie: td_sid={cookie}\r\n\r\n")
+        };
+        assert!(http_text(port, &info(&sid_a)).await.contains("\"can_write\":false"));
+        assert!(http_text(port, &info(&sid_b)).await.contains("\"can_write\":true"));
+
+        // B：200
+        let resp = http_text(port, &del(&sid_b)).await;
+        assert!(resp.contains("\"success\":true"), "resp: {resp}");
+        assert!(!dir.join("a.txt").exists());
+
+        // 桌面端豁免：关掉授权后自己还得能删
+        let resp = http_text(
+            port,
+            "DELETE /delete/b.txt HTTP/1.1\r\nHost: t\r\nX-TD-Secret: test-secret\r\n\r\n",
+        )
+        .await;
+        assert!(resp.contains("\"success\":true"), "resp: {resp}");
+        assert!(!dir.join("b.txt").exists());
+    }
+
+    /// 「关授权不等于断开」：上传 / 下载 / 打包一律不看那个开关。
+    #[tokio::test]
+    async fn write_flag_does_not_block_transfer() {
+        let (cfg, dir) = device_test_cfg("transfer");
+        let sid_a = cfg.new_session("192.168.1.7:5000");
+        cfg.set_device_write("192.168.1.7", false);
+        let port = serve_cfg(cfg).await;
+
+        // 上传
+        let boundary = "Fb";
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"up.txt\"\r\n\r\nhello\r\n--{boundary}--\r\n"
+        );
+        let req = format!(
+            "POST /upload HTTP/1.1\r\nHost: t\r\nCookie: td_sid={sid_a}\r\nContent-Type: multipart/form-data; boundary={boundary}\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let resp = http_text(port, &req).await;
+        assert!(resp.contains("\"success\":true"), "上传不受授权影响: {resp}");
+        assert_eq!(std::fs::read(dir.join("up.txt")).unwrap(), b"hello");
+
+        // 下载
+        let resp = http_text(
+            port,
+            &format!("GET /download/a.txt HTTP/1.1\r\nHost: t\r\nCookie: td_sid={sid_a}\r\n\r\n"),
+        )
+        .await;
+        assert!(resp.contains("200 OK"), "下载不受授权影响: {resp}");
+        assert!(resp.contains("AAAA"), "{resp}");
+
+        // 打包
+        let resp = http_text(
+            port,
+            &format!("GET /zip-all HTTP/1.1\r\nHost: t\r\nCookie: td_sid={sid_a}\r\n\r\n"),
+        )
+        .await;
+        assert!(resp.contains("200 OK"), "打包不受授权影响: {resp}");
     }
 
     /// 上传成功后目录里只能有成品，不能留 `.td-tmp-*` 中间文件。
