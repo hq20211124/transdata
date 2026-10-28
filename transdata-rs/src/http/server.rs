@@ -8,7 +8,6 @@ use std::io::ErrorKind;
 use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
-use std::sync::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task;
@@ -22,6 +21,10 @@ pub trait Conn: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Conn for T {}
 
 use crate::config::Config;
+// 文件操作的实现在 `crate::ops`（GUI 和 HTTP 共用同一套规则与同一把锁）
+use crate::ops::{
+    give_quota, is_reserved_name, rel_display, resolve_rel, safe_rel, take_quota, UPLOAD_LOCK,
+};
 
 const MAX_HEAD: usize = 8 * 1024;
 const CHUNK: usize = 256 * 1024;
@@ -33,8 +36,6 @@ pub const TEST_SECRET: &str = "test-secret";
 /// Fixed pairing code used by the unit tests.
 #[cfg(test)]
 pub const TEST_CODE: &str = "12345678";
-/// /files listing cap; deeper trees are truncated and flagged.
-const FILE_LIST_CAP: usize = 10_000;
 /// /verify per-request cap (number of manifest entries). The client sends at
 /// most 15 000 per batch, so this is only a backstop against a hand-made
 /// request. It does *not* limit the number of files on disk any more.
@@ -42,17 +43,6 @@ const VERIFY_CAP: usize = 20_000;
 /// How many uploads may run at the same time. Without this a single device
 /// (or a script) can saturate the disk and starve every other client.
 const MAX_CONCURRENT_UPLOADS: usize = 8;
-/// Maximum directory depth walked when listing / verifying the transfer dir
-/// (also breaks symlink cycles).
-const MAX_WALK_DEPTH: usize = 24;
-/// Maximum length of one path segment (bytes).
-const MAX_SEGMENT_LEN: usize = 200;
-/// Maximum length of a whole relative path (bytes).
-const MAX_PATH_LEN: usize = 1024;
-
-/// Serializes the "check for name -> create file" step so two concurrent
-/// uploads of the same folder cannot both create `<x>_1`.
-static UPLOAD_LOCK: Mutex<()> = Mutex::new(());
 
 /// Serve until the process ends.
 ///
@@ -688,68 +678,23 @@ async fn handle_conn(
             if let Some(cached) = cfg.cached_files() {
                 return write_json(&mut sock, &cached).await;
             }
-            let dir = cfg.upload_dir();
-            let mut items: Vec<String> = Vec::new();
-            let mut truncated = false;
-            let mut stack: Vec<(std::path::PathBuf, usize)> = vec![(dir.clone(), 0)];
-            while let Some((d, depth)) = stack.pop() {
-                if depth > MAX_WALK_DEPTH {
-                    truncated = true;
-                    break;
-                }
-                if let Ok(rd) = d.read_dir() {
-                    for e in rd.flatten() {
-                        let p = e.path();
-                        // Skip symlinks: they can point outside the transfer
-                        // directory and can form cycles.
-                        match e.file_type() {
-                            Ok(ft) if ft.is_symlink() => continue,
-                            Err(_) => continue,
-                            _ => {}
-                        }
-                        if p.is_dir() {
-                            stack.push((p.to_path_buf(), depth + 1));
-                        } else {
-                            // 正在上传的临时文件不算「已有文件」
-                            if p.file_name()
-                                .map(|n| is_temp_name(&n.to_string_lossy()))
-                                .unwrap_or(false)
-                            {
-                                continue;
-                            }
-                            let rel = p
-                                .strip_prefix(&dir)
-                                .ok()
-                                .map(|s| s.to_string_lossy().replace('\\', "/"))
-                                .unwrap_or_default();
-                            if items.len() >= FILE_LIST_CAP {
-                                truncated = true;
-                                break;
-                            }
-                            let meta = e.metadata().ok();
-                            let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
-                            let mtime = meta
-                                .as_ref()
-                                .and_then(|m| m.modified().ok())
-                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                                .map(|d| d.as_secs())
-                                .unwrap_or(0);
-                            items.push(format!(
-                                r#"{{"name":"{}","size":{},"modified":{}}}"#,
-                                Config::json_escape(&rel),
-                                size,
-                                mtime
-                            ));
-                        }
-                    }
-                }
-                if truncated {
-                    break;
-                }
-            }
+            // 遍历与上限都在 `crate::ops::list` 里（GUI 用同一份，所以两边
+            // 看到的是同一个目录）。网页端只要文件，目录行由前端自己拼。
+            let snap = crate::ops::list(cfg);
+            let items: Vec<String> = snap
+                .files()
+                .map(|e| {
+                    format!(
+                        r#"{{"name":"{}","size":{},"modified":{}}}"#,
+                        Config::json_escape(&e.rel),
+                        e.size,
+                        e.mtime
+                    )
+                })
+                .collect();
             let body = format!(
                 r#"{{"success":true,"truncated":{},"files":[{}]}}"#,
-                truncated,
+                snap.truncated,
                 items.join(",")
             );
             cfg.store_files_cache(body.clone());
@@ -766,10 +711,7 @@ async fn handle_conn(
             }
         }
         ("DELETE", p) if p.starts_with("/delete/") => {
-            match resolve_rel(cfg, &p["/delete/".len()..]) {
-                Some(p) => delete(&mut sock, cfg, &p, peer).await,
-                None => write_json_err(&mut sock, "Bad path").await,
-            }
+            delete(&mut sock, cfg, &p["/delete/".len()..], peer).await
         }
         ("POST", "/upload") => {
             upload(&mut sock, cfg, &req.boundary, &mut pending, peer).await
@@ -1216,123 +1158,6 @@ async fn write_json_status(
     .await
 }
 
-/// Normalize a client-supplied relative path into one that is safe to join
-/// onto the upload dir.
-///
-/// Rejects: absolute paths, drive letters, UNC paths, `.` / `..` segments,
-/// empty segments, control characters, the Windows-illegal characters
-/// `< > : " | ? *` (a colon would open an NTFS alternate data stream!), names
-/// ending in a dot or a space, the reserved device names (`CON`, `NUL`,
-/// `COM1`, ...) and over-long segments.
-///
-/// `\` -> `/` so a Windows-style path cannot sneak in either.
-fn safe_rel(s: &str) -> Option<String> {
-    let s = s.replace('\\', "/");
-    if s.len() > MAX_PATH_LEN {
-        return None;
-    }
-    let mut segs: Vec<&str> = Vec::new();
-    for seg in s.split('/') {
-        if seg.is_empty() || seg == "." || seg == ".." {
-            return None;
-        }
-        if seg.chars().any(|c| c.is_control()) {
-            return None;
-        }
-        // Illegal on Windows; `:` in particular opens an ADS, `*`/`?` are
-        // wildcards, `"`/`|`/`<`/`>` are shell metacharacters.
-        if seg.chars().any(|c| matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*')) {
-            return None;
-        }
-        // Windows silently strips trailing dots and spaces, which would let
-        // "evil.exe." and "evil.exe" collide and ".. " behave like "..".
-        if seg.ends_with('.') || seg.ends_with(' ') {
-            return None;
-        }
-        if seg.len() > MAX_SEGMENT_LEN {
-            return None;
-        }
-        if is_reserved_name(seg) {
-            return None;
-        }
-        segs.push(seg);
-    }
-    if segs.is_empty() {
-        return None;
-    }
-    if segs[0].len() == 2 && segs[0].as_bytes()[1] == b':' {
-        return None; // Windows drive letter
-    }
-    Some(segs.join("/"))
-}
-
-/// Windows reserved device names: `CON`, `PRN`, `AUX`, `NUL`, `COM1`..`COM9`,
-/// `LPT1`..`LPT9` — with or without an extension (`CON.txt` is still `CON`).
-fn is_reserved_name(seg: &str) -> bool {
-    let stem = seg.split('.').next().unwrap_or("").to_ascii_uppercase();
-    match stem.as_str() {
-        "CON" | "PRN" | "AUX" | "NUL" => true,
-        s if s.len() == 4
-            && (s.starts_with("COM") || s.starts_with("LPT"))
-            && s.as_bytes()[3].is_ascii_digit()
-            && s.as_bytes()[3] != b'0' =>
-        {
-            true
-        }
-        _ => false,
-    }
-}
-
-/// Resolve a client-supplied relative path to an absolute path that is
-/// guaranteed to live inside the transfer directory.
-///
-/// On top of the lexical checks of [`safe_rel`] this resolves symlinks:
-/// the longest existing ancestor is canonicalized and must still be inside
-/// the canonicalized transfer dir, so a junction/symlink inside the
-/// directory can never be used to read or delete files outside of it.
-/// Path as shown in the activity log: relative to the transfer dir, `/`
-/// separated. Falls back to the file name if it somehow sits outside.
-fn rel_display(cfg: &Config, p: &std::path::Path) -> String {
-    p.strip_prefix(cfg.upload_dir())
-        .map(|r| r.to_string_lossy().replace('\\', "/"))
-        .unwrap_or_else(|_| {
-            p.file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default()
-        })
-}
-
-fn resolve_rel(cfg: &Config, rel: &str) -> Option<std::path::PathBuf> {
-    let rel = safe_rel(rel)?;
-    let base = cfg.upload_dir();
-    let base_canon = base.canonicalize().ok()?;
-    let joined = base.join(&rel);
-
-    let mut probe = joined.clone();
-    let mut tail: Vec<std::ffi::OsString> = Vec::new();
-    loop {
-        if let Ok(c) = probe.canonicalize() {
-            if !c.starts_with(&base_canon) {
-                return None; // escapes the transfer directory
-            }
-            let mut out = c;
-            for name in tail.iter().rev() {
-                out.push(name);
-            }
-            return Some(out);
-        }
-        match probe.file_name() {
-            Some(n) => {
-                tail.push(n.to_os_string());
-                if !probe.pop() {
-                    return None;
-                }
-            }
-            None => return None,
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // download (streamed from disk in chunks)
 
@@ -1435,93 +1260,22 @@ impl Drop for UploadGuard<'_> {
     }
 }
 
-/// Take `n` bytes from the run quota. Returns false when the quota is
-/// exhausted (the transfer is then aborted instead of filling the disk).
-fn take_quota(cfg: &Config, n: u64) -> bool {
-    cfg.quota_left
-        .fetch_update(
-            std::sync::atomic::Ordering::SeqCst,
-            std::sync::atomic::Ordering::SeqCst,
-            |cur| if cur >= n { Some(cur - n) } else { None },
-        )
-        .is_ok()
-}
-
-/// Give the quota back (used when an aborted upload is cleaned up).
-fn give_quota(cfg: &Config, n: u64) {
-    cfg.quota_left
-        .fetch_add(n, std::sync::atomic::Ordering::SeqCst);
-}
-
 // ---------------------------------------------------------------------------
 // delete (file or whole subtree)
 
+/// `DELETE /delete/<rel>` —— 薄壳：调 `ops::delete`，把结果写成 JSON。
+/// 真正的并发规则（锁、配额归还、缓存失效、活动日志）在 `crate::ops` 里，
+/// 和桌面端管理共用同一套。
 async fn delete(
     sock: &mut impl Conn,
     cfg: &Arc<Config>,
-    path: &std::path::Path,
+    rel: &str,
     peer: &str,
 ) -> Result<(), std::io::Error> {
-    let p = path.to_path_buf();
-    if p.is_file() {
-        let size = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
-        if std::fs::remove_file(&p).is_ok() {
-            // 删掉的文件把配额还回去（否则删了也传不进新东西）
-            give_quota(cfg, size);
-            cfg.log_activity(
-                peer,
-                crate::config::ActKind::Delete,
-                &rel_display(cfg, &p),
-                size,
-            );
-            cfg.invalidate_files();
-            return write_json(sock, r#"{"success":true}"#).await;
-        }
-    } else if p.is_dir() {
-        // Remove the whole tree: files first, then directories deepest-first.
-        let mut files: Vec<std::path::PathBuf> = Vec::new();
-        let mut dirs: Vec<std::path::PathBuf> = Vec::new();
-        let mut stack = vec![p.clone()];
-        while let Some(d) = stack.pop() {
-            if let Ok(rd) = std::fs::read_dir(&d) {
-                for e in rd.flatten() {
-                    if e.path().is_dir() {
-                        dirs.push(e.path());
-                        stack.push(e.path());
-                    } else {
-                        files.push(e.path());
-                    }
-                }
-            }
-        }
-        let freed: u64 = files
-            .iter()
-            .filter_map(|f| std::fs::metadata(f).ok())
-            .map(|m| m.len())
-            .sum();
-        let _ = files.iter().map(|f| std::fs::remove_file(f)).count();
-        let _ = dirs.into_iter().rev().map(|d| std::fs::remove_dir(d)).count();
-        let _ = std::fs::remove_dir(&p);
-        give_quota(cfg, freed);
-        if p.exists() {
-            // 目录还在：里面多半有文件正被上传/下载占用（Windows 删不掉打开的文件）
-            cfg.invalidate_files();
-            return write_json_err(
-                sock,
-                "文件夹里还有文件正被上传或下载占用，请稍后再删",
-            )
-            .await;
-        }
-        let dir_name = format!("{}/", rel_display(cfg, &p));
-        cfg.log_activity(peer, crate::config::ActKind::Delete, &dir_name, 0);
-        cfg.invalidate_files();
-        return write_json(sock, r#"{"success":true}"#).await;
+    match crate::ops::delete(cfg, rel, peer) {
+        Ok(_) => write_json(sock, r#"{"success":true}"#).await,
+        Err(msg) => write_json_err(sock, &msg).await,
     }
-    if p.exists() {
-        // 还在，说明删不掉：多半是另一台设备正在下载 / 正在往里传
-        return write_json_err(sock, "文件正被占用（可能正在下载或上传），请稍后再删").await;
-    }
-    write_json_err(sock, "Not Found").await
 }
 
 // ---------------------------------------------------------------------------
@@ -1529,9 +1283,8 @@ async fn delete(
 
 /// `POST /rename` with `{"from":"a/b.txt","to":"a/c.txt"}`.
 ///
-/// 重命名和移动是同一件事（同一块盘内的 rename 是原子操作）。整段在
-/// UPLOAD_LOCK 里做：跟上传发布、删除互斥，所以不会出现「检查完目标不
-/// 存在 → 别人刚好建了一个 → 覆盖掉」这种竞态。
+/// 重命名和移动是同一件事（同一块盘内的 rename 是原子操作）。规则在
+/// `crate::ops::rename` 里，这里只负责读 body / 写响应。
 async fn rename_path(
     sock: &mut impl Conn,
     cfg: &Arc<Config>,
@@ -1553,61 +1306,8 @@ async fn rename_path(
         serde_json::from_slice(&raw).unwrap_or(serde_json::Value::Null);
     let from = json.get("from").and_then(|v| v.as_str()).unwrap_or("");
     let to = json.get("to").and_then(|v| v.as_str()).unwrap_or("");
-    if from.is_empty() || to.is_empty() {
-        return write_json_err(sock, "参数不完整").await;
-    }
-    let Some(src) = resolve_rel(cfg, from) else {
-        return write_json_err(sock, "找不到原文件").await;
-    };
-    if !src.exists() {
-        return write_json_err(sock, "找不到原文件").await;
-    }
-    // 新名字同样要过安全校验（不能跳出传输目录、不能有非法字符）
-    let Some(to_rel) = safe_rel(to) else {
-        return write_json_err(sock, "新名字不合法").await;
-    };
-    let dir = cfg.upload_dir();
-    let dst = dir.join(&to_rel);
-    if let Some(parent) = dst.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            return write_json_err(sock, &format!("建目录失败：{e}")).await;
-        }
-        // 目标目录必须仍在传输目录里（软链接/junction 不能成为出口）
-        if let (Ok(p), Ok(b)) = (parent.canonicalize(), dir.canonicalize()) {
-            if !p.starts_with(&b) {
-                return write_json_err(sock, "新路径超出了传输目录").await;
-            }
-        }
-    }
-
-    let outcome: Result<(), String> = {
-        let _guard = UPLOAD_LOCK.lock().ok();
-        // 只差大小写（Windows）算同一个文件，允许改；真的撞名就拒绝，
-        // 绝不覆盖别人的文件。
-        let same_file = dst
-            .to_string_lossy()
-            .to_lowercase()
-            == src.to_string_lossy().to_lowercase();
-        if dst.exists() && !same_file {
-            Err("同名文件已存在".to_string())
-        } else {
-            match std::fs::rename(&src, &dst) {
-                Ok(()) => Ok(()),
-                Err(e) => Err(format!("改不了：{e}（可能正在被下载或上传）")),
-            }
-        }
-    };
-    match outcome {
-        Ok(()) => {
-            cfg.invalidate_files();
-            cfg.log_activity(
-                peer,
-                crate::config::ActKind::Rename,
-                &format!("{from} → {to}"),
-                0,
-            );
-            write_json(sock, r#"{"success":true}"#).await
-        }
+    match crate::ops::rename(cfg, from, to, peer) {
+        Ok(()) => write_json(sock, r#"{"success":true}"#).await,
         Err(msg) => write_json_err(sock, &msg).await,
     }
 }
@@ -1884,7 +1584,7 @@ fn build_entries<W: std::io::Write>(
         .compression_method(zip::CompressionMethod::Deflated);
     let mut stack: Vec<(std::path::PathBuf, usize)> = vec![(dir.to_path_buf(), 0)];
     while let Some((d, depth)) = stack.pop() {
-        if depth > MAX_WALK_DEPTH {
+        if depth > crate::ops::MAX_WALK_DEPTH {
             break;
         }
         if let Ok(rd) = std::fs::read_dir(&d) {
@@ -2587,11 +2287,6 @@ fn publish_temp(
     let final_path = unique_path(dir, name)?;
     std::fs::rename(tmp, &final_path)?;
     Ok(final_path)
-}
-
-/// 列表 / 打包时要跳过的上传中间文件。
-fn is_temp_name(name: &str) -> bool {
-    name.starts_with(".td-tmp-") && name.ends_with(".part")
 }
 
 // ---------------------------------------------------------------------------
@@ -3541,6 +3236,46 @@ mod folder_tests {
         let resp = http_text(port, "GET /files HTTP/1.1\r\nHost: t\r\nX-TD-Secret: test-secret\r\n\r\n").await;
         assert!(resp.contains("docs/sub/a.txt"), "resp: {resp}");
         assert!(resp.contains("top.txt"), "resp: {resp}");
+    }
+
+    /// `/files` 现在是 `ops::list` 的薄壳：文件条目数 / 名字 / 大小必须和
+    /// 管理端看到的完全一致（否则网页端和桌面端会各说各话）。
+    #[tokio::test]
+    async fn ops_list_matches_files_endpoint() {
+        let (port, dir) = setup(
+            "opsmatch",
+            &[("docs/sub/a.txt", b"AAA"), ("top.txt", b"T"), ("docs/b.bin", b"12345")],
+        )
+        .await;
+        let resp =
+            http_text(port, "GET /files HTTP/1.1\r\nHost: t\r\nX-TD-Secret: test-secret\r\n\r\n")
+                .await;
+        let body = resp.split("\r\n\r\n").nth(1).unwrap_or("");
+        let json: serde_json::Value = serde_json::from_str(body).unwrap();
+        let mut from_http: Vec<(String, u64)> = json["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| {
+                (
+                    f["name"].as_str().unwrap().to_string(),
+                    f["size"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        from_http.sort();
+
+        let cfg = Arc::new(Config::with_secret(TEST_SECRET.to_string(), TEST_CODE.to_string()));
+        cfg.set_upload_dir(dir);
+        let snap = crate::ops::list(&cfg);
+        let mut from_ops: Vec<(String, u64)> =
+            snap.files().map(|e| (e.rel.clone(), e.size)).collect();
+        from_ops.sort();
+
+        assert_eq!(from_http, from_ops);
+        // 目录条目只在 ops 里（GUI 拼树用），网页端不该看到
+        assert!(snap.entries.iter().any(|e| e.is_dir && e.rel == "docs"));
+        assert!(!from_http.iter().any(|(n, _)| n == "docs"));
     }
 
     #[tokio::test]

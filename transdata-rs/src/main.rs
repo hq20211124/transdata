@@ -4,6 +4,7 @@ mod gui;
 mod http;
 mod instance;
 mod net;
+mod ops;
 mod settings;
 mod tls;
 mod update;
