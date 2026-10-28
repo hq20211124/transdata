@@ -1,0 +1,644 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>TransData v1.3 管理端样图（横向紧凑版）</title>
+<style>
+  :root{
+    --bg:#F4F5F9; --surface:#FFFFFF; --card-border:#E3E5EE;
+    --fg:#2A2E3F; --muted:#8A90A2; --accent:#5A6EE8;
+    --green:#1E7A46; --green-dot:#34C77B;
+    --soft-bg:#EEF0F6; --soft-fg:#4A4F66;
+    --input-border:#D8DCE6; --hover:#E9EBF2; --danger:#E5332E;
+    --sel:#EEF0FF;
+    --shadow:0 24px 60px rgba(30,36,64,.15), 0 2px 8px rgba(30,36,64,.06);
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    background:
+      radial-gradient(1200px 560px at 14% -14%, #E8ECFF 0%, transparent 62%),
+      radial-gradient(900px 520px at 96% 4%, #EDF7F1 0%, transparent 58%),
+      #F7F8FB;
+    font-family:"Segoe UI","Microsoft YaHei",system-ui,-apple-system,sans-serif;
+    color:var(--fg);-webkit-font-smoothing:antialiased;padding:24px 22px 40px;
+  }
+  .page-head{max-width:1200px;margin:0 auto 12px;display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}
+  .page-head h1{font-size:15px;margin:0;font-weight:650}
+  .page-head p{margin:0;font-size:11.5px;color:var(--muted)}
+  .pill-tip{font-size:11px;padding:3px 9px;border-radius:999px;background:#fff;border:1px solid var(--card-border);color:var(--soft-fg)}
+  .stage{max-width:1200px;margin:0 auto}
+  svg{display:block}
+
+  /* ---------- 窗口 ---------- */
+  .win{
+    width:1200px;height:760px;background:var(--bg);border-radius:12px;overflow:hidden;
+    box-shadow:var(--shadow);border:1px solid #DDE0EA;display:flex;flex-direction:column;position:relative;
+  }
+  .titlebar{
+    height:42px;flex:0 0 42px;background:var(--surface);border-bottom:1px solid var(--card-border);
+    display:flex;align-items:center;padding:0 10px;gap:10px;user-select:none;
+  }
+  .tb-left{display:flex;align-items:center;gap:7px}
+  .app-icon{
+    width:18px;height:18px;border-radius:5px;background:linear-gradient(140deg,#6D7FF0,#4C5BD9);
+    display:flex;align-items:center;justify-content:center;color:#fff;font-size:10px;font-weight:700;
+    box-shadow:0 1px 2px rgba(76,91,217,.35);
+  }
+  .app-name{font-size:14px;font-weight:600}
+  .ver{font-size:10.5px;color:var(--muted)}
+  .tb-spacer{flex:1}
+  .tb-status{display:flex;align-items:center;gap:6px;font-size:11.5px;color:var(--green);white-space:nowrap}
+  .tb-status .dot{width:7px;height:7px;border-radius:50%;background:var(--green-dot);box-shadow:0 0 0 3px rgba(52,199,123,.14)}
+  .tb-btns{display:flex;align-items:center}
+  .tbtn{width:36px;height:40px;display:flex;align-items:center;justify-content:center;border:0;background:transparent;color:var(--soft-fg);cursor:default}
+  .tbtn:hover{background:var(--hover)}
+  .tbtn.close:hover{background:var(--danger);color:#fff}
+  .tb-btns .sep{width:1px;height:16px;background:var(--card-border);margin:0 6px}
+
+  .body{flex:1;min-height:0;padding:12px 16px;display:flex;flex-direction:column}
+  .main{flex:1;min-height:0;display:flex;gap:10px}
+  .card{background:var(--surface);border:1px solid var(--card-border);border-radius:10px}
+  .label{font-size:11.5px;color:var(--muted)}
+  .grow{flex:1}
+  .btn{
+    border:1px solid var(--card-border);background:#fff;color:var(--soft-fg);font:inherit;
+    font-size:11px;height:24px;padding:0 10px;border-radius:6px;cursor:pointer;white-space:nowrap;
+  }
+  .btn:hover{background:var(--hover)}
+  .btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+
+  /* ---------- 左：目录 ---------- */
+  .files{flex:1;min-width:0;display:flex;flex-direction:column;overflow:hidden}
+  .toolbar{display:flex;align-items:center;gap:7px;padding:7px 10px;border-bottom:1px solid #F0F2F7;flex:0 0 auto}
+  .toolbar .path{
+    font-family:Consolas,"Cascadia Mono",monospace;font-size:11.5px;color:var(--soft-fg);
+    background:var(--soft-bg);border-radius:6px;padding:4px 8px;max-width:290px;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  }
+  .toolbar .folder{color:#8B92A6}
+  .cols{display:flex;align-items:center;gap:8px;padding:5px 10px;border-bottom:1px solid #F0F2F7;flex:0 0 auto}
+  .cols span{font-size:9.5px;color:var(--muted);letter-spacing:.3px}
+  .flist{flex:1;min-height:0;overflow:auto;padding:3px 5px 5px}
+  .frow{display:flex;align-items:center;gap:8px;height:30px;padding:0 5px;border-radius:6px;cursor:default}
+  .frow:hover{background:#F7F8FD}
+  .frow.sel{background:var(--sel);box-shadow:inset 0 0 0 1px #D6DBFB}
+  .frow .indent{flex:0 0 auto}
+  .frow .tw{width:13px;flex:0 0 13px;color:#9AA1B4;display:flex;align-items:center;justify-content:center}
+  .frow .ic{width:16px;flex:0 0 16px;color:#8B92A6}
+  .frow.dir .ic{color:#E0A93B}
+  .frow .nm{flex:1;min-width:0;font-size:12.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .frow .sz{width:58px;flex:0 0 58px;text-align:right;font-size:10.5px;color:var(--muted);font-variant-numeric:tabular-nums}
+  .frow .tm{width:72px;flex:0 0 72px;text-align:right;font-size:10.5px;color:var(--muted);font-variant-numeric:tabular-nums}
+  .frow .ops{width:48px;flex:0 0 48px;display:flex;justify-content:flex-end;gap:1px}
+  .ib{width:21px;height:21px;border:0;background:transparent;border-radius:5px;display:flex;align-items:center;justify-content:center;color:#8B92A6;cursor:pointer}
+  .ib:hover{background:var(--hover);color:var(--accent)}
+  .ib.del:hover{background:#FEF3F2;color:var(--danger)}
+  .nm-input{
+    flex:1;min-width:0;font:inherit;font-size:12.5px;color:var(--fg);
+    border:1px solid var(--accent);border-radius:5px;padding:1px 5px;outline:none;
+    box-shadow:0 0 0 3px rgba(90,110,232,.14);background:#fff;
+  }
+  .statusbar{
+    flex:0 0 auto;display:flex;align-items:center;gap:10px;padding:5px 10px;
+    border-top:1px solid #F0F2F7;font-size:10px;color:var(--muted);
+  }
+  .empty{font-size:12px;color:var(--muted);text-align:center;padding:36px 0}
+
+  /* ---------- 中：设备 ---------- */
+  .devices{flex:0 0 296px;width:296px;display:flex;flex-direction:column;overflow:hidden}
+  .pane-h{display:flex;align-items:center;gap:6px;padding:8px 10px;flex:0 0 auto;border-bottom:1px solid #F0F2F7}
+  .pane-h .cnt{font-size:10px;color:var(--muted)}
+  .pane-h .hint{font-size:9.5px;color:var(--muted)}
+  .dhead{
+    display:flex;align-items:center;gap:6px;padding:4px 10px;flex:0 0 auto;
+    font-size:8.5px;color:var(--muted);letter-spacing:.2px;border-bottom:1px solid #F4F6FA;
+  }
+  .dlist{flex:1;min-height:0;overflow:auto;padding:2px 5px;display:flex;flex-direction:column;gap:1px}
+  .drow{
+    display:flex;align-items:center;gap:6px;height:30px;padding:0 5px;border-radius:6px;cursor:pointer;
+  }
+  .drow:hover{background:#F7F8FD}
+  .drow.sel{background:var(--sel);box-shadow:inset 0 0 0 1px #D6DBFB}
+  .drow .dot{width:6px;height:6px;flex:0 0 6px;border-radius:50%;background:var(--green-dot)}
+  .drow .ip{width:74px;flex:0 0 74px;font-family:Consolas,"Cascadia Mono",monospace;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .drow .idle{width:42px;flex:0 0 42px;font-size:9.5px;color:var(--muted);white-space:nowrap}
+  .drow .io{width:30px;flex:0 0 30px;font-size:10px;color:#3F7A5B;text-align:center;white-space:nowrap}
+  .drow .perm{width:48px;flex:0 0 48px;display:flex;justify-content:center}
+  .drow .kick{
+    width:32px;flex:0 0 32px;height:19px;border-radius:5px;border:1px solid var(--card-border);
+    background:#fff;color:var(--muted);font:inherit;font-size:9px;cursor:pointer;
+  }
+  .drow .kick:hover{color:var(--danger);border-color:#F3C9C7;background:#FEF6F5}
+  .ghost{
+    display:flex;align-items:center;justify-content:center;height:30px;margin:4px 0 0;
+    border:1px dashed #E1E5EF;border-radius:6px;font-size:10px;color:#AEB4C4;
+  }
+  .conn{flex:0 0 auto;margin:8px;padding:9px 10px 10px;border:1px solid var(--card-border);border-radius:10px;background:#FCFCFE}
+  .conn-h{display:flex;align-items:center;gap:6px;margin-bottom:7px}
+  .conn-h .hint{font-size:9px;color:var(--muted)}
+  .conn-row{display:flex;align-items:center;gap:9px}
+  .conn .qr{background:#fff;border:1px solid var(--card-border);border-radius:7px;padding:4px;flex:0 0 auto}
+  .conn .qr svg{width:86px;height:86px}
+  .conn-info{min-width:0;flex:1}
+  .conn-info .k{font-size:9px;color:var(--muted)}
+  .conn-info .v{font-size:18px;font-weight:600;font-family:Consolas,"Cascadia Mono",monospace;letter-spacing:.5px;line-height:1.2}
+  .conn-info .u{font-family:Consolas,monospace;font-size:9.5px;color:var(--accent);margin:1px 0 5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .conn-div{height:1px;background:#EDF0F6;margin:8px 0 6px}
+  .https-row{display:flex;align-items:center;gap:8px}
+  .https-row .t{font-size:10.5px;color:var(--soft-fg);flex:1;white-space:nowrap}
+  .hint2{font-size:9px;color:var(--muted);margin-top:3px;line-height:1.45}
+  .fp{font-size:9px;color:var(--soft-fg);margin-top:2px}
+  .fp span{font-family:Consolas,monospace;color:var(--muted)}
+
+  .switch{position:relative;width:30px;height:16px;flex:0 0 auto;cursor:pointer}
+  .switch input{position:absolute;opacity:0;width:100%;height:100%;margin:0;cursor:pointer}
+  .switch .track{position:absolute;inset:0;border-radius:999px;background:#C9CEDC;transition:background .16s}
+  .switch .knob{position:absolute;top:2px;left:2px;width:12px;height:12px;border-radius:50%;background:#fff;transition:left .16s;box-shadow:0 1px 2px rgba(0,0,0,.2)}
+  .switch input:checked + .track{background:var(--accent)}
+  .switch input:checked + .track + .knob{left:16px}
+
+  /* ---------- 右：设备详情 ---------- */
+  .detail{flex:0 0 336px;width:336px;display:flex;flex-direction:column;overflow:hidden}
+  .d-top{padding:8px 10px 7px;border-bottom:1px solid #F0F2F7;flex:0 0 auto}
+  .d-top .l1{display:flex;align-items:center;gap:7px}
+  .d-top .ip{font-family:Consolas,"Cascadia Mono",monospace;font-size:12.5px;font-weight:600}
+  .d-flag{font-size:9px;padding:1px 6px;border-radius:999px;background:#F2F7F4;color:#3F7A5B;border:1px solid #E1EEE7;white-space:nowrap}
+  .d-flag.off{background:#FFFAEB;color:#B54708;border-color:#FDE7C3}
+  .d-top .l2{font-size:9.5px;color:var(--muted);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .d-top .l3{font-size:9.5px;color:var(--soft-fg);margin-top:3px;font-variant-numeric:tabular-nums}
+  .d-top .l3 b{font-weight:600}
+  .ohead{
+    display:flex;align-items:center;gap:6px;padding:5px 10px;flex:0 0 auto;
+    border-bottom:1px solid #F4F6FA;font-size:9px;color:var(--muted);letter-spacing:.2px;
+  }
+  .ohead .c1{flex:1}
+  .ohead .c2{width:52px;text-align:right}
+  .ohead .c3{width:58px;text-align:right}
+  .olist{flex:1;min-height:0;overflow:auto;padding:3px 5px}
+  .op{display:flex;align-items:center;gap:6px;height:26px;padding:0 5px;border-radius:5px}
+  .op:hover{background:#F8F9FD}
+  .op .k{width:13px;flex:0 0 13px}
+  .op .k.up{color:#3F7A5B}
+  .op .k.dn{color:#5A6EE8}
+  .op .k.del{color:#D0503F}
+  .op .k.ren{color:#B8860B}
+  .op .n{flex:1;min-width:0;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .op .s{width:52px;flex:0 0 52px;text-align:right;font-size:9.5px;color:var(--muted);font-variant-numeric:tabular-nums}
+  .op .t{width:58px;flex:0 0 58px;text-align:right;font-size:9.5px;color:var(--muted);font-variant-numeric:tabular-nums}
+  .d-empty{font-size:11px;color:var(--muted);padding:24px 0;text-align:center}
+  .d-foot{flex:0 0 auto;border-top:1px solid #F0F2F7;padding:5px 10px;font-size:9px;color:var(--muted)}
+
+  /* ---------- 便签条 ---------- */
+  .notebar{flex:0 0 auto;height:76px;margin-top:10px;display:flex;align-items:center;gap:8px;padding:0 12px}
+  .notebar .k{font-size:11px;color:var(--muted);white-space:nowrap}
+  .notebar textarea{
+    flex:1;height:44px;resize:none;border:1px solid var(--input-border);border-radius:7px;padding:6px 10px;
+    font:inherit;font-size:12px;line-height:1.45;color:var(--fg);outline:none;background:#fff;
+  }
+  .notebar textarea:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(90,110,232,.12)}
+  .notebar .btn{height:30px;padding:0 14px;font-size:11.5px}
+
+  /* ---------- 浮层 ---------- */
+  .toast{
+    position:absolute;left:50%;bottom:64px;transform:translate(-50%,10px);
+    background:#2A2E3F;color:#fff;font-size:11.5px;padding:7px 14px;border-radius:8px;
+    opacity:0;pointer-events:none;transition:all .2s;box-shadow:0 8px 20px rgba(20,24,40,.22);z-index:40;
+  }
+  .toast.show{opacity:1;transform:translate(-50%,0)}
+  .scrim{position:absolute;inset:0;background:rgba(24,28,44,.26);display:none;align-items:center;justify-content:center;z-index:30;border-radius:12px}
+  .scrim.show{display:flex}
+  .dlg{width:352px;background:#fff;border-radius:12px;padding:16px;box-shadow:0 24px 60px rgba(20,24,40,.28)}
+  .dlg h3{margin:0 0 8px;font-size:13px;font-weight:600}
+  .dlg p{margin:0;font-size:12px;color:var(--soft-fg);line-height:1.6;word-break:break-all}
+  .dlg .mono{font-family:Consolas,"Cascadia Mono",monospace;color:var(--fg)}
+  .dlg .warn{margin-top:8px;font-size:10.5px;color:#B54708;background:#FFFAEB;border:1px solid #FDE7C3;border-radius:7px;padding:6px 8px;line-height:1.5}
+  .dlg-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:14px}
+  .btn.danger{background:var(--danger);border-color:var(--danger);color:#fff}
+
+  .legend{background:#fff;border:1px solid var(--card-border);border-radius:12px;padding:12px 14px;margin-top:14px}
+  .legend h4{margin:0 0 8px;font-size:11.5px;font-weight:600}
+  .legend ol{margin:0;padding-left:16px;font-size:11px;color:var(--soft-fg);line-height:1.85}
+  .legend code{font-family:Consolas,monospace;font-size:10.5px;background:var(--soft-bg);padding:1px 4px;border-radius:4px}
+  .foot-note{max-width:1200px;margin:12px auto 0;font-size:11px;color:var(--muted);line-height:1.7}
+</style>
+</head>
+<body>
+
+<div class="page-head">
+  <h1>TransData v1.3 · 管理端（横向紧凑版）</h1>
+  <p>一台设备一行，一条操作一行（文件 / 大小 / 时间 三列），目录收窄，纵向多出 6 行。</p>
+  <span class="pill-tip">可点：行 / 设备行 / 开关 / ✏ 🗑</span>
+</div>
+
+<div class="stage">
+  <div class="win" id="win">
+    <div class="titlebar">
+      <div class="tb-left">
+        <div class="app-icon">T</div>
+        <span class="app-name">TransData</span>
+        <span class="ver">v1.3.0</span>
+      </div>
+      <div class="tb-spacer"></div>
+      <div class="tb-status"><span class="dot"></span>运行中 · 端口 9999 · 3 台设备</div>
+      <div class="tb-btns">
+        <div class="sep"></div>
+        <button class="tbtn" title="主题"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M21 12.8A8.5 8.5 0 1 1 11.2 3a6.6 6.6 0 0 0 9.8 9.8Z"/></svg></button>
+        <button class="tbtn" title="设置"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="3.2"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.11a1.7 1.7 0 0 0-1.11-1.55 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.11A1.7 1.7 0 0 0 4.66 8.6a1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.7 1.7 0 0 0 9 4.24h.05A1.7 1.7 0 0 0 10.6 2.7V2a2 2 0 1 1 4 0v.11a1.7 1.7 0 0 0 1 1.55 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87V8.6a1.7 1.7 0 0 0 1.55 1H22a2 2 0 1 1 0 4h-.11a1.7 1.7 0 0 0-1.49 1Z"/></svg></button>
+        <div class="sep"></div>
+        <button class="tbtn" title="最小化"><svg width="11" height="11" viewBox="0 0 12 12" stroke="currentColor" stroke-width="1.2"><path d="M2 6h8"/></svg></button>
+        <button class="tbtn" title="最大化"><svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.2"><rect x="2.2" y="2.2" width="7.6" height="7.6" rx="1"/></svg></button>
+        <button class="tbtn close" title="关闭"><svg width="11" height="11" viewBox="0 0 12 12" stroke="currentColor" stroke-width="1.2"><path d="M2.4 2.4l7.2 7.2M9.6 2.4L2.4 9.6"/></svg></button>
+      </div>
+    </div>
+
+    <div class="body">
+      <div class="main">
+
+        <!-- ===== 左：目录 ===== -->
+        <section class="card files">
+          <div class="toolbar">
+            <span class="folder">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/></svg>
+            </span>
+            <span class="path">D:\TransData\uploads</span>
+            <span class="grow"></span>
+            <span id="loading" style="font-size:9.5px;color:var(--muted);display:none">读取中…</span>
+            <button class="btn" id="btnRefresh">刷新</button>
+            <button class="btn" id="btnOpen">打开目录</button>
+          </div>
+          <div class="cols">
+            <span style="width:13px"></span>
+            <span style="width:16px"></span>
+            <span style="flex:1">名称</span>
+            <span style="width:58px;text-align:right">大小</span>
+            <span style="width:72px;text-align:right">修改时间</span>
+            <span style="width:48px"></span>
+          </div>
+          <div class="flist" id="list"></div>
+          <div class="statusbar">
+            <span id="selInfo">未选中项目</span>
+            <span class="grow"></span>
+            <span id="sumInfo">6 个文件夹 · 7 个文件 · 259 MB</span>
+          </div>
+        </section>
+
+        <!-- ===== 中：设备（一台一行） ===== -->
+        <section class="card devices">
+          <div class="conn">
+            <div class="conn-h">
+              <span class="label" style="font-size:10.5px">连接</span>
+              <span class="grow"></span>
+              <span class="hint">未配对的设备看不到文件</span>
+            </div>
+            <div class="conn-row">
+              <div class="qr" id="qr"></div>
+              <div class="conn-info">
+                <div class="k">配对码 · 或扫左边的码</div>
+                <div class="v">48210396</div>
+                <div class="u">192.168.1.10:9999</div>
+                <button class="btn" style="height:21px;font-size:9.5px;padding:0 8px">复制地址</button>
+              </div>
+            </div>
+            <div class="conn-div"></div>
+            <div class="https-row">
+              <span class="t">启用 HTTPS（加密传输）</span>
+              <label class="switch"><input type="checkbox" id="tlsSwitch"><span class="track"></span><span class="knob"></span></label>
+            </div>
+            <div class="hint2" id="tlsHint">未开启时是明文 HTTP，同一网络内可被旁观。</div>
+            <div class="fp" id="tlsFp" style="display:none">证书指纹 <span>7C:3A:91:0E:4B:22:D8:55</span></div>
+          </div>
+          <div class="pane-h">
+            <span class="label">设备</span>
+            <span class="cnt" id="devCount">3 台</span>
+            <span class="grow"></span>
+            <span class="hint">关授权不影响传输</span>
+          </div>
+          <div class="dhead">
+            <span style="width:86px">设备</span>
+            <span style="width:42px">空闲</span>
+            <span style="width:30px;text-align:center">传输</span>
+            <span style="width:48px;text-align:center">删除/修改</span>
+            <span style="width:32px"></span>
+          </div>
+          <div class="dlist" id="devList"></div>
+        </section>
+
+        <!-- ===== 右：该设备操作详情（一条一行） ===== -->
+        <section class="card detail">
+          <div class="d-top">
+            <div class="l1">
+              <span class="ip" id="dIp">192.168.1.23</span>
+              <span class="grow"></span>
+              <span class="d-flag" id="dFlag">可删改</span>
+            </div>
+            <div class="l2" id="dSub">iPhone · Safari · 刚刚活跃</div>
+            <div class="l3" id="dStat">本次 18 分钟 · ↑ 3 个 · ↓ 5 个</div>
+          </div>
+          <div class="ohead">
+            <span class="c1">操作 / 文件</span>
+            <span class="c2">大小</span>
+            <span class="c3">时间</span>
+          </div>
+          <div class="olist" id="dBody"></div>
+          <div class="d-foot">只保留最近 50 条 · 重启清空 · 时间以本机为准</div>
+        </section>
+
+      </div>
+
+      <div class="card notebar">
+        <span class="k">快捷文本</span>
+        <textarea>手机打开 192.168.1.10:9999，扫码就能进</textarea>
+        <button class="btn">复制</button>
+        <button class="btn primary">发送</button>
+      </div>
+    </div>
+
+    <div class="scrim" id="scrim">
+      <div class="dlg">
+        <h3 id="dlgTitle">删除？</h3>
+        <p><span class="mono" id="dlgName">归档/2026-10 报告.pdf</span></p>
+        <div class="warn" id="dlgWarn">不可撤销。删除后配额立即归还，正在读它的设备会中断。</div>
+        <div class="dlg-actions">
+          <button class="btn" style="height:28px;padding:0 14px;font-size:12px" id="dlgCancel">取消</button>
+          <button class="btn danger" style="height:28px;padding:0 14px;font-size:12px" id="dlgOk">删除</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="toast" id="toast">已删除</div>
+  </div>
+
+  <div class="legend">
+    <h4>这版怎么省的纵向空间</h4>
+    <ol>
+      <li><b>设备：一台一行</b>（IP / 空闲 / 传输 / 删改开关 / 断开），3 台只占 90px；以前每台一张卡要 312px</li>
+      <li><b>操作详情：一条一行</b>，`操作文件 / 大小 / 时间` 三列，26px 一行，一屏能看 18 条</li>
+      <li><b>目录收窄到 516px</b>，把宽度让给右边两栏；列宽按最长内容反算，不再留空</li>
+      <li><b>行高统一压到 30px</b>（文件/设备），内边距 10，卡片圆角 10 —— 一屏 18 行文件</li>
+      <li><b>权限语义写进表头</b>：`传输` 列常绿、`删除/修改` 列是开关，关掉只动开关，不动传输</li>
+    </ol>
+  </div>
+</div>
+
+<p class="foot-note">
+  1200×760：内宽 1168 = 目录 516 + 设备 296 + 详情 336 + 两处 10px 间距。行高 30/26/22，实测三栏
+  clientHeight 与 scrollHeight 相等，无溢出。配色取自 <code>gui.rs</code> 的 <code>Palette::light()</code>。
+</p>
+
+<script>
+(function () {
+  /* 假二维码 */
+  var qr = document.getElementById('qr'), n = 25, cells = '', seed = 11;
+  function rnd() { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; }
+  function inFinder(x, y) { return (x < 8 && y < 8) || (x > n - 9 && y < 8) || (x < 8 && y > n - 9); }
+  for (var y = 0; y < n; y++) {
+    for (var x = 0; x < n; x++) {
+      var on;
+      if (inFinder(x, y)) {
+        var fx = x < 8 ? x : x - (n - 8), fy = y < 8 ? y : y - (n - 8);
+        on = (fx === 0 || fx === 6 || fy === 0 || fy === 6) || (fx >= 2 && fx <= 4 && fy >= 2 && fy <= 4);
+      } else { on = rnd() > 0.52; }
+      if (on) cells += '<rect x="' + x + '" y="' + y + '" width="1" height="1"/>';
+    }
+  }
+  qr.innerHTML = '<svg viewBox="0 0 ' + n + ' ' + n + '" shape-rendering="crispEdges" fill="#1c2030">' + cells + '</svg>';
+
+  var I = {
+    file: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8Z"/><path d="M14 3v5h5"/></svg>',
+    dir: '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z"/></svg>',
+    chev: '<svg width="8" height="8" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4.5 2.5 8 6l-3.5 3.5"/></svg>',
+    pencil: '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M4 20h4l10-10-4-4L4 16Z"/></svg>',
+    trash: '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9"><path d="M4 7h16M9 7V5h6v2M6 7l1 13h10l1-13"/></svg>',
+    up: '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 19V5M6 11l6-6 6 6"/></svg>',
+    dn: '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M6 13l6 6 6-6"/></svg>'
+  };
+
+  /* 目录数据 */
+  var rows = [
+    { id: 'd1', type: 'dir', name: '归档', depth: 0, size: '2 个文件', tm: '10-28 14:02', open: true },
+    { id: 'f1', type: 'file', name: '2026-10 报告.pdf', depth: 1, size: '2.4 MB', tm: '10-28 14:02' },
+    { id: 'f2', type: 'file', name: '2026-09 月报.xlsx', depth: 1, size: '340 KB', tm: '10-25 16:10' },
+    { id: 'd2', type: 'dir', name: '备份', depth: 0, size: '2 个文件', tm: '10-26 09:41', open: true },
+    { id: 'f3', type: 'file', name: '照片.zip', depth: 1, size: '118 MB', tm: '10-26 09:41' },
+    { id: 'f4', type: 'file', name: '旧照片.zip', depth: 1, size: '88 MB', tm: '10-24 11:02' },
+    { id: 'd3', type: 'dir', name: '设计稿', depth: 0, size: '1 个文件', tm: '10-28 13:55', open: true },
+    { id: 'f5', type: 'file', name: '首页-v3.png', depth: 1, size: '812 KB', tm: '10-28 13:55' },
+    { id: 'd4', type: 'dir', name: '安装包', depth: 0, size: '1 个文件', tm: '10-27 22:14', open: true },
+    { id: 'f6', type: 'file', name: 'TransData-1.2.0.exe', depth: 1, size: '6.8 MB', tm: '10-27 22:14' },
+    { id: 'd5', type: 'dir', name: '视频', depth: 0, size: '1 个文件', tm: '10-27 09:15', open: true },
+    { id: 'f7', type: 'file', name: '演示.mp4', depth: 1, size: '42.6 MB', tm: '10-27 09:15' },
+    { id: 'd6', type: 'dir', name: '临时', depth: 0, size: '1 个文件', tm: '10-26 22:38', open: true },
+    { id: 'f8', type: 'file', name: '日志-1027.txt', depth: 1, size: '96 KB', tm: '10-26 22:38' },
+    { id: 'f9', type: 'file', name: '会议记录.txt', depth: 0, size: '4 KB', tm: '10-28 11:20' }
+  ];
+  var selId = 'f1';
+  var list = document.getElementById('list');
+  function esc(s) { return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+  function visibleRows() {
+    var out = [], hidden = 0;
+    rows.forEach(function (r) {
+      if (r.depth > 0) { if (hidden > 0) return; }
+      if (r.type === 'dir') hidden = r.open ? 0 : 1;
+      out.push(r);
+    });
+    return out;
+  }
+  function render() {
+    list.innerHTML = visibleRows().map(function (r) {
+      var isDir = r.type === 'dir';
+      return '<div class="frow' + (isDir ? ' dir' : '') + (r.id === selId ? ' sel' : '') + '" data-id="' + r.id + '">'
+        + '<span class="indent" style="width:' + (r.depth * 14) + 'px"></span>'
+        + '<span class="tw">' + (isDir ? (r.open ? '<span style="transform:rotate(90deg)">' + I.chev + '</span>' : I.chev) : '') + '</span>'
+        + '<span class="ic">' + (isDir ? I.dir : I.file) + '</span>'
+        + '<span class="nm">' + esc(r.name) + '</span>'
+        + '<span class="sz">' + r.size + '</span>'
+        + '<span class="tm">' + r.tm + '</span>'
+        + '<span class="ops">'
+        + '<button class="ib" data-act="rename" title="重命名">' + I.pencil + '</button>'
+        + '<button class="ib del" data-act="del" title="删除">' + I.trash + '</button>'
+        + '</span></div>';
+    }).join('');
+  }
+  function findRow(id) { for (var i = 0; i < rows.length; i++) if (rows[i].id === id) return rows[i]; return null; }
+
+  list.addEventListener('click', function (e) {
+    var row = e.target.closest('.frow'); if (!row) return;
+    var r = findRow(row.dataset.id), btn = e.target.closest('button[data-act]');
+    if (btn) { if (btn.dataset.act === 'del') openDelete(r); else startRename(row, r); return; }
+    if (r.type === 'dir') r.open = !r.open;
+    selId = r.id; render(); updateSel();
+  });
+  function updateSel() {
+    var r = findRow(selId);
+    document.getElementById('selInfo').textContent = r
+      ? '已选中：' + r.name + (r.type === 'dir' ? '（文件夹）' : ' · ' + r.size) : '未选中项目';
+  }
+  function startRename(row, r) {
+    var nm = row.querySelector('.nm'), old = r.name;
+    var input = document.createElement('input');
+    input.className = 'nm-input'; input.value = old;
+    nm.replaceWith(input); input.focus();
+    var dot = old.lastIndexOf('.');
+    input.setSelectionRange(0, dot > 0 ? dot : old.length);
+    var done = false;
+    function commit() {
+      if (done) return; done = true;
+      var v = input.value.trim();
+      if (v && v !== old) { r.name = v; toast('已改名：' + old + ' → ' + v); }
+      render(); updateSel();
+    }
+    input.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Enter') commit();
+      if (ev.key === 'Escape') { done = true; render(); }
+    });
+    input.addEventListener('blur', commit);
+  }
+  var pending = null;
+  function openDelete(r) {
+    pending = r;
+    document.getElementById('dlgTitle').textContent = r.type === 'dir' ? '删除文件夹？' : '删除文件？';
+    document.getElementById('dlgName').textContent = r.name;
+    document.getElementById('dlgWarn').textContent = r.type === 'dir'
+      ? '文件夹和里面的 ' + r.size.replace(' 个文件', '') + ' 个项目会一起删除，不可撤销。'
+      : '不可撤销。删除后配额立即归还，正在读它的设备会中断。';
+    document.getElementById('scrim').classList.add('show');
+  }
+  document.getElementById('dlgCancel').onclick = function () {
+    document.getElementById('scrim').classList.remove('show'); pending = null;
+  };
+  document.getElementById('dlgOk').onclick = function () {
+    if (pending) {
+      var i = rows.indexOf(pending);
+      if (i >= 0) rows.splice(i, 1);
+      toast('已删除 ' + pending.name + '（配额已归还）');
+      pending = null; render(); updateSel();
+    }
+    document.getElementById('scrim').classList.remove('show');
+  };
+  document.getElementById('scrim').addEventListener('click', function (e) {
+    if (e.target.id === 'scrim') this.classList.remove('show');
+  });
+
+  /* 设备 */
+  var devices = [
+    { ip: '192.168.1.23', ua: 'iPhone · Safari', idle: '刚刚', allow: true, mins: 18, up: 3, down: 5,
+      ops: [
+        { k: 'del', n: '旧备份.zip', s: '88 MB', t: '8 分钟前' },
+        { k: 'ren', n: '会议记录.txt → 会议记录-1028.txt', s: '4 KB', t: '21 分钟前' },
+        { k: 'up', n: '归档/2026-10 报告.pdf', s: '2.4 MB', t: '1 小时前' },
+        { k: 'dn', n: '备份/照片.zip', s: '118 MB', t: '2 小时前' },
+        { k: 'up', n: '设计稿/首页-v3.png', s: '812 KB', t: '3 小时前' },
+        { k: 'dn', n: '视频/演示.mp4', s: '42.6 MB', t: '昨天' },
+        { k: 'del', n: '临时/日志-1026.txt', s: '88 KB', t: '昨天' },
+        { k: 'up', n: '截图/错误日志.png', s: '231 KB', t: '昨天' },
+        { k: 'ren', n: '素材/logo.svg', s: '12 KB', t: '2 天前' },
+        { k: 'dn', n: '安装包/TransData-1.2.0.exe', s: '6.8 MB', t: '2 天前' },
+        { k: 'up', n: '项目文档/需求说明.docx', s: '128 KB', t: '3 天前' },
+        { k: 'del', n: '草稿-v1.docx', s: '96 KB', t: '3 天前' },
+        { k: 'dn', n: '归档/2026-09 月报.xlsx', s: '340 KB', t: '4 天前' }
+      ] },
+    { ip: '192.168.1.57', ua: '小米笔记本 · Chrome', idle: '3 分钟前', allow: false, mins: 42, up: 6, down: 2,
+      ops: [
+        { k: 'up', n: '备份/照片.zip', s: '118 MB', t: '3 分钟前' },
+        { k: 'dn', n: '视频/演示.mp4', s: '42.6 MB', t: '40 分钟前' },
+        { k: 'up', n: '项目文档/需求说明.docx', s: '128 KB', t: '1 小时前' }
+      ] },
+    { ip: '192.168.1.88', ua: 'iPad · Safari', idle: '26 分钟前', allow: true, mins: 7, up: 1, down: 3,
+      ops: [
+        { k: 'dn', n: '安装包/TransData-1.2.0.exe', s: '6.8 MB', t: '26 分钟前' },
+        { k: 'up', n: '截图/错误日志.png', s: '231 KB', t: '31 分钟前' }
+      ] }
+  ];
+  var selIp = '192.168.1.23';
+  var devList = document.getElementById('devList');
+
+  function renderDevices() {
+    devList.innerHTML = devices.map(function (d) {
+      return '<div class="drow' + (d.ip === selIp ? ' sel' : '') + (d.allow ? '' : ' off') + '" data-ip="' + d.ip + '" title="' + d.ua + '">'
+        + '<span class="dot"></span>'
+        + '<span class="ip">' + d.ip + '</span>'
+        + '<span class="idle">' + d.idle + '</span>'
+        + '<span class="io" title="上传、下载可用（不受删除/修改授权影响）">↑↓</span>'
+        + '<span class="perm"><label class="switch"><input type="checkbox" data-allow="1"' + (d.allow ? ' checked' : '')
+        + '><span class="track"></span><span class="knob"></span></label></span>'
+        + '<button class="kick" data-kick="1">断开</button>'
+        + '</div>';
+    }).join('') + '<div class="ghost">＋ 等待新设备接入</div>';
+    document.getElementById('devCount').textContent = devices.length + ' 台';
+  }
+
+  devList.addEventListener('click', function (e) {
+    var row = e.target.closest('.drow'); if (!row) return;
+    var ip = row.dataset.ip;
+    if (e.target.closest('[data-kick]')) {
+      devices = devices.filter(function (x) { return x.ip !== ip; });
+      if (selIp === ip) selIp = devices.length ? devices[0].ip : null;
+      toast('已断开 ' + ip + '，对方需要重新配对');
+      renderDevices(); renderDetail(); return;
+    }
+    if (e.target.closest('.switch')) return;
+    selIp = ip; renderDevices(); renderDetail();
+  });
+  devList.addEventListener('change', function (e) {
+    var box = e.target.closest('input[data-allow]'); if (!box) return;
+    var ip = e.target.closest('.drow').dataset.ip;
+    var d = devices.filter(function (x) { return x.ip === ip; })[0];
+    d.allow = box.checked;
+    toast(d.allow ? ip + '：已允许删除 / 修改' : ip + '：已禁止删除 / 修改（上传下载照旧）');
+    renderDevices(); renderDetail();
+  });
+
+  function renderDetail() {
+    var d = devices.filter(function (x) { return x.ip === selIp; })[0];
+    if (!d) {
+      document.getElementById('dIp').textContent = '没有设备';
+      document.getElementById('dSub').textContent = '';
+      document.getElementById('dStat').textContent = '';
+      document.getElementById('dBody').innerHTML = '<div class="d-empty">点中间的设备看它的操作</div>';
+      return;
+    }
+    document.getElementById('dIp').textContent = d.ip;
+    document.getElementById('dSub').textContent = d.ua + ' · ' + d.idle;
+    document.getElementById('dStat').innerHTML = '本次 <b>' + d.mins + '</b> 分钟 · ↑ <b>' + d.up + '</b> 个 · ↓ <b>' + d.down + '</b> 个';
+    var flag = document.getElementById('dFlag');
+    flag.textContent = d.allow ? '可删除 / 修改' : '禁止删除 / 修改';
+    flag.className = 'd-flag' + (d.allow ? '' : ' off');
+    document.getElementById('dBody').innerHTML = d.ops.map(function (o) {
+      var icon = o.k === 'up' ? I.up : o.k === 'dn' ? I.dn : o.k === 'del' ? I.trash : I.pencil;
+      return '<div class="op"><span class="k ' + o.k + '">' + icon + '</span>'
+        + '<span class="n" title="' + esc(o.n) + '">' + esc(o.n) + '</span>'
+        + '<span class="s">' + o.s + '</span><span class="t">' + o.t + '</span></div>';
+    }).join('');
+  }
+
+  var tTimer;
+  function toast(msg) {
+    var t = document.getElementById('toast');
+    t.textContent = msg; t.classList.add('show');
+    clearTimeout(tTimer);
+    tTimer = setTimeout(function () { t.classList.remove('show'); }, 2400);
+  }
+  document.getElementById('btnRefresh').onclick = function () {
+    var l = document.getElementById('loading');
+    l.style.display = 'inline';
+    setTimeout(function () { l.style.display = 'none'; toast('目录已刷新'); }, 700);
+  };
+
+  var tls = document.getElementById('tlsSwitch'), tlsHint = document.getElementById('tlsHint');
+  var tlsFp = document.getElementById('tlsFp');
+  var addr = document.querySelector('.conn-info .u');
+  tls.addEventListener('change', function () {
+    tlsHint.textContent = tls.checked
+      ? '手机首次打开会提示一次证书不受信任，点「继续前往」即可。'
+      : '未开启时是明文 HTTP，同一网络内可被旁观。';
+    tlsFp.style.display = tls.checked ? 'block' : 'none';
+    addr.textContent = (tls.checked ? 'https://' : '') + '192.168.1.10:9999';
+    toast(tls.checked ? '已启用 HTTPS，地址与二维码已更新' : '已关闭 HTTPS，回到明文 HTTP');
+  });
+
+  render(); updateSel(); renderDevices(); renderDetail();
+})();
+</script>
+</body>
+</html>
