@@ -849,3 +849,41 @@ README 补两节（管理端目录 / 设备授权）。
 风险总评：ops 抽取是纯搬运，风险低但必须用现有测试兜住；按设备授权是新增校验点，
 只加在两条路由上、管理端豁免，回归面小；真正的成本在 GUI——三栏重排 + 树形列表 +
 后台刷新 + 行内编辑 + 确认窗，约等于一次中等规模重写。
+
+---
+
+## 执行记录（2026-10-28）：v1.3.0 管理端实施完成
+
+按上面「七、定稿」的 7 步顺序做完，每步单独一个 commit，随时可回退。
+
+| 步 | 结果 | 提交 |
+|---|---|---|
+| 1 | 分支 `v1.3.0`；版本 1.2.0 → **1.3.0**；PLAN + `mockups/` 作为基线提交 | `chore: v1.3.0 基线` |
+| 2 | 新增 `src/ops.rs`：`list / delete / rename` 从 server.rs 抽出，路径校验、`UPLOAD_LOCK`、配额、临时文件判断一起搬过去；`/files`、`/delete/*`、`/rename` 变成薄壳 | `refactor: 抽出 src/ops.rs` |
+| 3 | `config.rs`：`Session.allow_write` + `device_list / set_device_write / session_can_write / drop_client`（`DeviceInfo`） | `feat: 设备授权状态` |
+| 4 | `server.rs`：`may_write()` 判定，`DELETE /delete/*` 与 `POST /rename` 无权时 403；`/info` 增加 `can_write`；`X-TD-Secret` 豁免 | `feat: 按设备授权` |
+| 5 | 网页：`can_write=false` 时删除 / 改名按钮置灰 + 黄条，点了不发请求；刷新时重新问一次 `/info` | `feat(web)` |
+| 6 | `gui.rs` + 新模块 `src/gui/workspace.rs`：三栏重排（目录树 / 连接+设备 / 设备详情）、1200×760、后台刷新线程（3s 节流、最小化不刷、删改后立刻催）、行内改名（只选中主文件名）、删除确认窗、窄窗抽屉 | `feat(gui)` |
+| 7 | README 补两节（管理端目录 / 设备授权）+ 界面章节重写；PLAN 本节；release 重建与冒烟 | 本节 |
+
+**验证**
+- `cargo test --release`：**63 passed / 0 failed / 5 ignored**（原 60 + 新增 3：树与折叠、三栏出图 + 窄窗抽屉、删除确认的项目数）
+  - 3 个旧的 delete / rename 用例**一行没改**全绿（`delete_returns_quota` / `delete_removes_directory_tree` / `rename_moves_and_refuses_overwrite`）—— 这就是"搬运没走形"的证据
+  - 新增：`ops_list_includes_dirs`、`ops_list_skips_temp_files`、`desktop_ops_are_atomic_with_upload`、`ops_rename_rules`、`ops_list_matches_files_endpoint`、`device_write_flag_is_per_device`（config 与 HTTP 两层）、`write_flag_does_not_block_transfer`、`drop_client_kills_its_sessions`、`unknown_session_has_no_write`
+- `node --test web/test/logic.test.js`：11 passed（未受影响）
+- GUI 无头出图：`target/gui_manage_1200x760.png`、`target/gui_manage_700x470.png` 人工核对三栏比例、行高、开关两态、抽屉按钮位置
+- 真 exe 冒烟：启动正常、`/` 200（页面含新黄条）、`/app.js` 44834 字节（含 canWrite 逻辑）、未授权 `/files` 401
+
+**过程中踩到并修掉的坑**
+- 标题栏的「拖动区」原来一直铺到主题按钮左边，会把 `设备 (n)` 抽屉按钮的点击吃掉
+  （egui 里后建的交互区在上面）→ 拖动区右边界改成避开抽屉按钮；无头点击测试兜住
+- `egui::Painter::text` 不换行，名字必须先用 `elide()` 截断，否则长文件名会画出列外
+- 测试出图的栅格化器只按顶点颜色填三角形、不采字形纹理，所以 PNG 里文字是色块 ——
+  这是**原有测试手段的限制**，不是界面问题（结构、间距、颜色都能看）
+- 状态栏「已选中」和「操作结果」会互相顶掉 → 操作结果优先显示 6 秒；窄窗不画右侧统计（两段文字会叠）
+
+**已知未做（照旧）**
+- `/files` 仍是全量遍历 + 2 秒缓存（管理端走 `ops::list` 有自己的后台刷新）
+- 便签仍是 last-writer-wins
+- 设备详情里的「本次 N 分钟」是活动日志里最早一条到现在，不是真实会话建立时间
+  （`Session` 只存最后一次活动时间，没存 `since`）——够用，不额外加字段
