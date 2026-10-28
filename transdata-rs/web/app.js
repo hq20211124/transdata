@@ -229,10 +229,29 @@
                 addr = j.url;
                 $('copyAddr').setAttribute('aria-label', '复制访问地址 ' + addr);
             }
+            applyCanWrite(j && j.can_write);
             setConn(true, '已连接');
         }).catch(function () {
             setConn(false, '连接断开');
         });
+    }
+
+    /* 电脑端可以按设备关掉「删除 / 修改」。置灰只是提示，真正的判定在服务端
+       （403）；点了也不发请求，免得白跑一趟网络。 */
+    function applyCanWrite(ok) {
+        var next = ok !== false;
+        if (next === canWrite) return;
+        canWrite = next;
+        var banner = $('roNotice');
+        if (banner) banner.hidden = canWrite;
+        renderFiles();
+    }
+
+    /* 操作完 / 切页签时重新问一次：授权可能在手机上停留期间被改掉 */
+    function refreshCanWrite() {
+        return apiJson('/info').then(function (j) {
+            applyCanWrite(j && j.can_write);
+        }).catch(function () { /* 网络断了另有提示 */ });
     }
 
     function copyText(text) {
@@ -645,11 +664,15 @@
 
     var dlList = [];
     var dlTruncated = false;
+    /* 这台设备还能不能「删除 / 修改」（由 /info 的 can_write 决定） */
+    var canWrite = true;
     var dlOpenDirs = {};      // 已展开的目录路径 -> true
     var dlExpanded = false;   // 顶层是否全部展开
 
     function initDownload() {
-        $('refreshBtn').addEventListener('click', function () { loadFiles(); });
+        $('refreshBtn').addEventListener('click', function () {
+            refreshCanWrite().then(function () { loadFiles(); });
+        });
         $('toggleDl').addEventListener('click', function () {
             dlExpanded = !dlExpanded;
             renderFiles();
@@ -799,6 +822,11 @@
         btn.title = '重命名 / 移动';
         btn.setAttribute('aria-label', '重命名 ' + node.name);
         btn.appendChild(icon(ICON_PENCIL));
+        if (!canWrite) {
+            btn.disabled = true;
+            btn.title = '电脑端已禁止这台设备删除 / 修改';
+            return btn;
+        }
         btn.addEventListener('click', function () {
             var next = prompt('新的名字（可以带子目录，例如 归档/' + node.name + '）', node.path);
             if (next == null) return;
@@ -822,6 +850,11 @@
         btn.title = isDir ? '删除整个文件夹' : '删除';
         btn.setAttribute('aria-label', (isDir ? '删除文件夹 ' : '删除 ') + name);
         btn.appendChild(icon(ICON_TRASH));
+        if (!canWrite) {
+            btn.disabled = true;
+            btn.title = '电脑端已禁止这台设备删除 / 修改';
+            return btn;
+        }
         btn.addEventListener('click', function () {
             var what = isDir
                 ? '整个文件夹「' + name + '」及其里的所有文件'

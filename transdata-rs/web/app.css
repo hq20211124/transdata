@@ -501,6 +501,11 @@ body {
 .icon-btn:hover { background: var(--danger-soft); color: var(--danger); }
 .icon-btn:focus-visible { outline: none; box-shadow: var(--ring); }
 .icon-btn--ok:hover { background: var(--accent-soft); color: var(--accent-soft-fg); }
+/* 电脑端关掉了这台设备的「删除 / 修改」：按钮置灰，点不了 */
+.icon-btn[disabled] {
+    opacity: .35;
+    cursor: not-allowed;
+}
 
 /* ---------------------------------------------------------------- progress */
 
