@@ -11,17 +11,12 @@
 
     var $ = function (id) { return document.getElementById(id); };
     var MODE_APP = MODE === 'app';
+    /* 纯逻辑在 /logic.js（编译期拼在本文件前面下发），见 web/logic.js */
+    var L = self.TDLogic;
 
     /* ---------------------------------------------------------------- utils */
 
-    function fmtSize(bytes) {
-        if (!bytes && bytes !== 0) return '';
-        if (bytes < 1024) return bytes + ' B';
-        var units = ['KB', 'MB', 'GB', 'TB'];
-        var v = bytes / 1024, i = 0;
-        while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
-        return (v < 10 ? v.toFixed(1) : Math.round(v)) + ' ' + units[i];
-    }
+    function fmtSize(bytes) { return L.fmtSize(bytes); }
 
     function fmtDuration(sec) {
         if (!isFinite(sec) || sec <= 0) return '';
@@ -397,15 +392,7 @@
     }
 
     function mergePicked(picked) {
-        var seen = {};
-        for (var i = 0; i < selected.length; i++) {
-            seen[selected[i].path + '|' + selected[i].file.size] = true;
-        }
-        for (var j = 0; j < picked.length; j++) {
-            var it = picked[j];
-            var k = it.path + '|' + it.file.size;
-            if (!seen[k]) { selected.push(it); seen[k] = true; }
-        }
+        selected = L.mergePicked(selected, picked);
     }
 
     function renderSelected() {
@@ -435,10 +422,14 @@
             rm.title = '移除';
             rm.setAttribute('aria-label', '移除 ' + it.path);
             rm.textContent = '×';
-            rm.addEventListener('click', function () {
-                selected.splice(idx, 1);
-                renderSelected();
-            });
+            // 必须按「对象引用」删，不能用循环下标：这里显示的行号是折叠后的
+            // 行号（最多 8 行），跟 selected 的下标不是一回事。
+            rm.addEventListener('click', (function (item) {
+                return function () {
+                    selected = L.removeItem(selected, item);
+                    renderSelected();
+                };
+            })(it));
             actions.appendChild(rm);
             li.appendChild(actions);
 
@@ -461,19 +452,6 @@
         $('uploadChip').textContent = selected.length ? selected.length + ' 个文件' : '未选择文件';
         $('uploadBtn').disabled = selected.length === 0 || uploading;
         $('uploadBtn').textContent = uploading ? '传输中…' : '开始上传';
-    }
-
-    function buildBatches(items) {
-        var batches = [], cur = [], curBytes = 0;
-        for (var i = 0; i < items.length; i++) {
-            var it = items[i];
-            if (cur.length > 0 && (cur.length >= BATCH_MAX_FILES || curBytes + it.file.size > BATCH_MAX_BYTES)) {
-                batches.push(cur); cur = []; curBytes = 0;
-            }
-            cur.push(it); curBytes += it.file.size;
-        }
-        if (cur.length) batches.push(cur);
-        return batches;
     }
 
     function manifest(items) {
@@ -576,7 +554,7 @@
             if (!todo.length) { return { done: true, failed: false, todo: [] }; }
 
             // 2) 分批上传，单批失败重试 3 次
-            var batches = buildBatches(todo);
+            var batches = L.buildBatches(todo, BATCH_MAX_FILES, BATCH_MAX_BYTES);
             var total = todo.reduce(function (n, it) { return n + it.file.size; }, 0);
             var doneBytes = 0;
 
@@ -699,51 +677,10 @@
 
     /* ------------------------------------------------------------------
        下载：目录树
-       服务器 /files 返回的是带子目录前缀的扁平列表，这里还原成树：
-       目录行有展开/收起 + 打包（整个目录压成 zip），文件行只有下载。
+       服务器 /files 返回的是带子目录前缀的扁平列表，buildTree 把它还原成树
+       （在 /logic.js 里，有 node 单测）；目录行有展开/收起 + 打包，
+       文件行只有下载。
        ------------------------------------------------------------------ */
-
-    function buildTree(files) {
-        var root = { name: '', path: '', dir: true, children: [], files: 0, size: 0, parent: null };
-        var index = { '': root };
-        files.forEach(function (f) {
-            var parts = f.name.split('/');
-            var cur = root;
-            for (var i = 0; i < parts.length - 1; i++) {
-                var p = parts.slice(0, i + 1).join('/');
-                var node = index[p];
-                if (!node) {
-                    node = {
-                        name: parts[i], path: p, dir: true, children: [],
-                        files: 0, size: 0, parent: cur
-                    };
-                    index[p] = node;
-                    cur.children.push(node);
-                }
-                cur = node;
-            }
-            cur.children.push({
-                name: parts[parts.length - 1], path: f.name, dir: false,
-                children: [], files: 1, size: f.size, parent: cur
-            });
-            // 目录上的计数/大小向上累加
-            var up = cur;
-            while (up) { up.files++; up.size += f.size; up = up.parent; }
-        });
-        sortTree(root);
-        return root;
-    }
-
-    /* 目录在前、文件在后，同类按名字排（跟文件管理器一个顺序） */
-    function sortTree(node) {
-        node.children.sort(function (a, b) {
-            if (a.dir !== b.dir) return a.dir ? -1 : 1;
-            return a.name.localeCompare(b.name, 'zh-Hans-CN');
-        });
-        node.children.forEach(function (c) {
-            if (c.dir) sortTree(c);
-        });
-    }
 
     function renderFiles() {
         var list = $('dlList');
@@ -766,18 +703,29 @@
         }
         $('dlEmpty').hidden = true;
 
-        var tree = buildTree(dlList);
+        var tree = L.buildTree(dlList);
 
         // 「折叠 5 条」只作用在顶层：展开的子目录内容全部显示
         var rows = [];
-        collectRows(tree, 0, rows, dlExpanded ? null : DL_COLLAPSED_ROWS);
+        L.collectRows(tree, 0, rows, dlExpanded ? null : DL_COLLAPSED_ROWS,
+            function (p) { return !!dlOpenDirs[p]; });
 
         var total = tree.children.length;
-        var rootShown = dlExpanded ? total : Math.min(total, DL_COLLAPSED_ROWS);
         var cap = Math.min(rows.length, RENDER_CAP);
 
         for (var i = 0; i < cap; i++) {
             list.appendChild(treeRow(rows[i].node, rows[i].depth));
+        }
+
+        // 截断必须说出来：以前服务器只给前 10000 项、前端只渲染前 200 行，
+        // 两处都是静默的，用户会以为文件丢了。
+        if (rows.length > cap) {
+            list.appendChild(el('li', 'listmore',
+                '仅渲染前 ' + cap + ' 行（共 ' + rows.length + ' 行），可展开文件夹逐个下载'));
+        }
+        if (dlTruncated) {
+            list.appendChild(el('li', 'listmore',
+                '文件太多，列表只显示前 ' + dlList.length + ' 项；其余请用「全部打包下载」'));
         }
 
         list.classList.toggle('is-scrollable', rows.length > DL_COLLAPSED_ROWS);
@@ -787,19 +735,6 @@
         tg.hidden = total <= DL_COLLAPSED_ROWS;
         tg.textContent = dlExpanded ? '收起' : '展开全部';
         tg.setAttribute('aria-expanded', dlExpanded ? 'true' : 'false');
-    }
-
-    /* 把树摊平成 [{node, depth}]，只展开用户点开过的目录。
-       limit 只作用在本层（顶层折叠用），子目录一旦展开就全部显示。 */
-    function collectRows(node, depth, out, limit) {
-        var n = (limit == null) ? node.children.length : Math.min(node.children.length, limit);
-        for (var i = 0; i < n; i++) {
-            var child = node.children[i];
-            out.push({ node: child, depth: depth });
-            if (child.dir && dlOpenDirs[child.path]) {
-                collectRows(child, depth + 1, out, null);
-            }
-        }
     }
 
     function treeRow(node, depth) {
@@ -901,7 +836,7 @@
     }
 
     function encPath(p) {
-        return p.split('/').map(encodeURIComponent).join('/');
+        return L.encPath(p);
     }
 
     /* ------------------------------------------------------------- 便签 */

@@ -13,9 +13,15 @@ pub const SESSION_TTL: Duration = Duration::from_secs(12 * 3600);
 pub const PAIR_ATTEMPTS: usize = 10;
 /// Length of the rate-limit window for pairing attempts.
 pub const PAIR_WINDOW: Duration = Duration::from_secs(300);
-/// After this many *failed* pairing attempts the server stops accepting
-/// codes for the rest of the run (brute-force lockout).
+/// After this many *failed* pairing attempts the server refuses codes for a
+/// while (brute-force lockout).
 pub const PAIR_MAX_FAILURES: u32 = 30;
+/// How long the lockout lasts before codes are accepted again.
+///
+/// This used to be permanent ("restart the program"), which meant anyone on
+/// the same Wi-Fi could lock the owner out of pairing for good with 30 wrong
+/// guesses — a denial of service against the person using the tool.
+pub const PAIR_COOLDOWN: Duration = Duration::from_secs(300);
 
 /// Upper bound for the shared note (bytes). The note is meant for pasting
 /// text around, not for shipping a database dump.
@@ -69,6 +75,19 @@ impl ActKind {
     }
 }
 
+/// Random 32-hex-char pairing secret (OS RNG).
+fn random_secret() -> String {
+    let mut bytes = [0u8; 16];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Random 8-digit pairing code (10^8 combinations).
+fn random_code() -> String {
+    let code: u32 = rand::Rng::gen_range(&mut rand::thread_rng(), 0..100_000_000);
+    format!("{code:08}")
+}
+
 /// One recorded operation (who did what, when, how big).
 #[derive(Clone, Debug)]
 pub struct Activity {
@@ -120,18 +139,23 @@ pub struct Config {
     /// inside the QR code (URL fragment, never sent to the server) and
     /// inside the desktop app. Everything a browser gets is a short-lived
     /// session id in an `HttpOnly` cookie.
-    pub pair_secret: String,
+    ///
+    /// Behind a lock because the settings panel can regenerate it.
+    pub pair_secret: RwLock<String>,
     /// 8-digit pairing code shown in the desktop window, for devices that
     /// cannot scan the QR code.
-    pub pair_code: String,
+    pub pair_code: RwLock<String>,
     /// Live sessions: session id -> (last used, peer address).
     pub sessions: RwLock<HashMap<String, Session>>,
     /// Ring buffer of recent operations (upload / download / delete).
     pub activity: Mutex<std::collections::VecDeque<Activity>>,
     /// Pairing attempts per peer address (ip -> timestamps).
     pub pair_attempts: Mutex<HashMap<String, Vec<Instant>>>,
-    /// Set once the brute-force lockout trips.
-    pub pair_locked: AtomicBool,
+    /// Set while the brute-force lockout is active: the instant it expires.
+    ///
+    /// `None` = codes are accepted. It cools down by itself — a permanent
+    /// lock could be triggered by anybody on the LAN.
+    pub pair_locked_until: Mutex<Option<Instant>>,
     /// Number of failed pairing attempts since startup.
     pub pair_failures: AtomicU32,
     /// The index page in its two variants (paired / not paired) plus the
@@ -182,15 +206,7 @@ pub struct TlsMaterial {
 
 impl Config {
     pub fn new() -> Self {
-        // Pairing secret: 32 hex chars from the OS RNG.
-        let mut bytes = [0u8; 16];
-        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut bytes);
-        let secret: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-        // Pairing code: 8 digits, brute force is hopeless even without the
-        // rate limit (10^8 combinations).
-        let code: u32 = rand::Rng::gen_range(&mut rand::thread_rng(), 0..100_000_000);
-        let code = format!("{code:08}");
-        Self::with_secret(secret, code)
+        Self::with_secret(random_secret(), random_code())
     }
 
     /// Same as [`Config::new`] but with caller-provided pairing material
@@ -214,10 +230,9 @@ impl Config {
         }
         dir = dir.join("uploads");
         std::fs::create_dir_all(&dir).ok();
-        // Older versions wrote the whole zip to a temp file first. If the
-        // program was killed while that was going on, a huge half-written
-        // archive is left behind — it is worthless, so drop it at startup.
-        cleanup_stale_zip_temps(&dir);
+        // NOTE: 清理残留文件**不在这里做**。构造 Config 的时候还没拿实例锁，
+        // 万一另一个实例正在上传，删它的 `.td-tmp-*.part` 就等于掐断传输。
+        // 见 `cleanup_stale_files()`（main 拿到锁之后才调用）。
 
         let (note_tx, _) = broadcast::channel::<String>(32);
         let (tls_tx, _) = watch::channel(false);
@@ -248,12 +263,12 @@ impl Config {
             note_buf: RwLock::new(Arc::new(String::new())),
             note_version: AtomicU64::new(0),
             note_tx,
-            pair_secret: secret,
-            pair_code: code,
+            pair_secret: RwLock::new(secret),
+            pair_code: RwLock::new(code),
             sessions: RwLock::new(HashMap::new()),
             activity: Mutex::new(std::collections::VecDeque::new()),
             pair_attempts: Mutex::new(HashMap::new()),
-            pair_locked: AtomicBool::new(false),
+            pair_locked_until: Mutex::new(None),
             pair_failures: AtomicU32::new(0),
             page_app,
             page_app_gz,
@@ -262,9 +277,9 @@ impl Config {
             page_pair_gz,
             page_pair_etag,
             asset_css: crate::web::APP_CSS.as_bytes().to_vec(),
-            asset_js: crate::web::APP_JS.as_bytes().to_vec(),
+            asset_js: crate::web::app_js().as_bytes().to_vec(),
             asset_css_etag: format!("\"{:016x}\"", fnv1a(crate::web::APP_CSS.as_bytes())),
-            asset_js_etag: format!("\"{:016x}\"", fnv1a(crate::web::APP_JS.as_bytes())),
+            asset_js_etag: format!("\"{:016x}\"", fnv1a(crate::web::app_js().as_bytes())),
             files_cache: RwLock::new(None),
             active_transfers: AtomicUsize::new(0),
             active_uploads: AtomicUsize::new(0),
@@ -278,6 +293,48 @@ impl Config {
     pub fn set_upload_dir(&self, dir: PathBuf) {
         std::fs::create_dir_all(&dir).ok();
         *self.upload_dir.write().unwrap() = dir;
+        // 换到另一个盘：配额必须按新盘的剩余空间重算，否则「磁盘打满保护」
+        // 用的还是启动时那台盘的旧数字。
+        self.refresh_quota();
+    }
+
+    /// 启动时清理残留文件 —— **必须在拿到实例锁之后调用**。
+    ///
+    /// 清理的是两类「上一次没正常退出」留下的东西：
+    /// * 传输目录里的 `.td-tmp-*.part`（上传中间文件）和 `*.zip.tmp`（老版本的临时压缩包）
+    /// * exe 旁边的 `*.exe.old`（更新时被改名的旧程序，运行中删不掉）
+    pub fn cleanup_stale_files(&self) {
+        cleanup_stale_zip_temps(&self.upload_dir());
+        cleanup_stale_exe_old();
+    }
+
+    /// Recompute the upload budget from the current directory's free space.
+    pub fn refresh_quota(&self) {
+        let dir = self.upload_dir();
+        let quota = match disk_free(&dir) {
+            Some(free) if free > DISK_RESERVE => (free - DISK_RESERVE).min(QUOTA_FALLBACK),
+            _ => QUOTA_FALLBACK,
+        };
+        self.quota_left.store(quota, Ordering::SeqCst);
+    }
+
+    /// Shrink the budget if the volume has less free space than the budget
+    /// assumes (only ever shrinks — growing from a stale reading would let a
+    /// burst of uploads eat into the reserve).
+    ///
+    /// The budget used to be a one-shot snapshot taken at startup: delete
+    /// files outside the app, or fill the disk with something else, and the
+    /// "stop at 507 instead of filling the disk" promise quietly stopped
+    /// holding.
+    pub fn clamp_quota_to_disk(&self) {
+        let Some(free) = disk_free(&self.upload_dir()) else {
+            return;
+        };
+        let budget = free.saturating_sub(DISK_RESERVE).min(QUOTA_FALLBACK);
+        let cur = self.quota_left.load(Ordering::SeqCst);
+        if budget < cur {
+            self.quota_left.store(budget, Ordering::SeqCst);
+        }
     }
 
     pub fn upload_dir(&self) -> PathBuf {
@@ -327,6 +384,62 @@ impl Config {
     /// Store the certificate material.
     pub fn set_tls_material(&self, m: Arc<TlsMaterial>) {
         *self.tls.write().unwrap() = Some(m);
+    }
+
+    // ---- pairing state ----------------------------------------------------
+
+    /// Current pairing secret (32 hex chars). Rotated by [`Self::reset_pairing`].
+    pub fn pair_secret(&self) -> String {
+        self.pair_secret.read().unwrap().clone()
+    }
+
+    /// Current 8-digit pairing code.
+    pub fn pair_code(&self) -> String {
+        self.pair_code.read().unwrap().clone()
+    }
+
+    /// Seconds left on the brute-force lockout (`None` = codes accepted).
+    ///
+    /// An expired lock clears itself here, so the state can never stick the
+    /// way the old "locked until restart" flag did.
+    pub fn pair_lock_left(&self) -> Option<u64> {
+        let mut guard = self.pair_locked_until.lock().unwrap();
+        let until = (*guard)?;
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            *guard = None;
+            self.pair_failures.store(0, Ordering::SeqCst);
+            None
+        } else {
+            Some(left.as_secs().max(1))
+        }
+    }
+
+    /// Count one failed attempt, tripping the cooldown at the cap.
+    pub fn note_pair_failure(&self) -> u32 {
+        let fails = self.pair_failures.fetch_add(1, Ordering::SeqCst) + 1;
+        if fails >= PAIR_MAX_FAILURES {
+            *self.pair_locked_until.lock().unwrap() = Some(Instant::now() + PAIR_COOLDOWN);
+            self.pair_failures.store(0, Ordering::SeqCst);
+            eprintln!("pairing locked for {}s after {fails} failed attempts", PAIR_COOLDOWN.as_secs());
+        }
+        fails
+    }
+
+    /// Issue a new code and a new secret, clear the lockout and the per-IP
+    /// attempt history. Returns `(code, secret)`.
+    ///
+    /// Already-paired devices keep their session — rotating the code only
+    /// affects devices that have not paired yet.
+    pub fn reset_pairing(&self) -> (String, String) {
+        let secret = random_secret();
+        let code = random_code();
+        *self.pair_secret.write().unwrap() = secret.clone();
+        *self.pair_code.write().unwrap() = code.clone();
+        self.pair_failures.store(0, Ordering::SeqCst);
+        *self.pair_locked_until.lock().unwrap() = None;
+        self.pair_attempts.lock().unwrap().clear();
+        (code, secret)
     }
 
     // ---- sessions ---------------------------------------------------------
@@ -523,6 +636,29 @@ pub fn cleanup_stale_zip_temps(dir: &std::path::Path) {
         let stale_zip = name.starts_with('.') && name.ends_with(".zip.tmp");
         let stale_upload = name.starts_with(".td-tmp-") && name.ends_with(".part");
         if (stale_zip || stale_upload) && e.path().is_file() {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
+/// 更新时旧程序被改名成 `transdata.exe.old`，但 Windows 不允许删除正在运行
+/// 的映像，所以 `replace_exe` 结尾那次 `remove_file` 一定失败（静默）——
+/// 结果是每更新一次就永久多留一份完整 exe。下次启动时（那时旧映像已经不在
+/// 运行了）再删一次。
+pub fn cleanup_stale_exe_old() {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let Some(dir) = exe.parent() else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        if e.file_name()
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .ends_with(".exe.old")
+        {
             let _ = std::fs::remove_file(e.path());
         }
     }

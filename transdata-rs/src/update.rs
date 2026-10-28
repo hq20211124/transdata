@@ -85,8 +85,27 @@ pub fn is_newer(remote: &str, local: &str) -> bool {
 /// 这不算错误 —— 等于"没有新版本"。
 pub const NO_RELEASE: &str = "更新服务器上还没有发布新版本";
 
+/// 只接受 https 的更新源。
+///
+/// 清单和 exe 走明文 http 的话，路径上任何人都能把两者一起换掉——清单里的
+/// sha256 会和攻击者的文件「完全匹配」，校验等于没做。
+pub fn ensure_https(url: &str) -> Result<(), String> {
+    let lower = url.trim_start().to_ascii_lowercase();
+    if lower.starts_with("https://") {
+        return Ok(());
+    }
+    // 单测用本地假服务器（明文 http）跑「下载→校验→替换」全链路；
+    // 仅测试构建、且仅回环地址放行，正式构建里没有这条分支。
+    #[cfg(test)]
+    if lower.starts_with("http://127.0.0.1:") || lower.starts_with("http://localhost:") {
+        return Ok(());
+    }
+    Err("更新地址必须是 https://（明文 http 会被中间人替换）".to_string())
+}
+
 /// 拉取版本清单
 pub fn fetch_release(url: &str) -> Result<Release, String> {
+    ensure_https(url)?;
     let resp = match ureq::get(url).call() {
         Ok(r) => r,
         Err(ureq::Error::Status(404, _)) => return Err(NO_RELEASE.to_string()),
@@ -141,15 +160,16 @@ pub fn parse_release(v: &serde_json::Value) -> Result<Release, String> {
         .ok_or_else(|| "更新信息里找不到版本号".to_string())?;
     let version = tag.trim().trim_start_matches('v').to_string();
     let assets = v.get("assets").and_then(|x| x.as_array());
+    // 只认 `.exe`。以前找不到时回退到 `assets.first()`，结果一个 release 里
+    // 排在前面的 `.sha256` / `.zip` 会被当成程序下载下来，然后覆盖掉
+    // transdata.exe —— 程序当场报废。
     let asset = assets.and_then(|list| {
-        list.iter()
-            .find(|a| {
-                a.get("name")
-                    .and_then(|n| n.as_str())
-                    .map(|n| n.to_ascii_lowercase().ends_with(".exe"))
-                    .unwrap_or(false)
-            })
-            .or_else(|| list.first())
+        list.iter().find(|a| {
+            a.get("name")
+                .and_then(|n| n.as_str())
+                .map(|n| n.to_ascii_lowercase().ends_with(".exe"))
+                .unwrap_or(false)
+        })
     });
     let url = asset
         .and_then(|a| a.get("browser_download_url"))
@@ -184,6 +204,7 @@ pub fn download(
     dest: &Path,
     mut on_progress: impl FnMut(u64, u64),
 ) -> Result<(), String> {
+    ensure_https(url)?;
     let resp = ureq::get(url)
         .call()
         .map_err(|e| format!("下载失败：{e}"))?;
@@ -240,6 +261,20 @@ pub fn verify(dest: &Path, expect: &Option<String>) -> Result<(), String> {
         Ok(())
     } else {
         Err("文件校验不通过（sha256 对不上），已放弃更新".to_string())
+    }
+}
+
+/// 下载到的东西至少得像个 Windows 程序（开头两字节 `MZ`）。
+///
+/// sha256 是可选的（清单没写就跳过），所以还需要一道「是不是可执行文件」
+/// 的兜底：一个 json / zip 就算哈希对上了，装上去也是废的。
+pub fn verify_pe(path: &Path) -> Result<(), String> {
+    let mut f = std::fs::File::open(path).map_err(|e| format!("打不开下载的文件：{e}"))?;
+    let mut magic = [0u8; 2];
+    match f.read_exact(&mut magic) {
+        Ok(()) if &magic == b"MZ" => Ok(()),
+        Ok(()) => Err("下载到的文件不是 Windows 程序（缺少 MZ 头），已放弃更新".to_string()),
+        Err(_) => Err("下载到的文件不完整，已放弃更新".to_string()),
     }
 }
 
@@ -302,15 +337,15 @@ mod tests {
                     let json = format!(
                         r#"{{"version":"9.9.9","url":"http://127.0.0.1:{port}/app.exe","sha256":"{sha}","notes":"test"}}"#,
                         port = port,
-                        sha = sha256_of(b"FAKE-EXE-CONTENT")
+                        sha = sha256_of(b"MZFAKE-EXE-CONTENT")
                     );
                     (json.into_bytes(), "application/json")
                 } else {
-                    (b"FAKE-EXE-CONTENT".to_vec(), "application/octet-stream")
+                    (b"MZFAKE-EXE-CONTENT".to_vec(), "application/octet-stream")
                 };
                 let body = String::from_utf8_lossy(&body)
                     .replace("PORT", &port.to_string())
-                    .replace("SHA", &sha256_of(b"FAKE-EXE-CONTENT"))
+                    .replace("SHA", &sha256_of(b"MZFAKE-EXE-CONTENT"))
                     .into_bytes();
                 let head = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -341,7 +376,7 @@ mod tests {
         assert_eq!(rel.version, "9.9.9");
         assert!(is_newer(&rel.version, APP_VERSION));
         assert!(rel.url.ends_with("/app.exe"));
-        assert_eq!(rel.sha256.as_deref(), Some(sha256_of(b"FAKE-EXE-CONTENT").as_str()));
+        assert_eq!(rel.sha256.as_deref(), Some(sha256_of(b"MZFAKE-EXE-CONTENT").as_str()));
 
         // 2) 下载 + 校验
         let dir = std::env::temp_dir().join("td_update_test");
@@ -352,7 +387,8 @@ mod tests {
             .expect("下载应该成功");
         assert!(last.0 > 0, "应该收到数据");
         verify(&new_file, &rel.sha256).expect("校验应该通过");
-        assert!(std::fs::read(&new_file).unwrap().starts_with(b"FAKE-EXE"));
+        verify_pe(&new_file).expect("MZ 头检查应该通过");
+        assert!(std::fs::read(&new_file).unwrap().starts_with(b"MZFAKE"));
 
         // 3) 校验不过要拦下来
         let bad = Some("0".repeat(64));
@@ -362,7 +398,7 @@ mod tests {
         let exe = dir.join("transdata.exe");
         std::fs::write(&exe, b"OLD").unwrap();
         replace_exe(&new_file, &exe).expect("替换应该成功");
-        assert!(std::fs::read(&exe).unwrap().starts_with(b"FAKE-EXE"));
+        assert!(std::fs::read(&exe).unwrap().starts_with(b"MZFAKE"));
         assert!(!dir.join("transdata.exe.old").exists(), "旧文件应该清掉");
 
         // 5) 换一个不存在的文件当来源 → 失败，但原来的 exe 还在
@@ -412,5 +448,53 @@ mod tests {
         let r = parse_release(&v).unwrap();
         assert_eq!(r.version, "1.3.0");
         assert_eq!(r.url, "https://example.com/t.exe");
+    }
+
+    /// 一个 release 里没有 `.exe` 时必须报错。
+    ///
+    /// 以前会回退到 `assets.first()`：排在前面的 `.sha256` / `.zip` 会被当成
+    /// 程序下载下来，然后覆盖掉 transdata.exe —— 程序当场报废。
+    #[test]
+    fn non_exe_asset_is_rejected() {
+        let v = serde_json::json!({
+            "tag_name": "v1.4.0",
+            "assets": [
+                { "name": "transdata-1.4.0.zip", "browser_download_url": "https://example.com/a.zip" },
+                { "name": "SHA256SUMS.txt", "browser_download_url": "https://example.com/b.txt" }
+            ]
+        });
+        assert!(parse_release(&v).is_err(), "没有 exe 附件就必须报错，不能乱装");
+
+        let empty = serde_json::json!({ "tag_name": "v1.4.0", "assets": [] });
+        assert!(parse_release(&empty).is_err());
+    }
+
+    /// 明文 http 的更新源直接拒绝（中间人可以把清单和 exe 一起换掉，
+    /// 清单里的 sha256 会和攻击者的文件「完全匹配」）。
+    #[test]
+    fn http_update_url_is_rejected() {
+        assert!(ensure_https("http://example.com/latest.json").is_err());
+        assert!(ensure_https("https://example.com/latest.json").is_ok());
+        assert!(ensure_https("HTTP://example.com/x").is_err());
+    }
+
+    /// 下载到的东西不是 Windows 程序（没有 MZ 头）要拦下来。
+    #[test]
+    fn non_pe_payload_is_rejected() {
+        let dir = std::env::temp_dir().join("td_pe_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("not-an-exe.bin");
+        std::fs::write(&f, b"PK\x03\x04this is a zip").unwrap();
+        assert!(verify_pe(&f).is_err(), "zip 不能被当成 exe");
+
+        let ok = dir.join("looks-like-exe.bin");
+        std::fs::write(&ok, b"MZ\x90\x00rest").unwrap();
+        assert!(verify_pe(&ok).is_ok());
+
+        let empty = dir.join("empty.bin");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(verify_pe(&empty).is_err(), "空文件必须被拒");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

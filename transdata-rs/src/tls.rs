@@ -58,9 +58,17 @@ fn candidate_dirs() -> Vec<PathBuf> {
 /// The certificate is regenerated when the address list changed, because a
 /// certificate for `192.168.1.5` is useless on `192.168.1.9`.
 pub fn load_or_create(ips: &[String]) -> Result<Arc<TlsMaterial>, String> {
+    load_or_create_in(ips, &candidate_dirs())
+}
+
+/// Same as [`load_or_create`] but with an explicit directory list.
+///
+/// Tests use this so they do not write certificates into `target/` (and so a
+/// test run cannot pick up a stale certificate from a previous one).
+pub fn load_or_create_in(ips: &[String], dirs: &[PathBuf]) -> Result<Arc<TlsMaterial>, String> {
     let wanted = ips.join(",");
 
-    for dir in candidate_dirs() {
+    for dir in dirs {
         let cert_path = dir.join(CERT_FILE);
         let key_path = dir.join(KEY_FILE);
         let meta_path = dir.join(META_FILE);

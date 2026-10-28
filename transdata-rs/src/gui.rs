@@ -410,7 +410,7 @@ fn window_icon() -> std::sync::Arc<eframe::egui::IconData> {
 /// 弹一个错误框。GUI 程序没有 stderr，错误只写进日志的话用户根本看不到
 /// （表现为"双击了没反应"）。
 #[cfg(windows)]
-fn show_error(msg: &str) {
+pub fn show_error(msg: &str) {
     #[link(name = "user32")]
     extern "system" {
         fn MessageBoxW(hwnd: isize, text: *const u16, caption: *const u16, flags: u32) -> i32;
@@ -432,7 +432,7 @@ fn show_error(msg: &str) {
 }
 
 #[cfg(not(windows))]
-fn show_error(msg: &str) {
+pub fn show_error(msg: &str) {
     eprintln!("{msg}");
 }
 
@@ -690,8 +690,8 @@ impl GuiApp {
         #[cfg(windows)] hwnd: isize,
     ) -> Self {
         let (_, last_v) = cfg.read_note();
-        let pair_code = cfg.pair_code.clone();
-        let pair_secret = cfg.pair_secret.clone();
+        let pair_code = cfg.pair_code();
+        let pair_secret = cfg.pair_secret();
         Self {
             cfg,
             port,
@@ -1016,6 +1016,9 @@ impl GuiApp {
                     ctx.request_repaint();
                 })?;
                 crate::update::verify(&tmp, &rel.sha256)?;
+                // sha256 是可选的（清单没写就跳过），所以再确认一次「这真的
+                // 是个 exe」——否则一个哈希对得上的 zip 也会被装上去。
+                crate::update::verify_pe(&tmp)?;
                 let exe = std::env::current_exe().map_err(|e| e.to_string())?;
                 crate::update::replace_exe(&tmp, &exe)
             })();
@@ -1048,7 +1051,11 @@ impl GuiApp {
             }
             crate::update::UpdateStatus::Available(r) => (
                 r.version.clone(),
-                "发现新版本，可以直接更新".to_string(),
+                if r.sha256.is_some() {
+                    "发现新版本，可以直接更新".to_string()
+                } else {
+                    "发现新版本，但清单没给 sha256 —— 无法校验完整性".to_string()
+                },
                 p.accent,
             ),
             crate::update::UpdateStatus::Downloading { received, total } => {
@@ -1138,6 +1145,48 @@ impl GuiApp {
                         _ => {}
                     }
                 });
+
+                // ---- 配对：锁定状态 + 一键换码
+                //
+                // 输错太多次会进冷却，以前只能重启程序；现在这里能看到还剩
+                // 多少秒，并且随时可以换一张新码立刻恢复。
+                ui.add_space(16.0);
+                section_label(ui, "配对");
+                ui.add_space(6.0);
+                kv_row(ui, "配对码", &self.pair_code);
+                let (lock_text, lock_color) = match self.cfg.pair_lock_left() {
+                    Some(secs) => (
+                        format!("已锁定：{secs} 秒后可重试"),
+                        p.btn_hover_close,
+                    ),
+                    None => (
+                        "正常：在手机上扫码或输入上面的配对码".to_string(),
+                        p.muted,
+                    ),
+                };
+                ui.add(
+                    eframe::egui::Label::new(
+                        RichText::new(lock_text).size(11.0).color(lock_color),
+                    )
+                    .wrap(),
+                );
+                ui.add_space(8.0);
+                if btn_soft(ui, "重新生成配对码", 12.0, 30.0, 132.0) {
+                    let (code, secret) = self.cfg.reset_pairing();
+                    self.pair_code = code;
+                    self.pair_secret = secret;
+                    self.pair_hidden = false;
+                    self.pair_msg = "配对码已更新".to_string();
+                    self.refresh_qr(ctx);
+                }
+                ui.add(
+                    eframe::egui::Label::new(
+                        RichText::new("换码后已连接的设备不受影响，新设备要用新码")
+                            .size(10.5)
+                            .color(p.muted),
+                    )
+                    .wrap(),
+                );
             });
         self.settings_open = open;
     }
@@ -1435,12 +1484,24 @@ impl GuiApp {
         }
 
         // A newer version on the server wins: remote content overwrites the
-        // local edit (两端同步规则).
+        // local edit (两端同步规则，用户确认保持这个行为)。
+        //
+        // 但覆盖必须说出来：以前正在打字时手机发来一条，框里的内容被直接
+        // 换掉，用户完全不知道自己的字去哪了。
         if shared_v != self.note_last_v {
+            let had_unsent = self
+                .note_local
+                .as_deref()
+                .map(|t| t != shared_text.as_str())
+                .unwrap_or(false);
             self.note_last_v = shared_v;
             self.note_local = None;
             self.text_buf = shared_text.as_ref().clone();
-            self.note_status = "已收到对方内容".to_string();
+            self.note_status = if had_unsent {
+                "已收到对方内容，本地未发送的改动被覆盖".to_string()
+            } else {
+                "已收到对方内容".to_string()
+            };
         } else if self.text_buf.is_empty() && self.note_local.is_none() {
             // First frame: show whatever the server already has.
             self.text_buf = shared_text.as_ref().clone();
@@ -1890,6 +1951,18 @@ impl GuiApp {
                                         self.pair_msg = "配对码已复制".to_string();
                                     }
                                 }
+                                // 配对冷却：以前桌面端完全看不到锁状态，手机一直失败
+                                // 也不知道为什么。这里直接把剩余秒数写出来。
+                                if let Some(secs) = self.cfg.pair_lock_left() {
+                                    ui.add_space(2.0);
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "已锁定，{secs} 秒后可重试（设置里可换码）"
+                                        ))
+                                        .size(10.5)
+                                        .color(pal::now().btn_hover_close),
+                                    );
+                                }
                                 if !self.pair_msg.is_empty() {
                                     ui.add_space(2.0);
                                     ui.label(
@@ -1969,9 +2042,14 @@ impl GuiApp {
                                 )
                                 .inner;
                             if copy_hit {
-                                win32_set_clipboard(&self.text_buf);
-                                self.note_local = None;
-                                self.note_status = "已复制到剪贴板".to_string();
+                                let ok = win32_set_clipboard(&self.text_buf);
+                                // 复制不等于"已同步"：不要清 note_local，
+                                // 否则下一次远端更新会静默覆盖掉本地改动。
+                                self.note_status = if ok {
+                                    "已复制到剪贴板".to_string()
+                                } else {
+                                    "复制失败：剪贴板被其他程序占用".to_string()
+                                };
                             }
                             // Ctrl+Enter 快捷键直接发送（顺带吞掉该按键，避免 TextEdit 插入换行）
                             let ctrl_enter = ctx.input(|i| {
@@ -2439,7 +2517,9 @@ fn open_in_explorer(dir: PathBuf) {
 /// Write `text` to the Windows system clipboard (CF_UNICODETEXT).
 /// Retries briefly while another app holds the clipboard open.
 #[cfg(windows)]
-fn win32_set_clipboard(text: &str) {
+/// 复制到 Windows 剪贴板。返回是否成功（失败时调用方要如实提示，
+/// 不能一律显示"已复制"）。
+fn win32_set_clipboard(text: &str) -> bool {
     #[link(name = "user32")]
     extern "system" {
         fn OpenClipboard(hwnd: isize) -> i32;
@@ -2465,24 +2545,32 @@ fn win32_set_clipboard(text: &str) {
     utf16.push(0u16); // NUL 结尾
     let byte_len = utf16.len() * std::mem::size_of::<u16>();
 
+    // 最多重试 20 次、每次 10 ms：剪贴板被别的程序占住时不要把 UI 线程
+    // 卡住一秒（原来是 50 ms × 20）。
     for _ in 0..20 {
         let hmem = unsafe { GlobalAlloc(GMEM_MOVEABLE, byte_len) };
         if hmem.is_null() {
-            return;
+            return false;
         }
         let ptr = unsafe { GlobalLock(hmem) };
-        if !ptr.is_null() {
+        if ptr.is_null() {
+            // 锁不住就别往下写：以前会拿着一个没锁住的内存块去
+            // SetClipboardData，剪贴板里出现的是一段未初始化数据。
             unsafe {
-                std::ptr::copy_nonoverlapping(utf16.as_ptr(), ptr as *mut u16, utf16.len());
-                GlobalUnlock(hmem);
+                GlobalFree(hmem);
             }
+            return false;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(utf16.as_ptr(), ptr as *mut u16, utf16.len());
+            GlobalUnlock(hmem);
         }
         if unsafe { OpenClipboard(0) } == 0 {
             // Clipboard locked by another app: release this handle, wait, retry.
             unsafe {
                 GlobalFree(hmem);
             }
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::thread::sleep(std::time::Duration::from_millis(10));
             continue;
         }
         unsafe {
@@ -2490,15 +2578,18 @@ fn win32_set_clipboard(text: &str) {
             let ok = SetClipboardData(CF_UNICODETEXT, hmem);
             CloseClipboard();
             if ok != 0 {
-                return; // success: the OS now owns hmem
+                return true; // success: the OS now owns hmem
             }
             GlobalFree(hmem);
         }
     }
+    false
 }
 
 #[cfg(not(windows))]
-fn win32_set_clipboard(_text: &str) {}
+fn win32_set_clipboard(_text: &str) -> bool {
+    false
+}
 
 fn choose_dir() -> Option<PathBuf> {
     rfd::FileDialog::new()

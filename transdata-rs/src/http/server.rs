@@ -35,7 +35,9 @@ pub const TEST_SECRET: &str = "test-secret";
 pub const TEST_CODE: &str = "12345678";
 /// /files listing cap; deeper trees are truncated and flagged.
 const FILE_LIST_CAP: usize = 10_000;
-/// /verify per-request cap.
+/// /verify per-request cap (number of manifest entries). The client sends at
+/// most 15 000 per batch, so this is only a backstop against a hand-made
+/// request. It does *not* limit the number of files on disk any more.
 const VERIFY_CAP: usize = 20_000;
 /// How many uploads may run at the same time. Without this a single device
 /// (or a script) can saturate the disk and starve every other client.
@@ -417,7 +419,8 @@ fn authorized(cfg: &Config, req: &Request) -> bool {
         }
     }
     if let Some(s) = &req.secret {
-        if ct_eq(s, &cfg.pair_secret) {
+        let expected = cfg.pair_secret.read().unwrap();
+        if ct_eq(s, expected.as_str()) {
             return true;
         }
     }
@@ -656,15 +659,22 @@ async fn handle_conn(
                         .count()
                 })
                 .unwrap_or(0);
-            let url = format!("http://{}:{}", crate::net::display_ip(), cfg.port);
+            // The scheme has to follow the current mode: with HTTPS switched
+            // on, an `http://` address here would send the phone to the
+            // "please use https" page (the page copies this value).
+            let scheme = if cfg.tls_on() { "https" } else { "http" };
+            let url = format!("{scheme}://{}:{}", crate::net::display_ip(), cfg.port);
             let dir_s = dir.to_string_lossy().replace('"', "\\\"");
             let active = cfg
                 .active_transfers
                 .load(std::sync::atomic::Ordering::SeqCst);
             let quota = cfg.quota_left.load(std::sync::atomic::Ordering::SeqCst);
             let paired = cfg.session_count();
+            // Seconds left on the pairing lockout (0 = not locked). The
+            // desktop window shows this; it used to have no idea at all.
+            let lock = cfg.pair_lock_left().unwrap_or(0);
             let body = format!(
-                r#"{{"success":true,"url":"{url}","files_count":{count},"save_dir":"{dir_s}","active":{active},"paired":{paired},"quota_left":{quota}}}"#
+                r#"{{"success":true,"url":"{url}","files_count":{count},"save_dir":"{dir_s}","active":{active},"paired":{paired},"quota_left":{quota},"pair_locked":{lock}}}"#
             );
             write_json(&mut sock, &body).await
         }
@@ -745,14 +755,18 @@ async fn handle_conn(
             cfg.store_files_cache(body.clone());
             write_json(&mut sock, &body).await
         }
+        // NOTE: `req.path` is *already* percent-decoded (see `parse_request`).
+        // Decoding it a second time corrupted every name that happens to
+        // contain `%` followed by two hex digits (`50%41.txt` -> `50A.txt`),
+        // which made such files impossible to download or delete.
         ("GET", p) if p.starts_with("/download/") => {
-            match resolve_rel(cfg, &url_decode(&p["/download/".len()..])) {
+            match resolve_rel(cfg, &p["/download/".len()..]) {
                 Some(p) => download(&mut sock, cfg, &p, peer).await,
                 None => write_json_err(&mut sock, "Bad path").await,
             }
         }
         ("DELETE", p) if p.starts_with("/delete/") => {
-            match resolve_rel(cfg, &url_decode(&p["/delete/".len()..])) {
+            match resolve_rel(cfg, &p["/delete/".len()..]) {
                 Some(p) => delete(&mut sock, cfg, &p, peer).await,
                 None => write_json_err(&mut sock, "Bad path").await,
             }
@@ -763,7 +777,8 @@ async fn handle_conn(
         ("POST", "/rename") => rename_path(&mut sock, cfg, &req, &mut pending, peer).await,
         ("POST", "/verify") => verify(&mut sock, cfg, &req, &mut pending).await,
         ("GET", p) if p.starts_with("/zip/") => {
-            match resolve_rel(cfg, &url_decode(&p["/zip/".len()..])) {
+            // `req.path` is already decoded — see the note above.
+            match resolve_rel(cfg, &p["/zip/".len()..]) {
                 Some(p) => zip_dir(&mut sock, cfg, &p, peer).await,
                 None => write_json_err(&mut sock, "Bad path").await,
             }
@@ -794,11 +809,14 @@ async fn pair(
     peer: &str,
     pending: &mut Vec<u8>,
 ) -> Result<(), std::io::Error> {
-    if cfg.pair_locked.load(std::sync::atomic::Ordering::SeqCst) {
+    // Lockout: temporary and self-clearing. The remaining time is part of the
+    // message so the page can tell the user *when* to retry instead of
+    // "restart the program".
+    if let Some(secs) = cfg.pair_lock_left() {
         return write_json_status(
             sock,
             "403 Forbidden",
-            "配对失败次数过多，已锁定，请重启程序",
+            &format!("配对尝试次数过多，{secs} 秒后可重试"),
         )
         .await;
     }
@@ -836,14 +854,22 @@ async fn pair(
 
     let given_code = json.get("code").and_then(|v| v.as_str()).unwrap_or("");
     let given_secret = json.get("secret").and_then(|v| v.as_str()).unwrap_or("");
-    let ok = (!given_code.is_empty() && ct_eq(given_code, &cfg.pair_code))
-        || (!given_secret.is_empty() && ct_eq(given_secret, &cfg.pair_secret));
+    let expected_code = cfg.pair_code();
+    let expected_secret = cfg.pair_secret();
+    let ok = (!given_code.is_empty() && ct_eq(given_code, &expected_code))
+        || (!given_secret.is_empty() && ct_eq(given_secret, &expected_secret));
 
     if !ok {
-        let fails = cfg.pair_failures.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let fails = cfg.note_pair_failure();
         if fails >= crate::config::PAIR_MAX_FAILURES {
-            cfg.pair_locked.store(true, std::sync::atomic::Ordering::SeqCst);
-            eprintln!("pairing locked after {fails} failed attempts");
+            // Tell the client when it may try again (see `pair_lock_left`).
+            let secs = cfg.pair_lock_left().unwrap_or(0);
+            return write_json_status(
+                sock,
+                "401 Unauthorized",
+                &format!("配对码不正确，已锁定 {secs} 秒"),
+            )
+            .await;
         }
         return write_json_status(sock, "401 Unauthorized", "配对码不正确").await;
     }
@@ -923,6 +949,22 @@ impl<S: Conn> tokio::io::AsyncWrite for HeadedStream<S> {
     }
 }
 
+/// Frame/message limits for the note socket.
+///
+/// Without this the socket accepted messages of up to 64 MB (the library
+/// default) and stored them as the shared note — the 4 MB cap that
+/// `POST /note` enforces was trivially bypassed over WebSocket, and the
+/// oversized text was then broadcast to every connected client.
+fn ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+    use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+    let max = crate::config::NOTE_MAX_BYTES + 64 * 1024;
+    WebSocketConfig {
+        max_message_size: Some(max),
+        max_frame_size: Some(max),
+        ..Default::default()
+    }
+}
+
 /// Serve one WebSocket connection: send the current note state, then forward
 /// live note updates from the broadcast channel. Text frames received from
 /// the client act as a "send" action (same as POST /note).
@@ -938,7 +980,7 @@ async fn ws_conn(
         head: head.into_iter(),
         stream: sock,
     };
-    let ws = match tokio_tungstenite::accept_async(headed).await {
+    let ws = match tokio_tungstenite::accept_async_with_config(headed, Some(ws_config())).await {
         Ok(ws) => ws,
         Err(e) => {
             eprintln!("ws handshake failed: {e}");
@@ -973,8 +1015,12 @@ async fn ws_conn(
                     None => break,
                     Some(Err(_)) => break,
                     Some(Ok(WsMsg::Text(t))) => {
-                        // Client-side "send" action.
-                        let _ = cfg.store_note(&t);
+                        // Client-side "send" action. The same 4 MB cap as
+                        // `POST /note`: a frame that big is refused instead of
+                        // being stored and broadcast to everybody.
+                        if t.len() <= crate::config::NOTE_MAX_BYTES {
+                            let _ = cfg.store_note(&t);
+                        }
                     }
                     Some(Ok(WsMsg::Ping(p))) => {
                         let _ = wtx.send(WsMsg::Pong(p)).await;
@@ -1105,7 +1151,7 @@ async fn write_page(
     if let Some(inm) = &req.if_none_match {
         if inm.split(',').any(|t| t.trim() == etag) {
             let head = format!(
-                "HTTP/1.1 304 Not Modified\r\nETag: {etag}\r\nCache-Control: private, max-age=0, must-revalidate\r\n{}Connection: close\r\n\r\n",
+                "HTTP/1.1 304 Not Modified\r\nETag: {etag}\r\nCache-Control: private, max-age=0, must-revalidate\r\nVary: Accept-Encoding\r\n{}Connection: close\r\n\r\n",
                 sec_headers()
             );
             sock.write_all(head.as_bytes()).await?;
@@ -1124,6 +1170,10 @@ async fn write_page(
     out.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
     out.extend_from_slice(format!("ETag: {etag}\r\n").as_bytes());
     out.extend_from_slice(b"Cache-Control: private, max-age=0, must-revalidate\r\n");
+    // The body depends on `Accept-Encoding` (plain vs gzip), so a cache must
+    // key on it as well — otherwise a gzip body can be handed to a client
+    // that never asked for one.
+    out.extend_from_slice(b"Vary: Accept-Encoding\r\n");
     out.extend_from_slice(csp_header().as_bytes());
     out.extend_from_slice(sec_headers().as_bytes());
     out.extend_from_slice(b"Connection: close\r\n\r\n");
@@ -1593,47 +1643,15 @@ async fn verify(
     };
     let arr: Vec<serde_json::Value> = arr.iter().take(VERIFY_CAP).cloned().collect();
 
-    // On-disk inventory, once per request.
-    let dir = cfg.upload_dir();
-    let mut on_disk: std::collections::HashMap<std::path::PathBuf, u64> =
-        std::collections::HashMap::new();
-    let mut cap = 0usize;
-    let mut stack: Vec<(std::path::PathBuf, usize)> = vec![(dir.clone(), 0)];
-    while let Some((d, depth)) = stack.pop() {
-        if depth > MAX_WALK_DEPTH {
-            break;
-        }
-        if let Ok(rd) = std::fs::read_dir(&d) {
-            for e in rd.flatten() {
-                // Skip symlinks: they must not be reachable through the API.
-                match e.file_type() {
-                    Ok(ft) if ft.is_symlink() => continue,
-                    Err(_) => continue,
-                    _ => {}
-                }
-                if e.path().is_dir() {
-                    stack.push((e.path(), depth + 1));
-                } else {
-                    on_disk.insert(
-                        e.path().to_path_buf(),
-                        e.metadata().map(|m| m.len()).unwrap_or(0),
-                    );
-                    cap += 1;
-                    if cap >= VERIFY_CAP {
-                        break;
-                    }
-                }
-            }
-        }
-        if cap >= VERIFY_CAP {
-            break;
-        }
-    }
-
+    // Each entry is checked with a direct `stat` of its own path. The old
+    // code built a full inventory of the transfer directory first and capped
+    // that walk at `VERIFY_CAP`, so a directory with more files than the cap
+    // reported every file beyond it as "missing" — a 30 000-file folder could
+    // never pass verification no matter how often it was re-uploaded.
     let mut results = Vec::with_capacity(arr.len());
     let mut all_ok = true;
     for f in &arr {
-        let item = check_one(cfg, f, &on_disk);
+        let item = check_one(cfg, f);
         if item != "ok" {
             all_ok = false;
         }
@@ -1652,11 +1670,7 @@ async fn verify(
     write_json(sock, &body).await
 }
 
-fn check_one(
-    cfg: &Arc<Config>,
-    f: &serde_json::Value,
-    on_disk: &std::collections::HashMap<std::path::PathBuf, u64>,
-) -> String {
+fn check_one(cfg: &Arc<Config>, f: &serde_json::Value) -> String {
     let path = f.get("path").and_then(|v| v.as_str());
     let size = f.get("size").and_then(|v| v.as_u64());
     let hash = f
@@ -1672,11 +1686,17 @@ fn check_one(
         None => return "bad_path".to_string(),
     };
     let p = cfg.upload_dir().join(&rel);
-    let disk_size = match on_disk.get(&p) {
-        Some(&s) => s,
-        None => return "missing".to_string(),
+    // `symlink_metadata` on purpose: a symlink must not be followed (it can
+    // point outside the transfer directory) and counts as "missing", which is
+    // exactly what the old inventory-based check reported.
+    let meta = match std::fs::symlink_metadata(&p) {
+        Ok(m) => m,
+        Err(_) => return "missing".to_string(),
     };
-    if disk_size != size {
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return "missing".to_string();
+    }
+    if meta.len() != size {
         return "size_mismatch".to_string();
     }
     if let Some(expect) = hash {
@@ -2122,6 +2142,8 @@ async fn upload(
 
     let dir = cfg.upload_dir();
     std::fs::create_dir_all(&dir).ok();
+    // 配额不是启动时的一次性快照：先按当前剩余空间收一次（只收缩不放大）。
+    cfg.clamp_quota_to_disk();
     let _active = ActiveGuard::new(cfg);
 
     // Concurrency cap: a single device (or a script) must not be able to
@@ -2906,9 +2928,15 @@ mod tests {
         use std::io::BufReader;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        // A certificate that is valid for 127.0.0.1.
-        let material = crate::tls::load_or_create(&["127.0.0.1".to_string()])
-            .expect("certificate");
+        // A certificate that is valid for 127.0.0.1. Written to a temp dir so
+        // the test neither pollutes `target/` nor picks up a stale cert.
+        let cert_dir = std::env::temp_dir().join(format!("transdata_tls_{}", std::process::id()));
+        std::fs::create_dir_all(&cert_dir).ok();
+        let material = crate::tls::load_or_create_in(
+            &["127.0.0.1".to_string()],
+            std::slice::from_ref(&cert_dir),
+        )
+        .expect("certificate");
         assert!(material.fingerprint.contains(':'), "fingerprint looks wrong");
 
         // Client that trusts exactly this certificate.
@@ -2929,7 +2957,12 @@ mod tests {
             TEST_SECRET.to_string(),
             TEST_CODE.to_string(),
         );
-        raw.port = 19876;
+        // 端口由系统分配：硬编码端口在并行测试或本机刚好占用时会 flaky。
+        let port = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        raw.port = port;
         let cfg = Arc::new(raw);
         cfg.set_tls_material(material);
         cfg.set_tls(true);
@@ -2941,16 +2974,16 @@ mod tests {
 
         // 1) plain HTTP on the TLS port -> the "please use https" page
         let plain = super::folder_tests::http_text(
-            19876,
+            port,
             "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
         )
         .await;
         assert!(plain.contains("HTTPS"), "expected a hint page, got: {plain}");
         assert!(plain.contains("https://"), "the page must show the https URL");
-        assert!(plain.contains(":19876"), "the page must show the port");
+        assert!(plain.contains(&format!(":{port}")), "the page must show the port");
 
         // 2) a real TLS request works and is still protected by the token
-        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", 19876)).await.unwrap();
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         let name = rustls::pki_types::ServerName::IpAddress(
             std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST).into(),
         );
@@ -2973,7 +3006,7 @@ mod tests {
         assert!(text.contains("401"), "unauthenticated TLS request: {text}");
 
         // With the secret: allowed.
-        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", 19876)).await.unwrap();
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         let name = rustls::pki_types::ServerName::IpAddress(
             std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST).into(),
         );
@@ -2994,6 +3027,12 @@ mod tests {
         let text = String::from_utf8_lossy(&out).to_string();
         assert!(text.contains("200 OK"), "got: {text}");
         assert!(text.contains("\"success\":true"), "got: {text}");
+        // A2：HTTPS 模式下 /info 必须报 https 地址，否则手机上「复制地址」
+        // 复制到的是一个打不开的 http 链接。
+        assert!(
+            text.contains("\"url\":\"https://"),
+            "HTTPS 模式下 /info 应该给 https 地址: {text}"
+        );
     }
 
     /// The whole browser flow in one go: pair -> get the app page -> upload
@@ -3323,7 +3362,7 @@ mod folder_tests {
     /// A server that accepts any number of sequential connections.
     /// Each test must pass a unique `name` — parallel tests share the pid,
     /// and the temp dir is wiped at setup.
-    async fn setup(name: &str, files: &[(&str, &[u8])]) -> (u16, std::path::PathBuf) {
+    pub(super) async fn setup(name: &str, files: &[(&str, &[u8])]) -> (u16, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!(
             "transdata_folder_{}_{}",
             std::process::id(),
@@ -3670,5 +3709,246 @@ mod folder_tests {
         let resp = http_text(port, "GET /files HTTP/1.1\r\nHost: t\r\nX-TD-Secret: test-secret\r\n\r\n")
             .await;
         assert!(resp.contains("\"success\":true"), "resp: {resp}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 回归测试：2026-10-28 review 修掉的缺陷
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod review_fix_tests {
+    use super::folder_tests::{http_bytes, http_text, setup};
+    use super::*;
+    use crate::config::Config;
+
+    /// A3：文件名里的 `%41` 不能被当成转义**再解一次**。
+    ///
+    /// 客户端把 `50%41.txt` 编码成 `50%2541.txt`；服务端解码一次得到
+    /// `50%41.txt`（正确）。以前 handler 又解了一次，变成 `50A.txt`，
+    /// 于是这个文件能列出来、却下不了、删不掉、也打不进 zip。
+    #[tokio::test]
+    async fn percent_in_filename_roundtrips() {
+        let (port, dir) = setup("percent_name", &[("50%41.txt", b"hello")]).await;
+        let auth = "X-TD-Secret: test-secret\r\n";
+
+        let list = http_text(
+            port,
+            &format!("GET /files HTTP/1.1\r\nHost: t\r\n{auth}\r\n"),
+        )
+        .await;
+        assert!(list.contains("50%41.txt"), "列表里应该有它: {list}");
+
+        let dl = http_text(
+            port,
+            &format!("GET /download/50%2541.txt HTTP/1.1\r\nHost: t\r\n{auth}\r\n"),
+        )
+        .await;
+        assert!(dl.starts_with("HTTP/1.1 200 OK"), "下载应该成功: {dl}");
+        assert!(dl.ends_with("hello"), "内容应该原样返回: {dl}");
+
+        let del = http_text(
+            port,
+            &format!("DELETE /delete/50%2541.txt HTTP/1.1\r\nHost: t\r\n{auth}\r\n"),
+        )
+        .await;
+        assert!(del.contains("\"success\":true"), "删除应该成功: {del}");
+        assert!(!dir.join("50%41.txt").exists(), "文件应该真的没了");
+    }
+
+    /// A3 边界：编码过的斜杠解码后就是子目录分隔符，不能变成穿越。
+    #[tokio::test]
+    async fn encoded_slash_cannot_escape() {
+        let (port, dir) = setup("enc_slash", &[]).await;
+        std::fs::write(dir.join("secret.txt"), b"top").ok();
+        let resp = http_text(
+            port,
+            "GET /download/..%2F..%2Fsecret.txt HTTP/1.1\r\nHost: t\r\nX-TD-Secret: test-secret\r\n\r\n",
+        )
+        .await;
+        assert!(
+            resp.contains("404") || resp.contains("400"),
+            "穿越必须被拒: {resp}"
+        );
+    }
+
+    /// A2：`/info` 的地址必须跟当前协议一致（HTTPS 下给 http 地址，
+    /// 手机上「复制地址」就复制到一个打不开的页面）。
+    #[tokio::test]
+    async fn info_reports_http_scheme_when_plain() {
+        let (port, _dir) = setup("info_scheme", &[]).await;
+        let resp = http_text(
+            port,
+            "GET /info HTTP/1.1\r\nHost: t\r\nX-TD-Secret: test-secret\r\n\r\n",
+        )
+        .await;
+        assert!(resp.contains("\"url\":\"http://"), "resp: {resp}");
+        // 顺带：桌面端要能看到配对锁状态
+        assert!(resp.contains("\"pair_locked\":0"), "resp: {resp}");
+    }
+
+    /// B6：页面正文随 `Accept-Encoding` 变，就必须带 `Vary`（200 和 304 都要）。
+    #[tokio::test]
+    async fn page_has_vary_accept_encoding() {
+        let (port, _dir) = setup("vary", &[]).await;
+        let page = http_text(port, "GET / HTTP/1.1\r\nHost: t\r\n\r\n").await;
+        assert!(page.contains("Vary: Accept-Encoding"), "200 缺 Vary: {page}");
+
+        // 拿到 ETag 后再发一次带 If-None-Match 的请求，应当 304 且同样带 Vary
+        let etag = page
+            .lines()
+            .find_map(|l| l.strip_prefix("ETag: "))
+            .expect("ETag")
+            .trim()
+            .to_string();
+        let not_modified = http_text(
+            port,
+            &format!(
+                "GET / HTTP/1.1\r\nHost: t\r\nIf-None-Match: {etag}\r\n\r\n"
+            ),
+        )
+        .await;
+        assert!(not_modified.contains("304"), "resp: {not_modified}");
+        assert!(
+            not_modified.contains("Vary: Accept-Encoding"),
+            "304 缺 Vary: {not_modified}"
+        );
+    }
+
+    /// B2：输错达到上限后进入**冷却**，而不是永久锁死；到点自动恢复。
+    #[tokio::test]
+    async fn pair_lockout_cools_down() {
+        let cfg = Config::with_secret(TEST_SECRET.to_string(), TEST_CODE.to_string());
+        for _ in 0..crate::config::PAIR_MAX_FAILURES {
+            cfg.note_pair_failure();
+        }
+        let left = cfg.pair_lock_left().expect("达到上限后应该处于锁定状态");
+        assert!(left > 0 && left <= crate::config::PAIR_COOLDOWN.as_secs());
+
+        // 把到期时间拨到过去，模拟冷却结束
+        *cfg.pair_locked_until.lock().unwrap() = Some(
+            std::time::Instant::now() - std::time::Duration::from_secs(1),
+        );
+        assert!(cfg.pair_lock_left().is_none(), "冷却结束后必须自动解锁");
+    }
+
+    /// B2：设置面板的「重新生成配对码」要换掉码和密钥，并立刻解锁。
+    #[tokio::test]
+    async fn reset_pairing_rotates_and_unlocks() {
+        let cfg = Config::with_secret(TEST_SECRET.to_string(), TEST_CODE.to_string());
+        for _ in 0..crate::config::PAIR_MAX_FAILURES {
+            cfg.note_pair_failure();
+        }
+        assert!(cfg.pair_lock_left().is_some());
+
+        let (code, secret) = cfg.reset_pairing();
+        assert_ne!(code, TEST_CODE);
+        assert_eq!(code.len(), 8);
+        assert_ne!(secret, TEST_SECRET);
+        assert_eq!(cfg.pair_code(), code);
+        assert_eq!(cfg.pair_secret(), secret);
+        assert!(cfg.pair_lock_left().is_none(), "换码后必须立刻可用");
+    }
+
+    /// B1：WebSocket 便签必须和 `POST /note` 一样受 4 MB 上限约束。
+    #[tokio::test]
+    async fn websocket_note_is_size_limited() {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        use tokio_tungstenite::tungstenite::http::HeaderValue;
+        use tokio_tungstenite::tungstenite::Message as WsMsg;
+
+        let cfg = Arc::new(Config::with_secret(
+            TEST_SECRET.to_string(),
+            TEST_CODE.to_string(),
+        ));
+        let dir = std::env::temp_dir().join(format!("transdata_ws_size_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        cfg.set_upload_dir(dir);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let cfg2 = cfg.clone();
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                let c = cfg2.clone();
+                tokio::spawn(async move {
+                    let _ = handle_conn(sock, &c, "127.0.0.1").await;
+                });
+            }
+        });
+
+        let mut req = format!("ws://127.0.0.1:{port}/ws")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut()
+            .insert("X-TD-Secret", HeaderValue::from_str(TEST_SECRET).unwrap());
+        let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+
+        // 正常大小的便签：应该被接受
+        ws.send(WsMsg::Text("small note".into())).await.unwrap();
+        for _ in 0..50 {
+            if cfg.read_note().0.as_str() == "small note" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(cfg.read_note().0.as_str(), "small note");
+
+        // 超过 4 MB：必须被拒（连接会被库按 max_message_size 断掉，或者被
+        // 我们的长度检查丢弃），总之便签内容不能变成那坨大文本。
+        let big = "x".repeat(crate::config::NOTE_MAX_BYTES + 1024);
+        let _ = ws.send(WsMsg::Text(big.into())).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            cfg.read_note().0.as_str(),
+            "small note",
+            "超限内容不能覆盖便签"
+        );
+    }
+
+    /// A4：`/verify` 不再受「目录里文件总数」影响 —— 这条用例要造 2 万+ 文件，
+    /// 默认不跑（`cargo test -- --ignored`）。
+    #[tokio::test]
+    #[ignore]
+    async fn verify_handles_more_files_than_the_old_cap() {
+        let (port, dir) = setup("verify_many", &[]).await;
+        let n = crate::http::server::VERIFY_CAP + 500;
+        for i in 0..n {
+            let d = dir.join(format!("d{}", i % 100));
+            std::fs::create_dir_all(&d).ok();
+            std::fs::write(d.join(format!("f{i}.bin")), b"x").ok();
+        }
+        // 清单里只挑最后 100 个（旧的「先扫全目录再比对」实现会漏掉它们）
+        let mut entries = Vec::new();
+        for i in (n - 100)..n {
+            entries.push(format!(
+                r#"{{"path":"d{}/f{i}.bin","size":1}}"#,
+                i % 100
+            ));
+        }
+        let body = format!(r#"{{"files":[{}]}}"#, entries.join(","));
+        let req = format!(
+            "POST /verify HTTP/1.1\r\nHost: t\r\nX-TD-Secret: test-secret\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let resp = http_text(port, &req).await;
+        assert!(resp.contains("\"all_ok\":true"), "resp: {}", &resp[..resp.len().min(400)]);
+    }
+
+    /// 上传进度用的 `%` 编码路径之外，普通中文/空格文件名也要能下载。
+    #[tokio::test]
+    async fn unicode_filename_downloads() {
+        let (port, _dir) = setup("unicode_name", &[("中文 文件.txt", b"ok")]).await;
+        let encoded = "%E4%B8%AD%E6%96%87%20%E6%96%87%E4%BB%B6.txt";
+        let resp = http_bytes(
+            port,
+            &format!(
+                "GET /download/{encoded} HTTP/1.1\r\nHost: t\r\nX-TD-Secret: test-secret\r\n\r\n"
+            ),
+        )
+        .await;
+        let text = String::from_utf8_lossy(&resp);
+        assert!(text.starts_with("HTTP/1.1 200 OK"), "{text}");
+        assert!(text.ends_with("ok"), "{text}");
     }
 }

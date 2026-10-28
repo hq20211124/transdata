@@ -1,6 +1,20 @@
 pub const INDEX_HTML: &str = include_str!("../web/index.html");
 pub const APP_CSS: &str = include_str!("../web/app.css");
+/// Pure logic, no DOM. Also loaded by `web/test/logic.test.js` under node.
+pub const LOGIC_JS: &str = include_str!("../web/logic.js");
+/// The UI itself (DOM wiring).
 pub const APP_JS: &str = include_str!("../web/app.js");
+
+/// The script the browser actually downloads: `logic.js` + `app.js`
+/// concatenated **at compile time**.
+///
+/// Splitting the pure functions out lets node unit-test them (that is how the
+/// "× removes the wrong row" class of bug gets caught), while the wire format
+/// stays a single `/app.js` request — no extra round trip, no size change.
+pub fn app_js() -> &'static str {
+    static JS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    JS.get_or_init(|| format!("{LOGIC_JS}\n{APP_JS}"))
+}
 
 /// Placeholder in `web/index.html` that is replaced with the page mode:
 /// `app` (already paired) or `pair` (needs a pairing code).
@@ -33,7 +47,7 @@ pub fn asset_version() -> &'static str {
     }
     let mut h = hash(FNV_OFFSET, APP_CSS.as_bytes());
     h = hash(h, b"\0");
-    h = hash(h, APP_JS.as_bytes());
+    h = hash(h, app_js().as_bytes());
     // Stash it in a static so we can hand out a &'static str.
     static VERSION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     VERSION.get_or_init(|| format!("{:016x}", h))
