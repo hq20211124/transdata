@@ -887,3 +887,25 @@ README 补两节（管理端目录 / 设备授权）。
 - 便签仍是 last-writer-wins
 - 设备详情里的「本次 N 分钟」是活动日志里最早一条到现在，不是真实会话建立时间
   （`Session` 只存最后一次活动时间，没存 `since`）——够用，不额外加字段
+
+---
+
+## 执行记录（2026-10-29）：管理端易用性修补 + 便签展开编辑
+
+版本仍是 1.3.0（纯 UI 修补，不加开关、不改接口），`cargo test` 68 passed / 0 failed / 5 ignored。
+
+| 项 | 结果 |
+|---|---|
+| 中栏连接卡 | `connect_card` 返回内容底边，设备表从「底边 + 间距」开始；HTTPS 关闭时开关下方不再留固定空白，省出的高度全给设备表（最小 120） |
+| 左栏目录名 | 不再 `elide()` 截断：按列宽排版 + `break_anywhere` 换行，行高随内容（最小 30），完整标题一定看得见 |
+| 左栏工具栏 | 路径框吃掉按钮之外的全部宽度，刷新/打开/更改始终贴右；窗口变宽只把空间给路径 |
+| 目录默认折叠 | `known_dirs` 只给第一次出现的目录补一笔折叠；用户手动展开过的不会被下一次快照折回去 |
+| 便签输入框 | `ScrollArea` 把 `min_scrolled_height` 压到 24 + 收起态 `auto_shrink`，修掉输入框被 egui 默认 64pt 最小高度撑出卡片的问题；收起 2 行、超过两行才滚动 |
+| 便签展开 | 右上角自绘四角箭头：展开时三栏让位、编辑器铺满内容区；点正文空白也能聚焦；展开/收起共用固定 TextEdit id，光标和选区延续；展开时取消未提交的行内改名（保留原名，不误提交） |
+| 便签状态行 | 状态统一走 `set_note_status`，10 秒自动消失（`request_repaint_after` 保证闲着也会到点重绘）；内容区 ≥600px 时便签条 88px 带状态行，矮窗保持 76px，不挤中栏 |
+| Esc | 这轮不动：现有三处各自独立读取且不消费，留到单独一轮统一收口 |
+
+**验证**
+- 新增用例：`new_dirs_start_collapsed`、`note_strip_height_depends_on_panel_height`、`note_status_expires`、`expanding_note_cancels_pending_rename`、`note_expand_icon_can_be_clicked`
+- 无头出图：`target/gui_note_expanded.png`（1200×760 展开态）、`target/gui_manage_1200x760.png`、`target/gui_manage_700x470.png` 人工核对
+- release 重建并覆盖部署到 `C:\TransData`，部署文件与 `target/release/transdata.exe` md5 一致（`87d5434a…`）

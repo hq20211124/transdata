@@ -31,6 +31,12 @@ const ACT_ROW_H: f32 = 26.0;
 const RENDER_CAP: usize = 500;
 /// 便签条高度（两行输入 + 按钮）
 const NOTE_STRIP_H: f32 = 76.0;
+/// 带一行状态提示时的便签条高度（输入 44 + 间隔 6 + 状态 14 + 上下边距 20）
+const NOTE_STRIP_H_STATUS: f32 = 88.0;
+/// 内容区矮于这个高度就不给便签条加状态行，免得中栏被挤到重叠
+const NOTE_STATUS_MIN_H: f32 = 600.0;
+/// 便签提示自动消失的时间
+const NOTE_STATUS_TTL: std::time::Duration = std::time::Duration::from_secs(10);
 /// 自绘标题栏的高度（原来这块是系统标题栏，深色模式下是一条黑边）
 const TITLEBAR_H: f32 = 42.0;
 
@@ -699,6 +705,12 @@ struct GuiApp {
     shape_size: (i32, i32),
     /// 快捷文本输入框当前是否有焦点（决定边框颜色，避免 egui 默认的黑框）
     note_focused: bool,
+    /// 便签是否铺满内容区（只存内存，重启回到收起态）
+    note_expanded: bool,
+    /// 便签提示是什么时候写的（10 秒后自动消失）
+    note_status_at: Option<std::time::Instant>,
+    /// 便签提示是不是警示（远端覆盖本地草稿）
+    note_status_warn: bool,
     /// 服务器已经挂了（弹过窗了，别重复弹）
     server_dead_reported: bool,
     /// Cached `ipconfig` result — fetched once at startup and only when the
@@ -733,8 +745,10 @@ struct GuiApp {
     files: crate::ops::Snapshot,
     /// 是否正在等第一次列表（工具栏显示「正在读取…」）
     files_loading: bool,
-    /// 折叠的目录（只在内存里，重启清空）
+    /// 折叠的目录（只在内存里，重启清空；新出现的目录默认折叠）
     collapsed: std::collections::HashSet<String>,
+    /// 已经见过的目录（判断哪些是新目录，好让它们默认折叠）
+    known_dirs: std::collections::HashSet<String>,
     /// 选中的条目（相对路径）
     selected: Option<String>,
     /// 正在改名的那一行：路径 + 编辑中的文字
@@ -817,6 +831,9 @@ impl GuiApp {
             maximized: false,
             pair_msg: String::new(),
             note_focused: false,
+            note_expanded: false,
+            note_status_at: None,
+            note_status_warn: false,
             server_dead_reported: false,
             #[cfg(windows)]
             hwnd,
@@ -837,6 +854,7 @@ impl GuiApp {
             files: crate::ops::Snapshot::default(),
             files_loading: true,
             collapsed: std::collections::HashSet::new(),
+            known_dirs: std::collections::HashSet::new(),
             selected: None,
             renaming: None,
             rename_fresh: false,
@@ -1602,6 +1620,32 @@ impl App for GuiApp {
 }
 
 impl GuiApp {
+    /// 记一条便签提示（10 秒后自动消失；warn 用警示色）。
+    fn set_note_status(&mut self, msg: &str, warn: bool) {
+        self.note_status = msg.to_string();
+        self.note_status_at = Some(std::time::Instant::now());
+        self.note_status_warn = warn;
+    }
+
+    /// 还应该显示的便签提示（过期就返回 None）。
+    fn note_status_live(&self) -> Option<&str> {
+        let at = self.note_status_at?;
+        if at.elapsed() < NOTE_STATUS_TTL {
+            Some(self.note_status.as_str())
+        } else {
+            None
+        }
+    }
+
+    /// 展开/收起便签。展开等于离开列表，顺手把没提交的改名取消掉。
+    fn set_note_expanded(&mut self, on: bool) {
+        self.note_expanded = on;
+        if on {
+            self.renaming = None;
+            self.rename_fresh = false;
+        }
+    }
+
     /// Build one frame of the window. Kept separate from `App::update` so
     /// the layout can be rendered headlessly in a test.
     fn draw(&mut self, ctx: &eframe::egui::Context) {
@@ -1667,11 +1711,11 @@ impl GuiApp {
             self.note_last_v = shared_v;
             self.note_local = None;
             self.text_buf = shared_text.as_ref().clone();
-            self.note_status = if had_unsent {
-                "已收到对方内容，本地未发送的改动被覆盖".to_string()
+            if had_unsent {
+                self.set_note_status("已收到对方内容，本地未发送的改动被覆盖", true);
             } else {
-                "已收到对方内容".to_string()
-            };
+                self.set_note_status("已收到对方内容", false);
+            }
         } else if self.text_buf.is_empty() && self.note_local.is_none() {
             // First frame: show whatever the server already has.
             self.text_buf = shared_text.as_ref().clone();
@@ -1682,6 +1726,13 @@ impl GuiApp {
 
         self.draw_workspace(ctx);
 
+        // 便签提示 10 秒后自动消失：窗口闲着也要能到点重绘，否则它会一直挂着
+        if let Some(at) = self.note_status_at {
+            let left = NOTE_STATUS_TTL.saturating_sub(at.elapsed());
+            if !left.is_zero() {
+                ctx.request_repaint_after(left);
+            }
+        }
 
         if refresh_now {
             // Only schedule a follow-up repaint when the display actually
@@ -2186,11 +2237,19 @@ fn choose_dir() -> Option<PathBuf> {
 //
 // 另外自定义 layouter，允许在任意字符间断行（否则一整段没空格的长文本
 // 会把左右两侧挤爆）。
+/// 便签编辑器的固定 id：收起/展开切换后光标、选区还能续上。
+fn note_editor_id() -> eframe::egui::Id {
+    eframe::egui::Id::new("td_note_editor")
+}
+
+/// `fill`：展开态用，输入框铺满可用高度；`right_inset`：右上角图标预留的宽度。
 fn note_text_edit(
     ui: &mut eframe::egui::Ui,
     text: &mut String,
     max_height: f32,
     focused: &mut bool,
+    fill: bool,
+    right_inset: f32,
 ) -> eframe::egui::Response {
     let font_id = eframe::egui::TextStyle::Body.resolve(ui.style());
     let mut layouter = |ui: &eframe::egui::Ui, t: &str, wrap_width: f32| {
@@ -2215,19 +2274,42 @@ fn note_text_edit(
         .fill(pal::now().soft_bg)
         .rounding(10.0)
         .stroke(eframe::egui::Stroke::new(1.0_f32, border))
-        .inner_margin(eframe::egui::Margin::symmetric(10.0, 8.0))
+        .inner_margin(eframe::egui::Margin::symmetric(10.0, 4.0))
         .show(ui, |ui| {
             eframe::egui::ScrollArea::vertical()
-                .id_source("note_text_edit_scroll")
+                // 两种形态分开记滚动位置：展开时不会继承便签条的小滚动偏移
+                .id_source(if fill {
+                    "note_scroll_full"
+                } else {
+                    "note_scroll_small"
+                })
                 .max_height(max_height)
-                // 高度固定：内容再长也不把下面的按钮顶走
-                .auto_shrink([false, false])
+                // ScrollArea 默认要求内容区至少 64pt 高（min_scrolled_size），
+                // 不压下去的话整个输入框会比便签条还高、穿出卡片底部
+                .min_scrolled_height(24.0)
+                // 收起：按内容收缩；展开：铺满给定高度
+                .auto_shrink([false, !fill])
                 .show(ui, |ui| {
+                    if fill {
+                        // 先铺一层背景交互，后面的 TextEdit 会盖在它上面：
+                        // 点正文空白也能直接聚焦，不用非得点中文字
+                        let bg = ui.available_rect_before_wrap();
+                        let bg_resp = ui.interact(
+                            bg,
+                            eframe::egui::Id::new("td_note_body"),
+                            eframe::egui::Sense::click(),
+                        );
+                        if bg_resp.clicked() {
+                            ui.ctx()
+                                .memory_mut(|m| m.request_focus(note_editor_id()));
+                        }
+                    }
                     let r = ui.add(
                         eframe::egui::TextEdit::multiline(text)
+                            .id(note_editor_id())
                             .frame(false)
-                            .desired_width(ui.available_width().max(80.0))
-                            .desired_rows(4)
+                            .desired_width((ui.available_width() - right_inset).max(80.0))
+                            .desired_rows(if fill { 8 } else { 2 })
                             .layouter(&mut layouter),
                     );
                     *focused = r.has_focus();
@@ -2788,7 +2870,7 @@ mod tests {
                     |ui| {
                         let mut focused = false;
                         let resp = if fixed {
-                            note_text_edit(ui, &mut text, 120.0, &mut focused)
+                            note_text_edit(ui, &mut text, 120.0, &mut focused, false, 0.0)
                         } else {
                             // 旧写法：TextEdit 直接放在布局流里，高度随文本无限增长
                             ui.add(
@@ -2869,6 +2951,74 @@ mod tests {
         assert!(names.contains(&"归档"));
     }
 
+    /// 新目录默认折叠；用户展开过的不再被折回去，之后新增的目录仍然默认折叠。
+    #[test]
+    fn new_dirs_start_collapsed() {
+        let snap = fake_snapshot();
+        let mut known = std::collections::HashSet::new();
+        let mut collapsed = std::collections::HashSet::new();
+        super::workspace::fold_new_dirs(&snap, &mut known, &mut collapsed);
+        assert!(collapsed.contains("归档") && collapsed.contains("备份"));
+        assert!(!collapsed.contains("会议记录.txt"), "文件不参与折叠");
+
+        // 用户展开「归档」
+        collapsed.remove("归档");
+        super::workspace::fold_new_dirs(&snap, &mut known, &mut collapsed);
+        assert!(!collapsed.contains("归档"), "展开过的目录不能被折回去");
+
+        // 之后新增的目录仍然默认折叠
+        let mut snap2 = fake_snapshot();
+        snap2.entries.push(crate::ops::Entry {
+            rel: "新目录".to_string(),
+            is_dir: true,
+            size: 0,
+            mtime: 0,
+        });
+        super::workspace::fold_new_dirs(&snap2, &mut known, &mut collapsed);
+        assert!(collapsed.contains("新目录"));
+    }
+
+    /// 矮窗不给状态行留高度（免得分栏被挤重叠），够高才用 88px 的便签条。
+    #[test]
+    fn note_strip_height_depends_on_panel_height() {
+        assert_eq!(
+            super::workspace::note_strip_height(NOTE_STATUS_MIN_H - 1.0),
+            NOTE_STRIP_H
+        );
+        assert_eq!(
+            super::workspace::note_strip_height(NOTE_STATUS_MIN_H),
+            NOTE_STRIP_H_STATUS
+        );
+    }
+
+    /// 便签提示 10 秒后自动消失。
+    #[test]
+    fn note_status_expires() {
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        app.set_note_status("已复制到剪贴板", false);
+        assert_eq!(app.note_status_live(), Some("已复制到剪贴板"));
+        app.note_status_at = Some(
+            std::time::Instant::now() - NOTE_STATUS_TTL - std::time::Duration::from_secs(1),
+        );
+        assert!(app.note_status_live().is_none());
+    }
+
+    /// 展开便签时把没提交的行内改名取消掉（保留原名）。
+    #[test]
+    fn expanding_note_cancels_pending_rename() {
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        app.renaming = Some(("归档/2026-10 报告.pdf".to_string(), "新名字".to_string()));
+        app.rename_fresh = true;
+        app.set_note_expanded(true);
+        assert!(app.note_expanded);
+        assert!(app.renaming.is_none(), "展开后不该留着改名框");
+        assert!(!app.rename_fresh);
+        app.set_note_expanded(false);
+        assert!(!app.note_expanded);
+    }
+
     /// 1200×760 三栏能画出来（出图人工核对）；700×470 走抽屉降级。
     #[test]
     fn management_view_renders_and_narrow_uses_drawer() {
@@ -2902,6 +3052,17 @@ mod tests {
         app.detail_ip = Some("192.168.1.23".to_string());
         render_png_size(&ctx, &mut app, "target/gui_manage_1200x760.png", 1200.0, 760.0);
         assert!(std::path::Path::new("target/gui_manage_1200x760.png").exists());
+
+        // 便签铺开：三栏让位，编辑器占满内容区（出图人工核对）
+        app.set_note_expanded(true);
+        app.text_buf = "这是一段用来检查展开态排版的长文本。".repeat(12);
+        app.set_note_status("已发送，另一端将自动填入", false);
+        render_png_size(&ctx, &mut app, "target/gui_note_expanded.png", 1200.0, 760.0);
+        assert!(std::path::Path::new("target/gui_note_expanded.png").exists());
+        app.set_note_expanded(false);
+        app.text_buf.clear();
+        app.note_status_at = None;
+        app.note_status.clear();
 
         // 窄窗口：右两栏收起，标题栏出现「设备 (n)」，点一下开抽屉
         let (w, h) = (700.0_f32, 470.0_f32);

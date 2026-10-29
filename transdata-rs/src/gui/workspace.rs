@@ -1,7 +1,7 @@
 // ---------------------------------------------------------------------------
 // v1.3 管理端：一屏三栏
 //
-//   左｜目录（文件树，行高 30）  中｜连接 + 设备（296）  右｜设备操作详情（336）
+//   左｜目录（文件树，行高 30 起，长名字换行不截断）  中｜连接 + 设备（296）  右｜设备操作详情（336）
 //   底｜便签条（76）
 //
 // 这里只是「怎么画」。所有动文件的事都走 `crate::ops`，和网页端排同一把锁。
@@ -72,6 +72,22 @@ pub(super) fn build_rows(
     let mut out = Vec::new();
     walk("", 0, &kids, collapsed, &mut out);
     out
+}
+
+/// 第一次见到的文件夹默认折叠。
+///
+/// `known` 记住出现过的目录，`collapsed` 只在新目录上补一笔：用户手动展开过
+/// 的目录不会因为下一次快照又被折回去。
+pub(super) fn fold_new_dirs(
+    snap: &crate::ops::Snapshot,
+    known: &mut std::collections::HashSet<String>,
+    collapsed: &mut std::collections::HashSet<String>,
+) {
+    for e in &snap.entries {
+        if e.is_dir && known.insert(e.rel.clone()) {
+            collapsed.insert(e.rel.clone());
+        }
+    }
 }
 
 /// Unix 秒 → 本地时间 `MM-DD HH:MM`。
@@ -198,6 +214,8 @@ impl GuiApp {
     pub(super) fn draw_workspace(&mut self, ctx: &eframe::egui::Context) {
         // 后台线程送来的目录快照（可能一次收到好几份，只留最新的）
         while let Ok(snap) = self.files_rx.try_recv() {
+            // 新出现的文件夹默认折叠（用户展开过的不会被重新折回去）
+            fold_new_dirs(&snap, &mut self.known_dirs, &mut self.collapsed);
             self.files = snap;
             self.files_loading = false;
         }
@@ -229,13 +247,22 @@ impl GuiApp {
             )
             .show(ctx, |ui| {
                 let panel = ui.available_rect_before_wrap();
+
+                // 展开态：三栏让位，便签铺满整个内容区
+                if self.note_expanded {
+                    self.note_panel(ui, panel, ctx, true, false);
+                    return;
+                }
+
+                let note_h = note_strip_height(panel.height());
+                let with_status = note_h > NOTE_STRIP_H;
                 let note_rect = eframe::egui::Rect::from_min_max(
-                    eframe::egui::pos2(panel.left(), panel.bottom() - NOTE_STRIP_H),
+                    eframe::egui::pos2(panel.left(), panel.bottom() - note_h),
                     panel.max,
                 );
                 let main_rect = eframe::egui::Rect::from_min_max(
                     panel.min,
-                    eframe::egui::pos2(panel.right(), panel.bottom() - NOTE_STRIP_H - COL_GAP),
+                    eframe::egui::pos2(panel.right(), panel.bottom() - note_h - COL_GAP),
                 );
                 let wide = panel.width() >= WIDE_MIN_W;
 
@@ -272,11 +299,11 @@ impl GuiApp {
                     self.connect_panel(ui, mid, ctx);
                 }
 
-                self.note_strip(ui, note_rect, ctx);
+                self.note_panel(ui, note_rect, ctx, false, with_status);
             });
 
-        // 窄窗的详情抽屉
-        if self.drawer_open && ctx.screen_rect().width() < WIDE_MIN_W {
+        // 窄窗的详情抽屉（便签铺开时不画，免得盖在编辑区上）
+        if !self.note_expanded && self.drawer_open && ctx.screen_rect().width() < WIDE_MIN_W {
             let mut open = true;
             eframe::egui::Window::new("设备操作详情")
                 .open(&mut open)
@@ -321,17 +348,20 @@ impl GuiApp {
             ui.allocate_ui_at_rect(tool, |ui| {
                 ui.horizontal_centered(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
-                    // 路径框（等宽字体，超长省略）
+                    // 路径框（等宽字体，超长省略）：吃掉按钮之外的全部宽度，
+                    // 窗口变宽就给目录名更多空间，三个按钮始终贴在右边
                     let dir = self.cfg.upload_dir().to_string_lossy().to_string();
                     let font = eframe::egui::FontId::monospace(12.0);
-                    let btn_w = 180.0;
-                    let w = (ui.available_width() - btn_w).max(60.0);
+                    let btn_w = 50.0 + 60.0 + 50.0;
+                    let gaps = 6.0 * 3.0;
+                    let w = (ui.available_width() - btn_w - gaps).max(60.0);
                     let shown = elide(ctx, &dir, font.clone(), w - 16.0);
                     eframe::egui::Frame::none()
                         .fill(pal::now().soft_bg)
                         .rounding(7.0)
                         .inner_margin(eframe::egui::Margin::symmetric(8.0, 5.0))
                         .show(ui, |ui| {
+                            ui.set_width((w - 16.0).max(20.0));
                             ui.label(RichText::new(shown).font(font).color(pal::now().soft_fg));
                         });
                     if btn_soft(ui, "刷新", 11.0, 24.0, 50.0) {
@@ -436,12 +466,47 @@ impl GuiApp {
 
     fn dir_row(&mut self, ui: &mut eframe::egui::Ui, row: &Row, ctx: &eframe::egui::Context) {
         let w = ui.available_width().max(120.0);
+        let indent = row.depth as f32 * 14.0;
+        let font = eframe::egui::FontId::proportional(12.5);
+        let pal = pal::now();
+        let name_color = if row.is_dir { pal.fg } else { pal.soft_fg };
+        let renaming_this = self
+            .renaming
+            .as_ref()
+            .map(|(rel, _)| rel == &row.rel)
+            .unwrap_or(false);
+
+        // 名字按列宽排版：宁可换行也不截断（完整标题必须看得见），行高跟着变
+        let name_w = {
+            let probe = eframe::egui::Rect::from_min_size(
+                eframe::egui::pos2(0.0, 0.0),
+                eframe::egui::vec2(w, 1.0),
+            );
+            let c = dir_columns(probe);
+            (c.1.left() - (c.0.left() + indent + 27.0) - 8.0).max(40.0)
+        };
+        let galley = if renaming_this {
+            None
+        } else {
+            let mut job = eframe::egui::text::LayoutJob::simple(
+                row.name.clone(),
+                font.clone(),
+                name_color,
+                name_w,
+            );
+            job.wrap.break_anywhere = true; // 中文/无空格的长名字也能断行
+            Some(ui.fonts(|f| f.layout_job(job)))
+        };
+        let row_h = galley
+            .as_ref()
+            .map(|g| (g.rect.height() + 10.0).max(ROW_H))
+            .unwrap_or(ROW_H);
+
         let (rect, resp) =
-            ui.allocate_exact_size(eframe::egui::vec2(w, ROW_H), eframe::egui::Sense::click());
+            ui.allocate_exact_size(eframe::egui::vec2(w, row_h), eframe::egui::Sense::click());
         if !ui.is_rect_visible(rect) {
             return;
         }
-        let pal = pal::now();
         let selected = self.selected.as_deref() == Some(row.rel.as_str());
         if selected {
             ui.painter()
@@ -456,7 +521,6 @@ impl GuiApp {
         }
 
         let cols = dir_columns(rect);
-        let indent = row.depth as f32 * 14.0;
         let icon_cx = cols.0.left() + indent + 7.0;
 
         // 展开箭头（只有目录有）
@@ -483,12 +547,6 @@ impl GuiApp {
 
         // 名字（改名时就地变成输入框）
         let name_left = icon_x + 9.0;
-        let name_w = (cols.1.left() - name_left - 8.0).max(40.0);
-        let renaming_this = self
-            .renaming
-            .as_ref()
-            .map(|(rel, _)| rel == &row.rel)
-            .unwrap_or(false);
 
         if renaming_this {
             let mut text = self.renaming.as_ref().map(|(_, t)| t.clone()).unwrap_or_default();
@@ -538,16 +596,12 @@ impl GuiApp {
             return;
         }
 
-        let font = eframe::egui::FontId::proportional(12.5);
-        let color = if row.is_dir { pal.fg } else { pal.soft_fg };
-        let shown = elide(ctx, &row.name, font.clone(), name_w);
-        ui.painter().text(
-            eframe::egui::pos2(name_left, rect.center().y),
-            eframe::egui::Align2::LEFT_CENTER,
-            shown,
-            font,
-            color,
-        );
+        if let Some(g) = galley {
+            let galley_h = g.rect.height();
+            let y = rect.top() + (row_h - galley_h) * 0.5;
+            ui.painter()
+                .galley(eframe::egui::pos2(name_left, y), g, name_color);
+        }
 
         // 大小 / 修改时间
         let f_small = eframe::egui::FontId::proportional(11.0);
@@ -692,30 +746,35 @@ impl GuiApp {
     // ---- 中栏：连接 + 设备 ------------------------------------------------
 
     fn connect_panel(&mut self, ui: &mut eframe::egui::Ui, rect: eframe::egui::Rect, ctx: &eframe::egui::Context) {
-        // 连接卡片的高度只跟内容走（二维码不再上下撑开）
-        let connect_h: f32 = if self.cfg.tls_on() { 268.0 } else { 246.0 };
-        let top = eframe::egui::Rect::from_min_size(
-            rect.min,
-            eframe::egui::vec2(rect.width(), connect_h.min(rect.height() - 120.0)),
-        );
-        let bottom = eframe::egui::Rect::from_min_max(
-            eframe::egui::pos2(rect.left(), top.bottom() + COL_GAP),
-            rect.max,
-        );
-        self.connect_card(ui, top, ctx);
-        self.device_card(ui, bottom, ctx);
+        ui.allocate_ui_at_rect(rect, |ui| {
+            // 连接卡片按内容自适应高度：HTTPS 下面不留空白，省出来的都给设备表
+            let used_bottom = self.connect_card(ui, rect, ctx);
+            let top = (used_bottom + COL_GAP)
+                .min(rect.bottom() - 120.0)
+                .max(rect.top() + 40.0);
+            let bottom = eframe::egui::Rect::from_min_max(
+                eframe::egui::pos2(rect.left(), top),
+                rect.max,
+            );
+            self.device_card(ui, bottom, ctx);
+        });
     }
 
-    fn connect_card(&mut self, ui: &mut eframe::egui::Ui, rect: eframe::egui::Rect, ctx: &eframe::egui::Context) {
+    fn connect_card(&mut self, ui: &mut eframe::egui::Ui, rect: eframe::egui::Rect, ctx: &eframe::egui::Context) -> f32 {
         let url = self.base_url();
         let mut toggle_hidden = false;
         let mut copy_addr = false;
         let mut tls_changed: Option<bool> = None;
         let mut copy_fp = false;
 
-        ui.allocate_ui_at_rect(rect, |ui| {
-            let inner = self.card_bg(ui, ui.max_rect());
-            ui.allocate_ui_at_rect(inner, |ui| {
+        let inner_w = (rect.width() - 20.0).max(120.0);
+        let card = eframe::egui::Frame::none()
+            .fill(pal::now().surface)
+            .rounding(12.0)
+            .stroke(eframe::egui::Stroke::new(1.0_f32, pal::now().card_border))
+            .inner_margin(eframe::egui::Margin::same(10.0))
+            .show(ui, |ui| {
+                ui.set_width(inner_w);
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("连接").size(12.5).strong().color(pal::now().fg));
                     ui.with_layout(
@@ -881,7 +940,8 @@ impl GuiApp {
                     );
                 }
             });
-        });
+
+        let used_bottom = card.response.rect.bottom();
 
         if toggle_hidden {
             self.pair_hidden = !self.pair_hidden;
@@ -901,6 +961,7 @@ impl GuiApp {
             self.set_tls(on);
             ctx.request_repaint();
         }
+        used_bottom
     }
 
     fn device_card(&mut self, ui: &mut eframe::egui::Ui, rect: eframe::egui::Rect, ctx: &eframe::egui::Context) {
@@ -1275,39 +1336,188 @@ impl GuiApp {
         );
     }
 
-    // ---- 底部便签条 --------------------------------------------------------
+    // ---- 底部便签：收起是一条，展开铺满整个内容区 --------------------------
 
-    fn note_strip(&mut self, ui: &mut eframe::egui::Ui, rect: eframe::egui::Rect, ctx: &eframe::egui::Context) {
+    fn note_panel(
+        &mut self,
+        ui: &mut eframe::egui::Ui,
+        rect: eframe::egui::Rect,
+        ctx: &eframe::egui::Context,
+        expanded: bool,
+        with_status: bool,
+    ) {
         let mut send = false;
         let mut copy = false;
+        let mut toggle: Option<bool> = None;
+
         ui.allocate_ui_at_rect(rect, |ui| {
             let inner = self.card_bg(ui, ui.max_rect());
-            ui.allocate_ui_at_rect(inner, |ui| {
-                ui.horizontal_centered(|ui| {
-                    ui.spacing_mut().item_spacing.x = 8.0;
-                    ui.label(
-                        RichText::new("快捷文本")
-                            .size(11.5)
-                            .color(pal::now().muted),
-                    );
-                    let btn_w = 64.0 * 2.0 + 8.0;
-                    let input_w = (ui.available_width() - btn_w - 8.0).max(120.0);
-                    let (input_rect, _) = ui.allocate_exact_size(
-                        eframe::egui::vec2(input_w, 44.0),
-                        eframe::egui::Sense::hover(),
-                    );
-                    ui.allocate_ui_at_rect(input_rect, |ui| {
-                        note_text_edit(ui, &mut self.text_buf, 28.0, &mut self.note_focused);
+            if expanded {
+                // 头部：标题 + 右上角「收起」
+                let head = eframe::egui::Rect::from_min_size(
+                    inner.min,
+                    eframe::egui::vec2(inner.width(), 24.0),
+                );
+                ui.allocate_ui_at_rect(head, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("快捷文本")
+                                .size(12.0)
+                                .strong()
+                                .color(pal::now().fg),
+                        );
                     });
-                    if btn_soft(ui, "复制", 12.0, 32.0, 64.0) {
-                        copy = true;
-                    }
-                    if btn_primary(ui, "发送", 12.0, 32.0, 64.0) {
-                        send = true;
-                    }
                 });
-            });
+                if note_expand_icon(
+                    ui,
+                    eframe::egui::Rect::from_min_size(
+                        eframe::egui::pos2(inner.right() - 22.0, inner.top()),
+                        eframe::egui::vec2(18.0, 18.0),
+                    ),
+                    true,
+                ) {
+                    toggle = Some(false);
+                }
+
+                // 底部：左边状态、右边按钮；中间编辑器铺满剩余高度
+                let footer = eframe::egui::Rect::from_min_max(
+                    eframe::egui::pos2(inner.left(), inner.bottom() - 38.0),
+                    inner.max,
+                );
+                let editor = eframe::egui::Rect::from_min_max(
+                    eframe::egui::pos2(inner.left(), head.bottom() + 6.0),
+                    eframe::egui::pos2(inner.right(), footer.top() - 6.0),
+                );
+                ui.allocate_ui_at_rect(editor, |ui| {
+                    note_text_edit(
+                        ui,
+                        &mut self.text_buf,
+                        (editor.height() - 8.0).max(24.0),
+                        &mut self.note_focused,
+                        true,
+                        0.0,
+                    );
+                });
+
+                let btns_w = 136.0;
+                if let Some(msg) = self.note_status_live() {
+                    let f = eframe::egui::FontId::proportional(10.5);
+                    let color = if self.note_status_warn {
+                        pal::now().btn_hover_close
+                    } else {
+                        pal::now().muted
+                    };
+                    let room = (footer.width() - btns_w - 8.0).max(40.0);
+                    ui.painter().text(
+                        footer.left_center(),
+                        eframe::egui::Align2::LEFT_CENTER,
+                        elide(ctx, msg, f.clone(), room),
+                        f,
+                        color,
+                    );
+                }
+                ui.allocate_ui_at_rect(
+                    eframe::egui::Rect::from_min_size(
+                        eframe::egui::pos2(footer.right() - btns_w, footer.top() + 3.0),
+                        eframe::egui::vec2(btns_w, 32.0),
+                    ),
+                    |ui| {
+                        ui.horizontal_centered(|ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            if btn_soft(ui, "复制", 12.0, 32.0, 64.0) {
+                                copy = true;
+                            }
+                            if btn_primary(ui, "发送", 12.0, 32.0, 64.0) {
+                                send = true;
+                            }
+                        });
+                    },
+                );
+            } else {
+                // 收起：一行输入（右上角展开按钮）+ 可选状态行
+                let status_h = if with_status { 14.0 } else { 0.0 };
+                let gap = if with_status { 6.0 } else { 0.0 };
+                let row_h = 44.0;
+                let row_top = inner.top()
+                    + ((inner.height() - status_h - gap - row_h) * 0.5).max(0.0);
+                let row = eframe::egui::Rect::from_min_size(
+                    eframe::egui::pos2(inner.left(), row_top),
+                    eframe::egui::vec2(inner.width(), row_h),
+                );
+                ui.allocate_ui_at_rect(row, |ui| {
+                    ui.horizontal_centered(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        ui.label(
+                            RichText::new("快捷文本")
+                                .size(11.5)
+                                .color(pal::now().muted),
+                        );
+                        let btn_w = 64.0 * 2.0 + 8.0;
+                        let input_w = (ui.available_width() - btn_w - 8.0).max(120.0);
+                        let (input_rect, _) = ui.allocate_exact_size(
+                            eframe::egui::vec2(input_w, 44.0),
+                            eframe::egui::Sense::hover(),
+                        );
+                        ui.allocate_ui_at_rect(input_rect, |ui| {
+                            // 右边留 22px 给展开按钮，免得压住第一行最后一个字
+                            note_text_edit(
+                                ui,
+                                &mut self.text_buf,
+                                36.0,
+                                &mut self.note_focused,
+                                false,
+                                22.0,
+                            );
+                        });
+                        if note_expand_icon(
+                            ui,
+                            eframe::egui::Rect::from_min_size(
+                                eframe::egui::pos2(input_rect.right() - 22.0, input_rect.top() + 3.0),
+                                eframe::egui::vec2(18.0, 18.0),
+                            ),
+                            false,
+                        ) {
+                            toggle = Some(true);
+                        }
+                        if btn_soft(ui, "复制", 12.0, 32.0, 64.0) {
+                            copy = true;
+                        }
+                        if btn_primary(ui, "发送", 12.0, 32.0, 64.0) {
+                            send = true;
+                        }
+                    });
+                });
+
+                if with_status {
+                    if let Some(msg) = self.note_status_live() {
+                        let st = eframe::egui::Rect::from_min_max(
+                            eframe::egui::pos2(inner.left(), inner.bottom() - 14.0),
+                            inner.max,
+                        );
+                        let f = eframe::egui::FontId::proportional(10.0);
+                        let color = if self.note_status_warn {
+                            pal::now().btn_hover_close
+                        } else {
+                            pal::now().muted
+                        };
+                        ui.painter().text(
+                            st.left_center(),
+                            eframe::egui::Align2::LEFT_CENTER,
+                            elide(ctx, msg, f.clone(), st.width() - 4.0),
+                            f,
+                            color,
+                        );
+                    }
+                }
+            }
         });
+
+        if let Some(on) = toggle {
+            self.set_note_expanded(on);
+            // 光标、选区跟着过去；两种形态共用同一个 TextEdit id
+            ctx.memory_mut(|m| m.request_focus(note_editor_id()));
+            ctx.request_repaint();
+        }
 
         // Ctrl+Enter 也能发
         let ctrl_enter = ctx.input(|i| {
@@ -1321,17 +1531,17 @@ impl GuiApp {
         }
         if copy {
             let ok = win32_set_clipboard(&self.text_buf);
-            self.note_status = if ok {
-                "已复制到剪贴板".to_string()
+            if ok {
+                self.set_note_status("已复制到剪贴板", false);
             } else {
-                "复制失败：剪贴板被其他程序占用".to_string()
-            };
+                self.set_note_status("复制失败：剪贴板被其他程序占用", true);
+            }
         }
         if send || ctrl_enter {
             let v = self.cfg.store_note(&self.text_buf);
             self.note_local = None;
             self.note_last_v = v;
-            self.note_status = "已发送，另一端将自动填入".to_string();
+            self.set_note_status("已发送，另一端将自动填入", false);
         }
     }
 
@@ -1465,6 +1675,59 @@ impl GuiApp {
     }
 }
 
+/// 便签条高度：内容区够高才给状态提示多留一行，矮窗保持 76 免得挤中栏。
+pub(super) fn note_strip_height(panel_h: f32) -> f32 {
+    if panel_h >= NOTE_STATUS_MIN_H {
+        NOTE_STRIP_H_STATUS
+    } else {
+        NOTE_STRIP_H
+    }
+}
+
+/// 便签右上角的展开/收起按钮（自己画四角箭头，不依赖 emoji 字体）。
+fn note_expand_icon(ui: &mut eframe::egui::Ui, rect: eframe::egui::Rect, expanded: bool) -> bool {
+    let resp = ui.interact(
+        rect,
+        eframe::egui::Id::new("td_note_toggle"),
+        eframe::egui::Sense::click(),
+    );
+    let pal = pal::now();
+    let color = if resp.hovered() {
+        pal.accent
+    } else {
+        pal.muted
+    };
+    if resp.hovered() {
+        ui.painter().rect_filled(rect, 5.0, pal.soft_bg);
+    }
+    let c = rect.center();
+    let stroke = eframe::egui::Stroke::new(1.3_f32, color);
+    for (sx, sy) in [
+        (-1.0_f32, -1.0_f32),
+        (1.0, -1.0),
+        (-1.0, 1.0),
+        (1.0, 1.0),
+    ] {
+        let outer = eframe::egui::pos2(c.x + sx * 6.0, c.y + sy * 6.0);
+        let inner = eframe::egui::pos2(c.x + sx * 2.0, c.y + sy * 2.0);
+        // 展开：箭头朝四角；收起：箭头朝中心
+        let (from, to) = if expanded { (inner, outer) } else { (outer, inner) };
+        // 箭头两翼要画在“箭头背后”，所以收起态方向取反
+        let (ax, ay) = if expanded { (sx, sy) } else { (-sx, -sy) };
+        ui.painter().line_segment([from, to], stroke);
+        ui.painter()
+            .line_segment([eframe::egui::pos2(to.x - ax * 3.0, to.y), to], stroke);
+        ui.painter()
+            .line_segment([eframe::egui::pos2(to.x, to.y - ay * 3.0), to], stroke);
+    }
+    resp.on_hover_text(if expanded {
+        "收起（回到便签条）"
+    } else {
+        "展开编辑"
+    })
+    .clicked()
+}
+
 /// 目录行的列边界：名称（弹性）/ 大小 / 修改时间 / 行内按钮
 fn dir_columns(r: eframe::egui::Rect) -> (
     eframe::egui::Rect,
@@ -1554,5 +1817,62 @@ fn fmt_ago_short(secs: u64) -> String {
         format!("{} 分", secs / 60)
     } else {
         format!("{} 时", secs / 3600)
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 图标确实能被点中（它只是叠在输入框上画的，没有占布局）。
+    #[test]
+    fn note_expand_icon_can_be_clicked() {
+        crate::settings::set_theme(crate::settings::Theme::Light);
+        let ctx = eframe::egui::Context::default();
+        let mut style = (*ctx.style()).clone();
+        style.visuals = eframe::egui::Visuals::light();
+        ctx.set_style(style);
+
+        let rect = eframe::egui::Rect::from_min_size(
+            eframe::egui::pos2(40.0, 20.0),
+            eframe::egui::vec2(18.0, 18.0),
+        );
+        let mut hits = 0;
+        for frame in 0..3 {
+            let mut input = eframe::egui::RawInput::default();
+            input.screen_rect = Some(eframe::egui::Rect::from_min_size(
+                eframe::egui::pos2(0.0, 0.0),
+                eframe::egui::vec2(200.0, 100.0),
+            ));
+            input.time = Some(frame as f64 * 0.1);
+            if frame >= 1 {
+                input.events.push(eframe::egui::Event::PointerMoved(rect.center()));
+            }
+            if frame == 1 {
+                input.events.push(eframe::egui::Event::PointerButton {
+                    pos: rect.center(),
+                    button: eframe::egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: eframe::egui::Modifiers::default(),
+                });
+            }
+            if frame == 2 {
+                input.events.push(eframe::egui::Event::PointerButton {
+                    pos: rect.center(),
+                    button: eframe::egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: eframe::egui::Modifiers::default(),
+                });
+            }
+            let _ = ctx.run(input, |ctx| {
+                eframe::egui::CentralPanel::default().show(ctx, |ui| {
+                    if note_expand_icon(ui, rect, false) {
+                        hits += 1;
+                    }
+                });
+            });
+        }
+        assert!(hits > 0, "图标点击没命中");
     }
 }
