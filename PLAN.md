@@ -892,7 +892,7 @@ README 补两节（管理端目录 / 设备授权）。
 
 ## 执行记录（2026-10-29）：管理端易用性修补 + 便签展开编辑
 
-版本仍是 1.3.0（纯 UI 修补，不加开关、不改接口），`cargo test` 68 passed / 0 failed / 5 ignored。
+版本仍是 1.3.0（纯 UI 修补，不加开关、不改接口），`cargo test` 69 passed / 0 failed / 5 ignored。
 
 | 项 | 结果 |
 |---|---|
@@ -905,7 +905,12 @@ README 补两节（管理端目录 / 设备授权）。
 | 便签状态行 | 状态统一走 `set_note_status`，10 秒自动消失（`request_repaint_after` 保证闲着也会到点重绘）；内容区 ≥600px 时便签条 88px 带状态行，矮窗保持 76px，不挤中栏 |
 | Esc | 这轮不动：现有三处各自独立读取且不消费，留到单独一轮统一收口 |
 
+**追加（同日）：Esc 统一收口**
+- `GuiApp::handle_escape` 一处读取并消费 Esc，优先级 **行内改名 > 删除确认 > 设置**，一次按键只退一层
+- 改名排最前不是随手排的：egui 自己在 Esc 时就会丢掉焦点，若先关别的层，改名框会按「失焦」被提交；Esc 的语义必须是取消
+- 便签展开态仍不接 Esc（退出靠右上角按钮）；`escape_closes_only_one_layer` 走完整 `draw` 验证三层依次退出、改名不会被提交
+
 **验证**
-- 新增用例：`new_dirs_start_collapsed`、`note_strip_height_depends_on_panel_height`、`note_status_expires`、`expanding_note_cancels_pending_rename`、`note_expand_icon_can_be_clicked`
+- 新增用例：`new_dirs_start_collapsed`、`note_strip_height_depends_on_panel_height`、`note_status_expires`、`expanding_note_cancels_pending_rename`、`note_expand_icon_can_be_clicked`、`escape_closes_only_one_layer`
 - 无头出图：`target/gui_note_expanded.png`（1200×760 展开态）、`target/gui_manage_1200x760.png`、`target/gui_manage_700x470.png` 人工核对
 - release 重建并覆盖部署到 `C:\TransData`，部署文件与 `target/release/transdata.exe` md5 一致（`87d5434a…`）

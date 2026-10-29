@@ -1646,6 +1646,26 @@ impl GuiApp {
         }
     }
 
+    /// Esc 只处理一次：行内改名 > 删除确认 > 设置，处理完就把键消费掉。
+    /// 改名排最前是因为 egui 自己会在 Esc 时丢掉焦点，若先关别的层，
+    /// 改名框就会按「失焦」被提交——Esc 的语义应该是取消。
+    /// 便签展开态故意不接 Esc（退出靠右上角按钮）。
+    fn handle_escape(&mut self, ctx: &eframe::egui::Context) {
+        if !ctx.input(|i| i.key_pressed(eframe::egui::Key::Escape)) {
+            return;
+        }
+        ctx.input_mut(|i| {
+            i.consume_key(eframe::egui::Modifiers::NONE, eframe::egui::Key::Escape);
+        });
+        if self.renaming.take().is_some() {
+            self.rename_fresh = false;
+        } else if self.confirm_delete.is_some() {
+            self.confirm_delete = None;
+        } else if self.settings_open {
+            self.settings_open = false;
+        }
+    }
+
     /// Build one frame of the window. Kept separate from `App::update` so
     /// the layout can be rendered headlessly in a test.
     fn draw(&mut self, ctx: &eframe::egui::Context) {
@@ -1672,12 +1692,7 @@ impl GuiApp {
         #[cfg(windows)]
         self.handle_resize(ctx);
 
-        // Esc 关掉设置面板
-        if self.settings_open
-            && ctx.input(|i| i.key_pressed(eframe::egui::Key::Escape))
-        {
-            self.settings_open = false;
-        }
+        self.handle_escape(ctx);
 
         let refresh_now = self.qr_dirty;
         if self.qr_dirty {
@@ -3002,6 +3017,54 @@ mod tests {
             std::time::Instant::now() - NOTE_STATUS_TTL - std::time::Duration::from_secs(1),
         );
         assert!(app.note_status_live().is_none());
+    }
+
+    /// Esc 一次只关一层：删除确认 > 设置 > 行内改名。
+    #[test]
+    fn escape_closes_only_one_layer() {
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        app.settings_open = true;
+        app.confirm_delete = Some(ConfirmDelete {
+            rel: "归档/2026-10 报告.pdf".to_string(),
+            name: "2026-10 报告.pdf".to_string(),
+            is_dir: false,
+            items: 0,
+        });
+        app.renaming = Some(("归档/2026-10 报告.pdf".to_string(), "新名字".to_string()));
+        app.rename_fresh = true;
+        app.files = fake_snapshot();
+        app.files_loading = false;
+
+        let esc = || {
+            let mut input = egui::RawInput::default();
+            input.screen_rect = Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(WIN_W, WIN_H),
+            ));
+            input.events.push(egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+            input
+        };
+
+        let _ = ctx.run(esc(), |ctx| app.draw(ctx));
+        assert!(app.renaming.is_none(), "第一下取消改名");
+        assert!(!app.rename_fresh);
+        assert!(!app.status_msg.starts_with("已改名"), "Esc 不能把改名提交掉");
+        assert!(app.confirm_delete.is_some(), "同一帧不该顺手关确认窗");
+        assert!(app.settings_open, "同一帧不该顺手关设置");
+
+        let _ = ctx.run(esc(), |ctx| app.draw(ctx));
+        assert!(app.confirm_delete.is_none(), "第二下关确认窗");
+        assert!(app.settings_open, "同一帧不该顺手关设置");
+
+        let _ = ctx.run(esc(), |ctx| app.draw(ctx));
+        assert!(!app.settings_open, "第三下关设置");
     }
 
     /// 展开便签时把没提交的行内改名取消掉（保留原名）。

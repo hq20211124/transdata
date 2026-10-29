@@ -582,10 +582,8 @@ impl GuiApp {
                 *t = text.clone();
             }
             let enter = ui.input(|i| i.key_pressed(eframe::egui::Key::Enter));
-            let esc = ui.input(|i| i.key_pressed(eframe::egui::Key::Escape));
-            if esc {
-                self.renaming = None;
-            } else if enter || r.lost_focus() {
+            // Esc 已在 GuiApp::handle_escape 里统一处理（会先把 renaming 清掉）
+            if enter || r.lost_focus() {
                 let from = row.rel.clone();
                 let to = text.trim().replace('\\', "/");
                 self.renaming = None;
@@ -1640,9 +1638,6 @@ impl GuiApp {
                     );
                 });
             });
-        if ctx.input(|i| i.key_pressed(eframe::egui::Key::Escape)) {
-            close = true;
-        }
         if close {
             self.confirm_delete = None;
             return;
