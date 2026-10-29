@@ -713,9 +713,8 @@ struct GuiApp {
     /// transfer dir changes. Never re-run per frame (that spawned a visible
     /// cmd console window every second on some machines).
     ips: Vec<String>,
-    /// 快捷文本：Some = 本地有未发送的编辑；None = 跟随共享文本。
-    /// 远端内容到达时直接覆盖（note_local 被丢弃）。
-    note_local: Option<String>,
+    /// 本地是否改过便签（远端内容到达时直接覆盖本地内容，但要说一声）。
+    note_dirty: bool,
     /// 编辑框里正在显示的内容。单独存一份，避免每帧克隆整段文本
     /// （打字时光标闪烁 60fps，长文本会被反复拷贝）。
     text_buf: String,
@@ -812,7 +811,7 @@ impl GuiApp {
         window_visible: Arc<std::sync::atomic::AtomicBool>,
         #[cfg(windows)] hwnd: isize,
     ) -> Self {
-        let (_, last_v) = cfg.read_note();
+        let (note_text, last_v) = cfg.read_note();
         let pair_code = cfg.pair_code();
         let pair_secret = cfg.pair_secret();
         Self {
@@ -836,8 +835,8 @@ impl GuiApp {
             #[cfg(windows)]
             shape_size: (0, 0),
             ips: crate::net::all_ipv4s(),
-            note_local: None,
-            text_buf: String::new(),
+            note_dirty: false,
+            text_buf: note_text.as_ref().clone(),
             note_last_v: last_v,
             note_status: String::new(),
             active_transfers,
@@ -1714,22 +1713,15 @@ impl GuiApp {
         // 但覆盖必须说出来：以前正在打字时手机发来一条，框里的内容被直接
         // 换掉，用户完全不知道自己的字去哪了。
         if shared_v != self.note_last_v {
-            let had_unsent = self
-                .note_local
-                .as_deref()
-                .map(|t| t != shared_text.as_str())
-                .unwrap_or(false);
+            let had_unsent = self.note_dirty && self.text_buf != *shared_text;
             self.note_last_v = shared_v;
-            self.note_local = None;
+            self.note_dirty = false;
             self.text_buf = shared_text.as_ref().clone();
             if had_unsent {
                 self.set_note_status("已收到对方内容，本地未发送的改动被覆盖", true);
             } else {
                 self.set_note_status("已收到对方内容", false);
             }
-        } else if self.text_buf.is_empty() && self.note_local.is_none() {
-            // First frame: show whatever the server already has.
-            self.text_buf = shared_text.as_ref().clone();
         }
 
         // ---- 自绘标题栏（代替系统标题栏，深色系统下那条黑边就没了）
@@ -2797,6 +2789,10 @@ mod tests {
     }
 
     fn test_app(ctx: &egui::Context) -> GuiApp {
+        test_app_with(ctx, std::sync::Arc::new(Config::new()))
+    }
+
+    fn test_app_with(ctx: &egui::Context, cfg: std::sync::Arc<Config>) -> GuiApp {
         let mut style = (*ctx.style()).clone();
         style.visuals = egui::Visuals::light();
         ctx.set_style(style);
@@ -2814,7 +2810,7 @@ mod tests {
             ctx.set_fonts(definitions);
         }
         GuiApp::new(
-            std::sync::Arc::new(Config::new()),
+            cfg,
             9999,
             std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -3039,6 +3035,29 @@ mod tests {
             std::time::Instant::now() - NOTE_STATUS_TTL - std::time::Duration::from_secs(1),
         );
         assert!(app.note_status_live().is_none());
+    }
+
+    /// 便签删光后不能自己变回来（空文本不该被当成「首帧，去采样共享内容」）。
+    #[test]
+    fn cleared_note_stays_cleared() {
+        let ctx = egui::Context::default();
+        let cfg = std::sync::Arc::new(Config::new());
+        cfg.store_note("要删掉的内容");
+        let mut app = test_app_with(&ctx, cfg);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(WIN_W, WIN_H),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run(input.clone(), |ctx| app.draw(ctx));
+        assert_eq!(app.text_buf, "要删掉的内容");
+
+        // 用户在输入框里全选删除
+        app.text_buf.clear();
+        let _ = ctx.run(input, |ctx| app.draw(ctx));
+        assert!(app.text_buf.is_empty(), "删掉的内容又回来了: {:?}", app.text_buf);
     }
 
     /// Esc 一次只关一层：删除确认 > 设置 > 行内改名。

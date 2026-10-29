@@ -3843,4 +3843,59 @@ mod review_fix_tests {
         assert!(text.starts_with("HTTP/1.1 200 OK"), "{text}");
         assert!(text.ends_with("ok"), "{text}");
     }
+
+    /// 切换 HTTPS 开关前后，同一个端口必须一直能连上。
+    #[tokio::test]
+    async fn tls_toggle_keeps_port_serving() {
+        let cert_dir = std::env::temp_dir()
+            .join(format!("transdata_tls_toggle_{}", std::process::id()));
+        std::fs::create_dir_all(&cert_dir).ok();
+        let material = crate::tls::load_or_create_in(
+            &["127.0.0.1".to_string()],
+            std::slice::from_ref(&cert_dir),
+        )
+        .expect("certificate");
+
+        let port = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        let dir = std::env::temp_dir().join(format!("transdata_toggle_dir_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).ok();
+        let mut raw = Config::with_secret(TEST_SECRET.to_string(), TEST_CODE.to_string());
+        raw.port = port;
+        raw.set_upload_dir(dir);
+        let cfg = Arc::new(raw);
+        cfg.set_tls_material(material);
+        let cfg2 = cfg.clone();
+        tokio::spawn(async move {
+            let _ = crate::http::server::serve(cfg2).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // 关：明文能连
+        let r = http_text(port, "GET / HTTP/1.1\r\nHost: t\r\n\r\n").await;
+        assert!(r.starts_with("HTTP/1.1 200"), "plain before: {}", &r[..r.len().min(200)]);
+
+        // 手机开着页面时会一直占着一条连接（WebSocket），切协议时它还在。
+        let held = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+
+        // 开：监听重绑，明文会拿到「请用 https」提示页
+        cfg.set_tls(true);
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        let r = http_text(port, "GET / HTTP/1.1\r\nHost: t\r\n\r\n").await;
+        assert!(r.contains("HTTPS"), "after tls on: {}", &r[..r.len().min(200)]);
+
+        // 再关：必须还能明文连
+        cfg.set_tls(false);
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        drop(held);
+        let r = http_text(port, "GET / HTTP/1.1\r\nHost: t\r\n\r\n").await;
+        assert!(
+            r.starts_with("HTTP/1.1 200"),
+            "server_error: {:?}, body: {}",
+            cfg.server_error(),
+            &r[..r.len().min(200)]
+        );
+    }
 }

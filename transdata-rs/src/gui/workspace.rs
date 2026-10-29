@@ -1384,7 +1384,7 @@ impl GuiApp {
                     eframe::egui::pos2(inner.right(), footer.top() - 6.0),
                 );
                 ui.allocate_ui_at_rect(editor, |ui| {
-                    note_text_edit(
+                    let r = note_text_edit(
                         ui,
                         &mut self.text_buf,
                         (editor.height() - 8.0).max(24.0),
@@ -1392,6 +1392,9 @@ impl GuiApp {
                         true,
                         0.0,
                     );
+                    if r.changed() {
+                        self.note_dirty = true;
+                    }
                 });
 
                 let btns_w = 136.0;
@@ -1458,7 +1461,7 @@ impl GuiApp {
                         );
                         ui.allocate_ui_at_rect(input_rect, |ui| {
                             // 右边留 22px 给展开按钮，免得压住第一行最后一个字
-                            note_text_edit(
+                            let r = note_text_edit(
                                 ui,
                                 &mut self.text_buf,
                                 36.0,
@@ -1466,6 +1469,9 @@ impl GuiApp {
                                 false,
                                 22.0,
                             );
+                            if r.changed() {
+                                self.note_dirty = true;
+                            }
                         });
                         if note_expand_icon(
                             ui,
@@ -1534,7 +1540,7 @@ impl GuiApp {
         }
         if send || ctrl_enter {
             let v = self.cfg.store_note(&self.text_buf);
-            self.note_local = None;
+            self.note_dirty = false;
             self.note_last_v = v;
             self.set_note_status("已发送，另一端将自动填入", false);
         }
