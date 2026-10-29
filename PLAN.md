@@ -914,3 +914,13 @@ README 补两节（管理端目录 / 设备授权）。
 - 新增用例：`new_dirs_start_collapsed`、`note_status_expires`、`expanding_note_cancels_pending_rename`、`note_expand_icon_can_be_clicked`、`escape_closes_only_one_layer`
 - 无头出图：`target/gui_note_expanded.png`（1200×760 展开态）、`target/gui_note_status.png`（收起态 + 提示同行）、`target/gui_manage_1200x760.png`、`target/gui_manage_700x470.png` 人工核对
 - release 重建并覆盖部署到 `C:\TransData`，部署文件与 `target/release/transdata.exe` md5 一致（`87d5434a…`）
+
+**追加（同日）：收起态便签的那个「第二个光标」**
+- 现象：点进便签输入框，左边出现正常光标，右边（展开按钮旁）又多一条竖线
+- 根因：内层 `ScrollArea` 认为内容比视口高一点（空文本时 TextEdit 的最小高度就顶出去了），
+  于是画了一条滚动条；它挤在右上角展开按钮上，看着就像没清掉的边缘线
+- 修法：收起态 `scroll_bar_visibility(AlwaysHidden)`（滚轮照常能滚）
+- 顺手把视口改成整两行字高（原来固定 36px 不是整行数，第三行露半截、还越过圆角边框），
+  并把默认裁剪余量清零、去掉 TextEdit 自带 4/2 内边距 —— 现在两行刚好填满，不露第三行
+- 真机验证（隔离实例、独立锁与配置，不影响正在运行的实例）：空文本只剩左侧光标；
+  粘长文本恰好两行、无滚动条、无溢出；展开态排版不变

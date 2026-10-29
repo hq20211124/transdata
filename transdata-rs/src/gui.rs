@@ -2253,6 +2253,7 @@ fn note_editor_id() -> eframe::egui::Id {
     eframe::egui::Id::new("td_note_editor")
 }
 
+/// `max_height`：展开态的最大高度（收起态按两行字高算）；
 /// `fill`：展开态用，输入框铺满可用高度；`right_inset`：右上角图标预留的宽度。
 fn note_text_edit(
     ui: &mut eframe::egui::Ui,
@@ -2287,7 +2288,31 @@ fn note_text_edit(
         .stroke(eframe::egui::Stroke::new(1.0_f32, border))
         .inner_margin(eframe::egui::Margin::symmetric(10.0, 4.0))
         .show(ui, |ui| {
-            eframe::egui::ScrollArea::vertical()
+            // 收起态视口取整两行：固定 36px 不是整行数，第三行会露出半截，
+            // 露出来的部分还会越过圆角边框，看着像文字溢出输入框。
+            let max_height = if fill {
+                max_height
+            } else {
+                let row_h = ui.fonts(|f| {
+                    let job = eframe::egui::text::LayoutJob::simple(
+                        " ".to_owned(),
+                        font_id.clone(),
+                        eframe::egui::Color32::WHITE,
+                        f32::INFINITY,
+                    );
+                    f.layout_job(job)
+                        .rows
+                        .first()
+                        .map(|r| r.height())
+                        .unwrap_or(16.0)
+                });
+                2.0 * row_h
+            };
+            if !fill {
+                // 默认内容裁剪会往外多放几个点，放出去的那截正好画到边框外
+                ui.style_mut().visuals.clip_rect_margin = 0.0;
+            }
+            let mut area = eframe::egui::ScrollArea::vertical()
                 // 两种形态分开记滚动位置：展开时不会继承便签条的小滚动偏移
                 .id_source(if fill {
                     "note_scroll_full"
@@ -2299,33 +2324,47 @@ fn note_text_edit(
                 // 不压下去的话整个输入框会比便签条还高、穿出卡片底部
                 .min_scrolled_height(24.0)
                 // 收起：按内容收缩；展开：铺满给定高度
-                .auto_shrink([false, !fill])
-                .show(ui, |ui| {
-                    if fill {
-                        // 先铺一层背景交互，后面的 TextEdit 会盖在它上面：
-                        // 点正文空白也能直接聚焦，不用非得点中文字
-                        let bg = ui.available_rect_before_wrap();
-                        let bg_resp = ui.interact(
-                            bg,
-                            eframe::egui::Id::new("td_note_body"),
-                            eframe::egui::Sense::click(),
-                        );
-                        if bg_resp.clicked() {
-                            ui.ctx()
-                                .memory_mut(|m| m.request_focus(note_editor_id()));
-                        }
-                    }
-                    let r = ui.add(
-                        eframe::egui::TextEdit::multiline(text)
-                            .id(note_editor_id())
-                            .frame(false)
-                            .desired_width((ui.available_width() - right_inset).max(80.0))
-                            .desired_rows(if fill { 8 } else { 2 })
-                            .layouter(&mut layouter),
+                .auto_shrink([false, !fill]);
+            if !fill {
+                // 长文本时滚动条会画在展开按钮边上，看着像多出来的那根竖线。
+                // 收起态没有看滚动位置的需求，直接不画（滚轮照常能滚）。
+                area = area.scroll_bar_visibility(
+                    eframe::egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
+                );
+            }
+            area.show(ui, |ui| {
+                if fill {
+                    // 先铺一层背景交互，后面的 TextEdit 会盖在它上面：
+                    // 点正文空白也能直接聚焦，不用非得点中文字
+                    let bg = ui.available_rect_before_wrap();
+                    let bg_resp = ui.interact(
+                        bg,
+                        eframe::egui::Id::new("td_note_body"),
+                        eframe::egui::Sense::click(),
                     );
-                    *focused = r.has_focus();
-                    resp = Some(r);
-                });
+                    if bg_resp.clicked() {
+                        ui.ctx()
+                            .memory_mut(|m| m.request_focus(note_editor_id()));
+                    }
+                }
+                let r = ui.add(
+                    eframe::egui::TextEdit::multiline(text)
+                        .id(note_editor_id())
+                        .frame(false)
+                        // 收起态外框已经留了内边距，TextEdit 自带的 4/2 会再多一圈，
+                        // 两行的视口就被顶掉一点，第二行又被切
+                        .margin(if fill {
+                            eframe::egui::Margin::symmetric(4.0, 2.0)
+                        } else {
+                            eframe::egui::Margin::ZERO
+                        })
+                        .desired_width((ui.available_width() - right_inset).max(80.0))
+                        .desired_rows(if fill { 8 } else { 2 })
+                        .layouter(&mut layouter),
+                );
+                *focused = r.has_focus();
+                resp = Some(r);
+            });
         });
     resp.expect("note text edit")
 }
