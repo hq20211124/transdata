@@ -250,19 +250,17 @@ impl GuiApp {
 
                 // 展开态：三栏让位，便签铺满整个内容区
                 if self.note_expanded {
-                    self.note_panel(ui, panel, ctx, true, false);
+                    self.note_panel(ui, panel, ctx, true);
                     return;
                 }
 
-                let note_h = note_strip_height(panel.height());
-                let with_status = note_h > NOTE_STRIP_H;
                 let note_rect = eframe::egui::Rect::from_min_max(
-                    eframe::egui::pos2(panel.left(), panel.bottom() - note_h),
+                    eframe::egui::pos2(panel.left(), panel.bottom() - NOTE_STRIP_H),
                     panel.max,
                 );
                 let main_rect = eframe::egui::Rect::from_min_max(
                     panel.min,
-                    eframe::egui::pos2(panel.right(), panel.bottom() - note_h - COL_GAP),
+                    eframe::egui::pos2(panel.right(), panel.bottom() - NOTE_STRIP_H - COL_GAP),
                 );
                 let wide = panel.width() >= WIDE_MIN_W;
 
@@ -299,7 +297,7 @@ impl GuiApp {
                     self.connect_panel(ui, mid, ctx);
                 }
 
-                self.note_panel(ui, note_rect, ctx, false, with_status);
+                self.note_panel(ui, note_rect, ctx, false);
             });
 
         // 窄窗的详情抽屉（便签铺开时不画，免得盖在编辑区上）
@@ -1342,7 +1340,6 @@ impl GuiApp {
         rect: eframe::egui::Rect,
         ctx: &eframe::egui::Context,
         expanded: bool,
-        with_status: bool,
     ) {
         let mut send = false;
         let mut copy = false;
@@ -1432,15 +1429,12 @@ impl GuiApp {
                     },
                 );
             } else {
-                // 收起：一行输入（右上角展开按钮）+ 可选状态行
-                let status_h = if with_status { 14.0 } else { 0.0 };
-                let gap = if with_status { 6.0 } else { 0.0 };
-                let row_h = 44.0;
-                let row_top = inner.top()
-                    + ((inner.height() - status_h - gap - row_h) * 0.5).max(0.0);
-                let row = eframe::egui::Rect::from_min_size(
-                    eframe::egui::pos2(inner.left(), row_top),
-                    eframe::egui::vec2(inner.width(), row_h),
+                // 收起：一行输入（右上角展开按钮）。
+                // 提示也放在这一行里（输入框和按钮之间），不另占纵向空间 ——
+                // 否则窗口够高时便签条会多出一截空白，输入框被顶到上面去。
+                let row = eframe::egui::Rect::from_center_size(
+                    inner.center(),
+                    eframe::egui::vec2(inner.width(), 44.0),
                 );
                 ui.allocate_ui_at_rect(row, |ui| {
                     ui.horizontal_centered(|ui| {
@@ -1450,8 +1444,14 @@ impl GuiApp {
                                 .size(11.5)
                                 .color(pal::now().muted),
                         );
+                        let status = self
+                            .note_status_live()
+                            .map(|m| (m.to_string(), self.note_status_warn));
+                        let status_w = if status.is_some() { 160.0 } else { 0.0 };
+                        let extra = if status.is_some() { status_w + 8.0 } else { 0.0 };
                         let btn_w = 64.0 * 2.0 + 8.0;
-                        let input_w = (ui.available_width() - btn_w - 8.0).max(120.0);
+                        let input_w =
+                            (ui.available_width() - btn_w - 8.0 - extra).max(120.0);
                         let (input_rect, _) = ui.allocate_exact_size(
                             eframe::egui::vec2(input_w, 44.0),
                             eframe::egui::Sense::hover(),
@@ -1477,6 +1477,25 @@ impl GuiApp {
                         ) {
                             toggle = Some(true);
                         }
+                        if let Some((msg, warn)) = status {
+                            let (r, _) = ui.allocate_exact_size(
+                                eframe::egui::vec2(status_w, 20.0),
+                                eframe::egui::Sense::hover(),
+                            );
+                            let f = eframe::egui::FontId::proportional(10.5);
+                            let color = if warn {
+                                pal::now().btn_hover_close
+                            } else {
+                                pal::now().muted
+                            };
+                            ui.painter().text(
+                                r.left_center(),
+                                eframe::egui::Align2::LEFT_CENTER,
+                                elide(ctx, &msg, f.clone(), status_w - 4.0),
+                                f,
+                                color,
+                            );
+                        }
                         if btn_soft(ui, "复制", 12.0, 32.0, 64.0) {
                             copy = true;
                         }
@@ -1485,28 +1504,6 @@ impl GuiApp {
                         }
                     });
                 });
-
-                if with_status {
-                    if let Some(msg) = self.note_status_live() {
-                        let st = eframe::egui::Rect::from_min_max(
-                            eframe::egui::pos2(inner.left(), inner.bottom() - 14.0),
-                            inner.max,
-                        );
-                        let f = eframe::egui::FontId::proportional(10.0);
-                        let color = if self.note_status_warn {
-                            pal::now().btn_hover_close
-                        } else {
-                            pal::now().muted
-                        };
-                        ui.painter().text(
-                            st.left_center(),
-                            eframe::egui::Align2::LEFT_CENTER,
-                            elide(ctx, msg, f.clone(), st.width() - 4.0),
-                            f,
-                            color,
-                        );
-                    }
-                }
             }
         });
 
@@ -1667,15 +1664,6 @@ impl GuiApp {
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             ctx.request_repaint();
         }
-    }
-}
-
-/// 便签条高度：内容区够高才给状态提示多留一行，矮窗保持 76 免得挤中栏。
-pub(super) fn note_strip_height(panel_h: f32) -> f32 {
-    if panel_h >= NOTE_STATUS_MIN_H {
-        NOTE_STRIP_H_STATUS
-    } else {
-        NOTE_STRIP_H
     }
 }
 

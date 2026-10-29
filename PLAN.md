@@ -902,7 +902,7 @@ README 补两节（管理端目录 / 设备授权）。
 | 目录默认折叠 | `known_dirs` 只给第一次出现的目录补一笔折叠；用户手动展开过的不会被下一次快照折回去 |
 | 便签输入框 | `ScrollArea` 把 `min_scrolled_height` 压到 24 + 收起态 `auto_shrink`，修掉输入框被 egui 默认 64pt 最小高度撑出卡片的问题；收起 2 行、超过两行才滚动 |
 | 便签展开 | 右上角自绘四角箭头：展开时三栏让位、编辑器铺满内容区；点正文空白也能聚焦；展开/收起共用固定 TextEdit id，光标和选区延续；展开时取消未提交的行内改名（保留原名，不误提交） |
-| 便签状态行 | 状态统一走 `set_note_status`，10 秒自动消失（`request_repaint_after` 保证闲着也会到点重绘）；内容区 ≥600px 时便签条 88px 带状态行，矮窗保持 76px，不挤中栏 |
+| 便签状态行 | 状态统一走 `set_note_status`，10 秒自动消失（`request_repaint_after` 保证闲着也会到点重绘）；便签条恒 76px，提示挤在同一行里（输入框和按钮之间），不预留纵向空间——预留 12px 会让输入框顶到上面、下面空一块 |
 | Esc | 这轮不动：现有三处各自独立读取且不消费，留到单独一轮统一收口 |
 
 **追加（同日）：Esc 统一收口**
@@ -911,6 +911,6 @@ README 补两节（管理端目录 / 设备授权）。
 - 便签展开态仍不接 Esc（退出靠右上角按钮）；`escape_closes_only_one_layer` 走完整 `draw` 验证三层依次退出、改名不会被提交
 
 **验证**
-- 新增用例：`new_dirs_start_collapsed`、`note_strip_height_depends_on_panel_height`、`note_status_expires`、`expanding_note_cancels_pending_rename`、`note_expand_icon_can_be_clicked`、`escape_closes_only_one_layer`
-- 无头出图：`target/gui_note_expanded.png`（1200×760 展开态）、`target/gui_manage_1200x760.png`、`target/gui_manage_700x470.png` 人工核对
+- 新增用例：`new_dirs_start_collapsed`、`note_status_expires`、`expanding_note_cancels_pending_rename`、`note_expand_icon_can_be_clicked`、`escape_closes_only_one_layer`
+- 无头出图：`target/gui_note_expanded.png`（1200×760 展开态）、`target/gui_note_status.png`（收起态 + 提示同行）、`target/gui_manage_1200x760.png`、`target/gui_manage_700x470.png` 人工核对
 - release 重建并覆盖部署到 `C:\TransData`，部署文件与 `target/release/transdata.exe` md5 一致（`87d5434a…`）

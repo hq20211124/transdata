@@ -31,10 +31,6 @@ const ACT_ROW_H: f32 = 26.0;
 const RENDER_CAP: usize = 500;
 /// 便签条高度（两行输入 + 按钮）
 const NOTE_STRIP_H: f32 = 76.0;
-/// 带一行状态提示时的便签条高度（输入 44 + 间隔 6 + 状态 14 + 上下边距 20）
-const NOTE_STRIP_H_STATUS: f32 = 88.0;
-/// 内容区矮于这个高度就不给便签条加状态行，免得中栏被挤到重叠
-const NOTE_STATUS_MIN_H: f32 = 600.0;
 /// 便签提示自动消失的时间
 const NOTE_STATUS_TTL: std::time::Duration = std::time::Duration::from_secs(10);
 /// 自绘标题栏的高度（原来这块是系统标题栏，深色模式下是一条黑边）
@@ -2993,19 +2989,6 @@ mod tests {
         assert!(collapsed.contains("新目录"));
     }
 
-    /// 矮窗不给状态行留高度（免得分栏被挤重叠），够高才用 88px 的便签条。
-    #[test]
-    fn note_strip_height_depends_on_panel_height() {
-        assert_eq!(
-            super::workspace::note_strip_height(NOTE_STATUS_MIN_H - 1.0),
-            NOTE_STRIP_H
-        );
-        assert_eq!(
-            super::workspace::note_strip_height(NOTE_STATUS_MIN_H),
-            NOTE_STRIP_H_STATUS
-        );
-    }
-
     /// 便签提示 10 秒后自动消失。
     #[test]
     fn note_status_expires() {
@@ -3122,8 +3105,11 @@ mod tests {
         app.set_note_status("已发送，另一端将自动填入", false);
         render_png_size(&ctx, &mut app, "target/gui_note_expanded.png", 1200.0, 760.0);
         assert!(std::path::Path::new("target/gui_note_expanded.png").exists());
+        // 收起态 + 提示：提示挤在同一行里，便签条高度不变（出图人工核对）
         app.set_note_expanded(false);
         app.text_buf.clear();
+        render_png_size(&ctx, &mut app, "target/gui_note_status.png", 1200.0, 760.0);
+        assert!(std::path::Path::new("target/gui_note_status.png").exists());
         app.note_status_at = None;
         app.note_status.clear();
 
