@@ -2168,11 +2168,66 @@ enum OpenFailure {
     NoProgram,
 }
 
+#[cfg(windows)]
+#[repr(C)]
+struct OpenAsInfo {
+    file: *const u16,
+    class_name: *const u16,
+    flags: u32,
+}
+
+#[cfg(windows)]
+const OAIF_ALLOW_REGISTRATION: u32 = 0x1;
+#[cfg(windows)]
+const OAIF_EXEC: u32 = 0x4;
+
+/// canonicalize() 给出的路径带 `\\?\` 前缀，外壳 API 不认（会报找不到文件
+/// 或参数无效），转成普通路径再交给系统。
+#[cfg(windows)]
+fn shell_path(path: &std::path::Path) -> Vec<u16> {
+    let s = path.to_string_lossy();
+    let plain = if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else {
+        s.strip_prefix(r"\\?\").unwrap_or(&s).to_string()
+    };
+    plain.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// 弹系统「选择应用」框。这个调用是模态的，放到后台线程等用户选完，
+/// 不卡界面；路径按 UTF-16 交给系统，不会因编码转换把中文名弄花。
+/// （rundll32 的 OpenAs_RunDLL 走 ANSI 命令行，中文名会变成乱码。）
+#[cfg(windows)]
+fn show_open_with_dialog(path: &std::path::Path) -> bool {
+    #[link(name = "shell32")]
+    extern "system" {
+        fn SHOpenWithDialog(hwnd: isize, info: *const OpenAsInfo) -> i32;
+    }
+    #[link(name = "ole32")]
+    extern "system" {
+        fn CoInitializeEx(reserved: *const std::ffi::c_void, coinit: u32) -> i32;
+        fn CoUninitialize();
+    }
+    let file = shell_path(path);
+    std::thread::Builder::new()
+        .name("open-with".into())
+        .spawn(move || unsafe {
+            CoInitializeEx(std::ptr::null(), 2); // COINIT_APARTMENTTHREADED
+            let info = OpenAsInfo {
+                file: file.as_ptr(),
+                class_name: std::ptr::null(),
+                flags: OAIF_ALLOW_REGISTRATION | OAIF_EXEC,
+            };
+            SHOpenWithDialog(0, &info);
+            CoUninitialize();
+        })
+        .is_ok()
+}
+
 /// 用系统默认程序打开（= 资源管理器里双击）。默认程序装不上/注册表
 /// 指向一个已不存在的 exe 时，退回系统「选择一个应用」选择框。
 #[cfg(windows)]
 fn open_with_default(path: &std::path::Path) -> Result<(), OpenFailure> {
-    use std::os::windows::ffi::OsStrExt;
     #[link(name = "shell32")]
     extern "system" {
         fn ShellExecuteW(
@@ -2184,38 +2239,26 @@ fn open_with_default(path: &std::path::Path) -> Result<(), OpenFailure> {
             show: i32,
         ) -> isize;
     }
-    fn wide(s: &std::ffi::OsStr) -> Vec<u16> {
-        s.encode_wide().chain(std::iter::once(0)).collect()
-    }
     if !path.exists() {
         return Err(OpenFailure::Missing);
     }
-    let file = wide(path.as_os_str());
-    let run = |verb: &str| {
-        let op: Vec<u16> = verb.encode_utf16().chain(std::iter::once(0)).collect();
-        let r = unsafe {
-            ShellExecuteW(
-                0,
-                op.as_ptr(),
-                file.as_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
-                1,
-            )
-        };
-        r as usize > 32
+    let file = shell_path(path);
+    let verb: Vec<u16> = "open".encode_utf16().chain(std::iter::once(0)).collect();
+    let r = unsafe {
+        ShellExecuteW(
+            0,
+            verb.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1,
+        )
     };
-    if run("open") || run("openas") {
+    if r as usize > 32 {
         return Ok(());
     }
-    // 关联指向的程序已经被卸载/删除时，上面两种 verb 都会失败，
-    // 只有老牌的 OpenAs_RunDLL 还愿意弹「选择应用」框。
-    let ok = std::process::Command::new("rundll32.exe")
-        .arg("shell32.dll,OpenAs_RunDLL")
-        .arg(path)
-        .spawn()
-        .is_ok();
-    if ok {
+    // 关联指向的程序已经被卸载/删除时，open 会失败；交给系统选择框
+    if show_open_with_dialog(path) {
         Ok(())
     } else {
         Err(OpenFailure::NoProgram)
