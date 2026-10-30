@@ -629,10 +629,7 @@ pub fn run_gui(cfg: Arc<Config>, port: u16) {
             *ctx_holder_gui.lock().unwrap() = Some(cc.egui_ctx.clone());
             // 主题跟着设置走（深浅两套配色在 pal::now() 里）
             let mut style = (*cc.egui_ctx.style()).clone();
-            style.visuals = match theme {
-                crate::settings::Theme::Light => eframe::egui::Visuals::light(),
-                crate::settings::Theme::Dark => eframe::egui::Visuals::dark(),
-            };
+            style.visuals = theme_visuals(theme);
             cc.egui_ctx.set_style(style);
             if let Some((bytes, index)) = cjk_font() {
                 let font_data = eframe::egui::FontData {
@@ -1140,10 +1137,7 @@ impl GuiApp {
         crate::settings::set_theme(next);
         self.settings.theme = next;
         self.settings.save();
-        ctx.set_visuals(match next {
-            crate::settings::Theme::Light => eframe::egui::Visuals::light(),
-            crate::settings::Theme::Dark => eframe::egui::Visuals::dark(),
-        });
+        ctx.set_visuals(theme_visuals(next));
         ctx.request_repaint();
     }
 
@@ -1566,6 +1560,11 @@ mod pal {
         pub green_dot: Color32,
         pub soft_bg: Color32,
         pub soft_fg: Color32,
+        /// 行/设备被选中时的底色，以及悬停时的浅一档
+        pub sel_bg: Color32,
+        pub sel_hover: Color32,
+        /// 选中文字时的底色（egui 会把它半透明地盖在字上，所以取贴近正文的色）
+        pub sel_text_bg: Color32,
         /// 输入框未聚焦时的边框
         pub input_border: Color32,
         /// 窗口按钮悬停底色（关闭按钮是红的）
@@ -1585,6 +1584,9 @@ mod pal {
             green_dot: Color32::from_rgb(0x34, 0xC7, 0x7B),
             soft_bg: Color32::from_rgb(0xEE, 0xF0, 0xF6),
             soft_fg: Color32::from_rgb(0x4A, 0x4F, 0x66),
+            sel_bg: Color32::from_rgb(0xE2, 0xE7, 0xFC),
+            sel_hover: Color32::from_rgb(0xF1, 0xF3, 0xFE),
+            sel_text_bg: Color32::from_rgba_unmultiplied(0x25, 0x2B, 0x4A, 90),
             input_border: Color32::from_rgb(0xD8, 0xDC, 0xE6),
             btn_hover: Color32::from_rgb(0xE9, 0xEB, 0xF2),
             btn_hover_close: Color32::from_rgb(0xE5, 0x33, 0x2E),
@@ -1603,6 +1605,9 @@ mod pal {
             green_dot: Color32::from_rgb(0x3A, 0xD1, 0x86),
             soft_bg: Color32::from_rgb(0x2E, 0x33, 0x40),
             soft_fg: Color32::from_rgb(0xC2, 0xC7, 0xD8),
+            sel_bg: Color32::from_rgb(0x35, 0x3B, 0x58),
+            sel_hover: Color32::from_rgb(0x2B, 0x30, 0x47),
+            sel_text_bg: Color32::from_rgba_unmultiplied(0xC9, 0xD0, 0xF0, 30),
             input_border: Color32::from_rgb(0x3C, 0x42, 0x52),
             btn_hover: Color32::from_rgb(0x33, 0x38, 0x47),
             btn_hover_close: Color32::from_rgb(0xE5, 0x33, 0x2E),
@@ -1616,6 +1621,25 @@ mod pal {
             crate::settings::Theme::Dark => dark(),
         }
     }
+}
+
+/// egui 默认的选中色是青绿，和这套紫蓝配色不搭，而且它是半透明地**盖在
+/// 文字上面**（浅色主题默认那层直接把 12px 的字洗到约 1.6:1，基本看不清）。
+/// 改成贴近正文的颜色、低透明度：字几乎保持原色，背景被压出一块可见的
+/// 灰蓝选区（实测浅色 5.4:1、深色 5.1:1）。光标也用主色。
+fn theme_visuals(theme: crate::settings::Theme) -> eframe::egui::Visuals {
+    let pal = match theme {
+        crate::settings::Theme::Light => pal::light(),
+        crate::settings::Theme::Dark => pal::dark(),
+    };
+    let mut v = match theme {
+        crate::settings::Theme::Light => eframe::egui::Visuals::light(),
+        crate::settings::Theme::Dark => eframe::egui::Visuals::dark(),
+    };
+    v.selection.bg_fill = pal.sel_text_bg;
+    v.selection.stroke = eframe::egui::Stroke::new(1.0_f32, pal.accent);
+    v.text_cursor.stroke = eframe::egui::Stroke::new(2.0_f32, pal.accent);
+    v
 }
 
 impl App for GuiApp {

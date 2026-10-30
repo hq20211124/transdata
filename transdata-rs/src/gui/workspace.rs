@@ -400,7 +400,13 @@ impl GuiApp {
         let indent = row.depth as f32 * 14.0;
         let font = eframe::egui::FontId::proportional(12.5);
         let pal = pal::now();
-        let name_color = if row.is_dir { pal.fg } else { pal.soft_fg };
+        let selected = self.selected.as_deref() == Some(row.rel.as_str());
+        // 选中的行把名字提回正常前景色，压在选中底色上才不显灰
+        let name_color = if row.is_dir || selected {
+            pal.fg
+        } else {
+            pal.soft_fg
+        };
         let renaming_this = self
             .renaming
             .as_ref()
@@ -438,15 +444,14 @@ impl GuiApp {
         if !ui.is_rect_visible(rect) {
             return;
         }
-        let selected = self.selected.as_deref() == Some(row.rel.as_str());
         if selected {
             ui.painter()
-                .rect(rect, 6.0, pal.soft_bg, eframe::egui::Stroke::NONE);
+                .rect(rect, 6.0, pal.sel_bg, eframe::egui::Stroke::NONE);
         } else if resp.hovered() {
             ui.painter().rect(
                 rect,
                 6.0,
-                pal.soft_bg.gamma_multiply(0.6),
+                pal.sel_hover,
                 eframe::egui::Stroke::NONE,
             );
         }
@@ -544,12 +549,17 @@ impl GuiApp {
             eframe::egui::Align2::RIGHT_CENTER,
             size_txt,
             f_small,
-            pal.muted,
+            if selected { pal.soft_fg } else { pal.muted },
         );
 
         // 行内 ✏ 🗑：常显但压得很淡，悬停才提亮（删除变红），既看得见又不吵
         let actions_rect = cols.2;
-        let base_color = pal.muted.gamma_multiply(if selected { 0.75 } else { 0.5 });
+        let base_color = if selected {
+            pal.soft_fg
+        } else {
+            pal.muted.gamma_multiply(0.5)
+        };
+        let icon_hover_bg = if selected { pal.sel_hover } else { pal.soft_bg };
         let pencil = eframe::egui::Rect::from_center_size(
             eframe::egui::pos2(actions_rect.left() + 23.0, rect.center().y),
             eframe::egui::vec2(32.0, 22.0),
@@ -561,10 +571,10 @@ impl GuiApp {
         let pr = ui.interact(pencil, ui.id().with(("pen", &row.rel)), eframe::egui::Sense::click());
         let tr = ui.interact(trash, ui.id().with(("trash", &row.rel)), eframe::egui::Sense::click());
         if pr.hovered() {
-            ui.painter().rect_filled(pencil, 5.0, pal.soft_bg);
+            ui.painter().rect_filled(pencil, 5.0, icon_hover_bg);
         }
         if tr.hovered() {
-            ui.painter().rect_filled(trash, 5.0, pal.soft_bg);
+            ui.painter().rect_filled(trash, 5.0, icon_hover_bg);
         }
         paint_pencil(
             ui.painter(),
@@ -1013,14 +1023,14 @@ impl GuiApp {
                                 ui.painter().rect(
                                     row,
                                     6.0,
-                                    pal.soft_bg,
+                                    pal.sel_bg,
                                     eframe::egui::Stroke::NONE,
                                 );
                             } else if resp.hovered() {
                                 ui.painter().rect(
                                     row,
                                     6.0,
-                                    pal.soft_bg.gamma_multiply(0.5),
+                                    pal.sel_hover,
                                     eframe::egui::Stroke::NONE,
                                 );
                             }
