@@ -16,7 +16,6 @@ pub(super) struct Row {
     pub(super) depth: usize,
     pub(super) is_dir: bool,
     pub(super) size: u64,
-    pub(super) mtime: u64,
 }
 
 /// 把 `ops::list` 的扁平条目按父子关系拼成树，再按折叠状态摊平。
@@ -61,7 +60,6 @@ pub(super) fn build_rows(
                 depth,
                 is_dir: e.is_dir,
                 size: e.size,
-                mtime: e.mtime,
             });
             if e.is_dir && !collapsed.contains(&e.rel) {
                 walk(&e.rel, depth + 1, kids, collapsed, out);
@@ -88,74 +86,6 @@ pub(super) fn fold_new_dirs(
             collapsed.insert(e.rel.clone());
         }
     }
-}
-
-/// Unix 秒 → 本地时间 `MM-DD HH:MM`。
-///
-/// 不引 chrono：Windows 上用 `FileTimeToLocalFileTime` + `FileTimeToSystemTime`
-/// 两步换算出本地时间（会跟着系统时区走），其它平台退化成 UTC。
-fn fmt_mtime(unix: u64) -> String {
-    if unix == 0 {
-        return "—".to_string();
-    }
-    #[cfg(windows)]
-    {
-        #[repr(C)]
-        #[derive(Default)]
-        struct SysTime {
-            y: u16,
-            mo: u16,
-            dow: u16,
-            d: u16,
-            h: u16,
-            mi: u16,
-            s: u16,
-            ms: u16,
-        }
-        #[repr(C)]
-        struct FileTime {
-            low: u32,
-            high: u32,
-        }
-        extern "system" {
-            fn FileTimeToLocalFileTime(ft: *const FileTime, out: *mut FileTime) -> i32;
-            fn FileTimeToSystemTime(ft: *const FileTime, out: *mut SysTime) -> i32;
-        }
-        // 1601-01-01 → 1970-01-01 的秒数
-        const EPOCH_DIFF: u64 = 11_644_473_600;
-        let ticks = (unix.saturating_add(EPOCH_DIFF)).saturating_mul(10_000_000);
-        let ft = FileTime {
-            low: ticks as u32,
-            high: (ticks >> 32) as u32,
-        };
-        let mut local = FileTime { low: 0, high: 0 };
-        let mut st = SysTime::default();
-        unsafe {
-            if FileTimeToLocalFileTime(&ft, &mut local) != 0
-                && FileTimeToSystemTime(&local, &mut st) != 0
-            {
-                return format!("{:02}-{:02} {:02}:{:02}", st.mo, st.d, st.h, st.mi);
-            }
-        }
-    }
-    let days = (unix / 86_400) as i64;
-    let secs = unix % 86_400;
-    let (_, mo, d) = civil_from_days(days);
-    format!("{:02}-{:02} {:02}:{:02}", mo, d, secs / 3600, (secs % 3600) / 60)
-}
-
-#[cfg_attr(windows, allow(dead_code))]
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    (y + if m <= 2 { 1 } else { 0 }, m, d)
 }
 
 /// 文件夹图标（矢量画，不依赖 emoji 字体）
@@ -187,25 +117,28 @@ fn paint_file(p: &eframe::egui::Painter, c: eframe::egui::Pos2, color: eframe::e
 }
 
 /// 铅笔（改名）
-fn paint_pencil(p: &eframe::egui::Painter, c: eframe::egui::Pos2, color: eframe::egui::Color32) {
+fn paint_pencil(p: &eframe::egui::Painter, c: eframe::egui::Pos2, color: eframe::egui::Color32, k: f32) {
     use eframe::egui::{pos2, Stroke};
     p.line_segment(
-        [pos2(c.x - 3.5, c.y + 3.5), pos2(c.x + 3.5, c.y - 3.5)],
-        Stroke::new(1.6_f32, color),
+        [pos2(c.x - 3.5 * k, c.y + 3.5 * k), pos2(c.x + 3.5 * k, c.y - 3.5 * k)],
+        Stroke::new(1.6_f32 * k, color),
     );
     p.line_segment(
-        [pos2(c.x - 3.5, c.y + 3.5), pos2(c.x - 1.0, c.y + 2.6)],
-        Stroke::new(1.2_f32, color),
+        [pos2(c.x - 3.5 * k, c.y + 3.5 * k), pos2(c.x - 1.0 * k, c.y + 2.6 * k)],
+        Stroke::new(1.2_f32 * k, color),
     );
 }
 
 /// 垃圾桶（删除）
-fn paint_trash(p: &eframe::egui::Painter, c: eframe::egui::Pos2, color: eframe::egui::Color32) {
+fn paint_trash(p: &eframe::egui::Painter, c: eframe::egui::Pos2, color: eframe::egui::Color32, k: f32) {
     use eframe::egui::{pos2, Rect, Stroke};
-    let s = Stroke::new(1.2_f32, color);
-    p.line_segment([pos2(c.x - 4.0, c.y - 3.0), pos2(c.x + 4.0, c.y - 3.0)], s);
-    p.line_segment([pos2(c.x - 1.5, c.y - 4.5), pos2(c.x + 1.5, c.y - 4.5)], s);
-    let body = Rect::from_min_size(pos2(c.x - 3.0, c.y - 1.5), eframe::egui::vec2(6.0, 6.5));
+    let s = Stroke::new(1.2_f32 * k, color);
+    p.line_segment([pos2(c.x - 4.0 * k, c.y - 3.0 * k), pos2(c.x + 4.0 * k, c.y - 3.0 * k)], s);
+    p.line_segment([pos2(c.x - 1.5 * k, c.y - 4.5 * k), pos2(c.x + 1.5 * k, c.y - 4.5 * k)], s);
+    let body = Rect::from_min_size(
+        pos2(c.x - 3.0 * k, c.y - 1.5 * k),
+        eframe::egui::vec2(6.0 * k, 6.5 * k),
+    );
     p.rect(body, 1.0, eframe::egui::Color32::TRANSPARENT, s);
 }
 
@@ -393,8 +326,7 @@ impl GuiApp {
                 let f = eframe::egui::FontId::proportional(11.0);
                 let c = pal::now().muted;
                 p.text(cols.0.left_center(), eframe::egui::Align2::LEFT_CENTER, "名称", f.clone(), c);
-                p.text(cols.1.right_center(), eframe::egui::Align2::RIGHT_CENTER, "大小", f.clone(), c);
-                p.text(cols.2.right_center(), eframe::egui::Align2::RIGHT_CENTER, "修改时间", f, c);
+                p.text(cols.1.right_center(), eframe::egui::Align2::RIGHT_CENTER, "大小", f, c);
             });
             rect.min.y = head.bottom();
 
@@ -599,7 +531,7 @@ impl GuiApp {
                 .galley(eframe::egui::pos2(name_left, y), g, name_color);
         }
 
-        // 大小 / 修改时间
+        // 大小
         let f_small = eframe::egui::FontId::proportional(11.0);
         let size_txt = if row.is_dir {
             String::new()
@@ -610,30 +542,20 @@ impl GuiApp {
             cols.1.right_center(),
             eframe::egui::Align2::RIGHT_CENTER,
             size_txt,
-            f_small.clone(),
-            pal.muted,
-        );
-        ui.painter().text(
-            cols.2.right_center(),
-            eframe::egui::Align2::RIGHT_CENTER,
-            fmt_mtime(row.mtime),
             f_small,
             pal.muted,
         );
 
         // 行内 ✏ 🗑（悬停或选中时才出现，免得整屏都是按钮）
-        let actions_rect = eframe::egui::Rect::from_min_max(
-            eframe::egui::pos2(cols.2.right() + 2.0, rect.top()),
-            rect.max,
-        );
+        let actions_rect = cols.2;
         if resp.hovered() || selected {
             let pencil = eframe::egui::Rect::from_center_size(
-                eframe::egui::pos2(actions_rect.left() + 9.0, rect.center().y),
-                eframe::egui::vec2(18.0, 18.0),
+                eframe::egui::pos2(actions_rect.left() + 23.0, rect.center().y),
+                eframe::egui::vec2(32.0, 22.0),
             );
             let trash = eframe::egui::Rect::from_center_size(
-                eframe::egui::pos2(actions_rect.left() + 29.0, rect.center().y),
-                eframe::egui::vec2(18.0, 18.0),
+                eframe::egui::pos2(actions_rect.left() + 59.0, rect.center().y),
+                eframe::egui::vec2(32.0, 22.0),
             );
             let pr = ui.interact(pencil, ui.id().with(("pen", &row.rel)), eframe::egui::Sense::click());
             let tr = ui.interact(trash, ui.id().with(("trash", &row.rel)), eframe::egui::Sense::click());
@@ -647,6 +569,7 @@ impl GuiApp {
                 ui.painter(),
                 pencil.center(),
                 if pr.hovered() { pal.accent } else { pal.muted },
+                1.3,
             );
             paint_trash(
                 ui.painter(),
@@ -656,6 +579,7 @@ impl GuiApp {
                 } else {
                     pal.muted
                 },
+                1.3,
             );
             if pr.clicked() {
                 self.selected = Some(row.rel.clone());
@@ -760,6 +684,7 @@ impl GuiApp {
         let url = self.base_url();
         let mut toggle_hidden = false;
         let mut copy_addr = false;
+        let mut rotate_code = false;
         let mut tls_changed: Option<bool> = None;
         let mut copy_fp = false;
 
@@ -796,8 +721,8 @@ impl GuiApp {
 
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 10.0;
-                    // 二维码 86
-                    let qr = 86.0_f32;
+                    // 二维码：卡里空着的地方都给它，扫起来更快
+                    let qr = 112.0_f32;
                     let (qr_rect, qr_resp) = ui.allocate_exact_size(
                         eframe::egui::vec2(qr, qr),
                         eframe::egui::Sense::click(),
@@ -873,15 +798,21 @@ impl GuiApp {
                                 self.ips.join("、")
                             ));
                         }
-                        if btn_link(ui, "复制地址") {
-                            copy_addr = true;
-                        }
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 12.0;
+                            if btn_link(ui, "复制地址") {
+                                copy_addr = true;
+                            }
+                            if btn_link(ui, "换一张码") {
+                                rotate_code = true;
+                            }
+                        });
                     });
                 });
 
                 if let Some(secs) = self.cfg.pair_lock_left() {
                     ui.label(
-                        RichText::new(format!("已锁定，{secs} 秒后可重试（设置里可换码）"))
+                        RichText::new(format!("已锁定，{secs} 秒后可重试（换一张码可立即解除）"))
                             .size(10.0)
                             .color(pal::now().btn_hover_close),
                     );
@@ -946,6 +877,14 @@ impl GuiApp {
         if copy_addr {
             ctx.copy_text(url);
             self.pair_msg = "地址已复制".to_string();
+        }
+        if rotate_code {
+            let (code, secret) = self.cfg.reset_pairing();
+            self.pair_code = code;
+            self.pair_secret = secret;
+            self.pair_hidden = false;
+            self.pair_msg = "已换一张新码，旧码立即失效".to_string();
+            self.refresh_qr(ctx);
         }
         if copy_fp {
             if let Some(m) = self.cfg.tls_material() {
@@ -1708,29 +1647,27 @@ fn note_expand_icon(ui: &mut eframe::egui::Ui, rect: eframe::egui::Rect, expande
     .clicked()
 }
 
-/// 目录行的列边界：名称（弹性）/ 大小 / 修改时间 / 行内按钮
+/// 目录行的列边界：名称（弹性）/ 大小 / 行内按钮
 fn dir_columns(r: eframe::egui::Rect) -> (
     eframe::egui::Rect,
     eframe::egui::Rect,
     eframe::egui::Rect,
 ) {
-    let actions_w = 46.0;
+    let actions_w = 78.0;
     let size_w = 66.0;
-    let time_w = 84.0;
-    let right = r.right() - actions_w;
-    let time = eframe::egui::Rect::from_min_max(
-        eframe::egui::pos2(right - time_w, r.top()),
-        eframe::egui::pos2(right, r.bottom()),
+    let actions = eframe::egui::Rect::from_min_max(
+        eframe::egui::pos2(r.right() - actions_w, r.top()),
+        eframe::egui::pos2(r.right(), r.bottom()),
     );
     let size = eframe::egui::Rect::from_min_max(
-        eframe::egui::pos2(time.left() - size_w, r.top()),
-        eframe::egui::pos2(time.left(), r.bottom()),
+        eframe::egui::pos2(actions.left() - size_w, r.top()),
+        eframe::egui::pos2(actions.left(), r.bottom()),
     );
     let name = eframe::egui::Rect::from_min_max(
         eframe::egui::pos2(r.left() + 4.0, r.top()),
         eframe::egui::pos2(size.left() - 6.0, r.bottom()),
     );
-    (name, size, time)
+    (name, size, actions)
 }
 
 /// 设备表的列边界：IP / 空闲 / 开关（+ 断开）
