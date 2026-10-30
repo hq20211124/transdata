@@ -743,9 +743,13 @@ impl GuiApp {
                                         pal::now().muted,
                                     );
                                 } else if let Some(h) = &self.qr_handle {
+                                    // 码本身不带白边，这里留 3px + 框的 4px 当静区
                                     ui.add(
                                         eframe::egui::widgets::Image::from_texture(h)
-                                            .max_size(eframe::egui::vec2(qr - 8.0, qr - 8.0)),
+                                            .fit_to_exact_size(eframe::egui::vec2(
+                                                qr - 6.0,
+                                                qr - 6.0,
+                                            )),
                                     );
                                 }
                             });
@@ -803,7 +807,7 @@ impl GuiApp {
                             if btn_link(ui, "复制地址") {
                                 copy_addr = true;
                             }
-                            if btn_link(ui, "换一张码") {
+                            if btn_link(ui, "刷新二维码") {
                                 rotate_code = true;
                             }
                         });
@@ -812,7 +816,7 @@ impl GuiApp {
 
                 if let Some(secs) = self.cfg.pair_lock_left() {
                     ui.label(
-                        RichText::new(format!("已锁定，{secs} 秒后可重试（换一张码可立即解除）"))
+                        RichText::new(format!("已锁定，{secs} 秒后可重试（刷新二维码可立即解除）"))
                             .size(10.0)
                             .color(pal::now().btn_hover_close),
                     );
@@ -883,7 +887,7 @@ impl GuiApp {
             self.pair_code = code;
             self.pair_secret = secret;
             self.pair_hidden = false;
-            self.pair_msg = "已换一张新码，旧码立即失效".to_string();
+            self.pair_msg = "二维码已刷新，旧码立即失效".to_string();
             self.refresh_qr(ctx);
         }
         if copy_fp {

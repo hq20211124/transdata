@@ -877,15 +877,16 @@ impl GuiApp {
         // device that scans the code.
         let payload = format!("{}#k={}", self.base_url(), self.pair_secret);
         if let Ok(qr) = qrcode::QrCode::new(&payload) {
-            // Keep the texture small: the card displays the QR at 132px, so
-            // ~360px is already 2.7x supersampled. 60px/module produced a
+            // Keep the texture small: the card displays the QR at ~100px, so
+            // ~360px is already 3.5x supersampled. 60px/module produced a
             // 9900x9900 texture that exceeds wgpu's 8192 limit and panicked.
             let modules = qr.version().width() as u32;
             let scale = ((360u32) / modules.max(1)).clamp(1, 12);
             let buf = qr
                 .render::<image::Rgba<u8>>()
                 .module_dimensions(scale, scale)
-                .quiet_zone(true)
+                // 不留静区：白边由卡片的框内边距提供，否则码看起来填不满框。
+                .quiet_zone(false)
                 .build();
             let w: usize = buf.width() as usize;
             let h: usize = buf.height() as usize;
