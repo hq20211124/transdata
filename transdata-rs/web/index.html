@@ -30,6 +30,21 @@
     </div>
 </div>
 
+<!-- 改名 / 删除确认。不用原生 prompt / confirm：部分手机浏览器会直接把系统
+     弹窗吞掉（prompt 返回空、confirm 返回 false），点按钮就像没反应。 -->
+<div class="modal" id="opModal" hidden>
+    <div class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="opTitle">
+        <h3 class="modal-title" id="opTitle"></h3>
+        <p class="modal-text" id="opText" hidden></p>
+        <input class="modal-input" id="opInput" type="text" autocomplete="off"
+               autocapitalize="off" spellcheck="false" hidden>
+        <div class="modal-actions">
+            <button class="btn btn--soft" id="opCancel" type="button">取消</button>
+            <button class="btn btn--primary" id="opOk" type="button">确定</button>
+        </div>
+    </div>
+</div>
+
 <!-- ===================== 主界面 ===================== -->
 <div id="appView" class="app" hidden>
 

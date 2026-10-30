@@ -187,6 +187,76 @@
         initDownload();
         initNote();
         initServerInfo();
+        initDialog();
+    }
+
+    /* ------------------------------------------------------------- 弹窗 */
+
+    /* 改名 / 删除确认用页面内自绘的弹窗，不用原生 prompt / confirm：
+       部分手机浏览器（还有 App 内嵌 WebView）会把系统弹窗直接吞掉，
+       prompt 返回空、confirm 返回 false，点按钮看起来就是「没反应」。 */
+
+    var dlg = null;   // { mode, resolve, opener }
+
+    function initDialog() {
+        var modal = $('opModal');
+        if (!modal) return;
+        $('opCancel').addEventListener('click', function () { closeDialog(null); });
+        $('opOk').addEventListener('click', function () { submitDialog(); });
+        // 点遮罩关闭；点面板内部不关
+        modal.addEventListener('click', function (e) {
+            if (e.target === modal) closeDialog(null);
+        });
+        $('opInput').addEventListener('keydown', function (e) {
+            if (e.key === 'Enter') { e.preventDefault(); submitDialog(); }
+        });
+        document.addEventListener('keydown', function (e) {
+            if (dlg && e.key === 'Escape') { e.preventDefault(); closeDialog(null); }
+        });
+    }
+
+    /* opts: { title, text?, input?, okLabel?, danger? } → Promise
+       带 input 时返回输入串（取消为 null），否则返回 true / null */
+    function openDialog(opts) {
+        return new Promise(function (resolve) {
+            dlg = { mode: opts.input != null ? 'input' : 'confirm', resolve: resolve, opener: document.activeElement };
+            $('opTitle').textContent = opts.title || '';
+            var text = $('opText');
+            text.textContent = opts.text || '';
+            text.hidden = !opts.text;
+            var ok = $('opOk');
+            ok.textContent = opts.okLabel || '确定';
+            ok.className = 'btn ' + (opts.danger ? 'btn--danger-solid' : 'btn--primary');
+            var input = $('opInput');
+            input.hidden = opts.input == null;
+            input.value = opts.input || '';
+            $('opModal').hidden = false;
+            if (opts.input != null) {
+                input.focus();
+                // 选中主名、保留扩展名：改个名不用先删掉 .epub
+                var slash = Math.max(input.value.lastIndexOf('/'), input.value.lastIndexOf('\\'));
+                var dot = input.value.lastIndexOf('.');
+                var end = dot > slash + 1 ? dot : input.value.length;
+                try { input.setSelectionRange(slash + 1, end); } catch (e) { input.select(); }
+            } else {
+                ok.focus();
+            }
+        });
+    }
+
+    function submitDialog() {
+        if (!dlg) return;
+        var isInput = dlg.mode === 'input';
+        closeDialog(isInput ? $('opInput').value.trim() : true);
+    }
+
+    function closeDialog(value) {
+        var d = dlg;
+        if (!d) return;
+        dlg = null;
+        $('opModal').hidden = true;
+        if (d.opener && d.opener.focus) d.opener.focus();
+        d.resolve(value);
     }
 
     /* ------------------------------------------------------------------ tabs */
@@ -842,18 +912,34 @@
             return btn;
         }
         btn.addEventListener('click', function () {
-            var next = prompt('新的名字（可以带子目录，例如 归档/' + node.name + '）', node.path);
-            if (next == null) return;
-            next = next.trim().replace(/^\/+|\/+$/g, '');
-            if (!next || next === node.path) return;
-            apiJson('/rename', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ from: node.path, to: next })
-            }).then(function (j) {
-                if (j && j.success) { loadFiles(); }
-                else { alert('重命名失败：' + ((j && j.error) || '未知错误')); }
-            }).catch(function () { alert('重命名失败（网络错误）'); });
+            openDialog({
+                title: '重命名 / 移动',
+                text: '可以带子目录，例如 归档/' + node.name,
+                input: node.path,
+                okLabel: '改名'
+            }).then(function (next) {
+                if (next == null) return;
+                next = next.replace(/^\/+|\/+$/g, '');
+                if (!next) return;
+                if (next === node.path) {
+                    notice($('dlNotice'), '名字没有变化', 'info');
+                    return;
+                }
+                apiJson('/rename', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ from: node.path, to: next })
+                }).then(function (j) {
+                    if (j && j.success) {
+                        notice($('dlNotice'), '已改名：' + node.name + ' → ' + next, 'ok');
+                        loadFiles();
+                    } else {
+                        notice($('dlNotice'), '重命名失败：' + ((j && j.error) || '未知错误'), 'err');
+                    }
+                }).catch(function () {
+                    notice($('dlNotice'), '重命名失败（网络错误）', 'err');
+                });
+            });
         });
         return btn;
     }
@@ -873,11 +959,24 @@
             var what = isDir
                 ? '整个文件夹「' + name + '」及其里的所有文件'
                 : '「' + name + '」';
-            if (!confirm('删除' + what + '？该操作不可恢复。')) return;
-            apiJson('/delete/' + encPath(path), { method: 'DELETE' }).then(function (j) {
-                if (j && j.success) { loadFiles(); }
-                else { alert('删除失败：' + ((j && j.error) || '未知错误')); }
-            }).catch(function () { alert('删除失败'); });
+            openDialog({
+                title: '删除' + (isDir ? '文件夹' : '文件'),
+                text: '删除' + what + '？删除后不可恢复。',
+                okLabel: '删除',
+                danger: true
+            }).then(function (ok) {
+                if (!ok) return;
+                apiJson('/delete/' + encPath(path), { method: 'DELETE' }).then(function (j) {
+                    if (j && j.success) {
+                        notice($('dlNotice'), '已删除 ' + name, 'ok');
+                        loadFiles();
+                    } else {
+                        notice($('dlNotice'), '删除失败：' + ((j && j.error) || '未知错误'), 'err');
+                    }
+                }).catch(function () {
+                    notice($('dlNotice'), '删除失败（网络错误）', 'err');
+                });
+            });
         });
         return btn;
     }

@@ -133,6 +133,10 @@ body {
 .btn--danger { color: var(--danger); }
 .btn--danger:hover { background: var(--danger-soft); color: var(--danger); }
 
+/* 破坏性操作的主按钮：实心红。前景色用 --surface，浅色下是白字、深色下是深字 */
+.btn--danger-solid { background: var(--danger); color: var(--surface); box-shadow: var(--shadow-sm); }
+.btn--danger-solid:hover { background: var(--danger); filter: brightness(1.07); }
+
 .btn--sm { height: 30px; padding: 0 10px; font-size: 12.5px; }
 /* 列表行内的小按钮：跟行高齐平，不把行撑高 */
 .btn--xs { height: 18px; padding: 0 6px; font-size: 11px; border-radius: 5px; font-weight: 600; gap: 3px; }
@@ -551,6 +555,52 @@ body {
 .notice--info { background: var(--accent-soft); color: var(--accent-soft-fg); border-color: color-mix(in srgb, var(--accent) 22%, transparent); }
 .notice--warn { background: var(--warn-soft); color: var(--warn); border-color: color-mix(in srgb, var(--warn) 25%, transparent); }
 
+/* ------------------------------------------------------------------ modal */
+/* 改名 / 删除确认：页面内自绘，不依赖会被部分手机浏览器吞掉的 prompt/confirm */
+
+.modal {
+    position: fixed;
+    inset: 0;
+    z-index: 60;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 18px;
+    background: rgba(12, 14, 20, .45);
+}
+
+.modal-panel {
+    width: 100%;
+    max-width: 380px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 16px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow-md);
+}
+
+.modal-title { margin: 0; font-size: 15px; font-weight: 700; letter-spacing: -.01em; }
+.modal-text { margin: 0; font-size: 12.5px; line-height: 1.5; color: var(--fg-muted); word-break: break-word; }
+
+.modal-input {
+    width: 100%;
+    height: 38px;
+    padding: 0 10px;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-sm);
+    background: var(--surface-2);
+    color: var(--fg);
+    font: 500 13.5px/1 inherit;
+    font-family: inherit;
+}
+.modal-input:focus { outline: none; border-color: var(--accent); box-shadow: var(--ring); }
+
+.modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 2px; }
+.modal-actions .btn { min-width: 78px; }
+
 /* ------------------------------------------------------------------ empty */
 
 .empty {
@@ -677,6 +727,11 @@ body {
 @media (max-width: 620px) {
     .container { padding-top: 12px; padding-bottom: 10px; }
     .panel { padding: 12px; border-radius: 12px; gap: 10px; }
+
+    /* 弹窗靠上：手机键盘弹起时不会盖住输入框 */
+    .modal { align-items: flex-start; padding-top: 56px; }
+    /* < 16px 会在 iOS 上触发整页放大 */
+    .modal-input { font-size: 16px; }
 
     /* 手机上省出高度，让「开始上传」不被吸底发送框挡住 */
     .filelist li { padding: 1px 5px; }
