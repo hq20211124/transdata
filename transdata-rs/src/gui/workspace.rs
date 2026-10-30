@@ -615,6 +615,10 @@ impl GuiApp {
                         name: row.name.clone(),
                     });
                 } else if let Some(path) = crate::ops::resolve_rel(&self.cfg, &row.rel) {
+                    // 系统弹窗要等一两秒，先给个回声，免得看起来像没反应
+                    self.status_msg = format!("正在打开「{}」…", row.name);
+                    self.status_at = Some(std::time::Instant::now());
+                    self.status_is_err = false;
                     if let Err(why) = open_with_default(&path) {
                         self.report_open_failure(&row.name, why);
                     }
