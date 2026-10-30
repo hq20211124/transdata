@@ -1551,7 +1551,7 @@ impl GuiApp {
             (c.rel.clone(), c.name.clone(), c.is_dir, c.items);
         let mut close = false;
         let mut go = false;
-        eframe::egui::Window::new("确认删除")
+        eframe::egui::Window::new(if is_dir { "删除文件夹" } else { "删除文件" })
             .collapsible(false)
             .resizable(false)
             .anchor(eframe::egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -1575,8 +1575,8 @@ impl GuiApp {
                 }
                 ui.add_space(4.0);
                 ui.label(
-                    RichText::new("不可撤销，配额立即归还。")
-                        .size(11.0)
+                    RichText::new("删了就找不回来，确定不要了吗？")
+                        .size(11.5)
                         .color(pal::now().btn_hover_close),
                 );
                 ui.add_space(10.0);
