@@ -710,7 +710,7 @@ impl GuiApp {
                                 toggle_hidden = true;
                             }
                             ui.label(
-                                RichText::new("未配对的设备看不到文件")
+                                RichText::new(tip)
                                     .size(10.0)
                                     .color(pal::now().muted),
                             );
