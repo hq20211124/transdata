@@ -2162,10 +2162,16 @@ fn looks_like_program(name: &str) -> bool {
     )
 }
 
-/// 用系统默认程序打开（= 资源管理器里双击）。没有关联程序时弹系统的
-/// 「你要如何打开这个文件？」选择框；返回是否成功。
+/// 打开失败的原因：文件真没了，还是系统没有能打开它的程序。
+enum OpenFailure {
+    Missing,
+    NoProgram,
+}
+
+/// 用系统默认程序打开（= 资源管理器里双击）。默认程序装不上/注册表
+/// 指向一个已不存在的 exe 时，退回系统「选择一个应用」选择框。
 #[cfg(windows)]
-fn open_with_default(path: &std::path::Path) -> bool {
+fn open_with_default(path: &std::path::Path) -> Result<(), OpenFailure> {
     use std::os::windows::ffi::OsStrExt;
     #[link(name = "shell32")]
     extern "system" {
@@ -2180,6 +2186,9 @@ fn open_with_default(path: &std::path::Path) -> bool {
     }
     fn wide(s: &std::ffi::OsStr) -> Vec<u16> {
         s.encode_wide().chain(std::iter::once(0)).collect()
+    }
+    if !path.exists() {
+        return Err(OpenFailure::Missing);
     }
     let file = wide(path.as_os_str());
     let run = |verb: &str| {
@@ -2196,12 +2205,30 @@ fn open_with_default(path: &std::path::Path) -> bool {
         };
         r as usize > 32
     };
-    run("open") || run("openas")
+    if run("open") || run("openas") {
+        return Ok(());
+    }
+    // 关联指向的程序已经被卸载/删除时，上面两种 verb 都会失败，
+    // 只有老牌的 OpenAs_RunDLL 还愿意弹「选择应用」框。
+    let ok = std::process::Command::new("rundll32.exe")
+        .arg("shell32.dll,OpenAs_RunDLL")
+        .arg(path)
+        .spawn()
+        .is_ok();
+    if ok {
+        Ok(())
+    } else {
+        Err(OpenFailure::NoProgram)
+    }
 }
 
 #[cfg(not(windows))]
-fn open_with_default(_path: &std::path::Path) -> bool {
-    false
+fn open_with_default(path: &std::path::Path) -> Result<(), OpenFailure> {
+    if path.exists() {
+        Err(OpenFailure::NoProgram)
+    } else {
+        Err(OpenFailure::Missing)
+    }
 }
 
 /// Write `text` to the Windows system clipboard (CF_UNICODETEXT).

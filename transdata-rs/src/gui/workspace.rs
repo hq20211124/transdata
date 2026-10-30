@@ -615,18 +615,21 @@ impl GuiApp {
                         name: row.name.clone(),
                     });
                 } else if let Some(path) = crate::ops::resolve_rel(&self.cfg, &row.rel) {
-                    if !open_with_default(&path) {
-                        self.report_open_failure(&row.name);
+                    if let Err(why) = open_with_default(&path) {
+                        self.report_open_failure(&row.name, why);
                     }
                 } else {
-                    self.report_open_failure(&row.name);
+                    self.report_open_failure(&row.name, OpenFailure::Missing);
                 }
             }
         }
     }
 
-    fn report_open_failure(&mut self, name: &str) {
-        self.status_msg = format!("打不开「{name}」：文件可能已经不在了");
+    fn report_open_failure(&mut self, name: &str, why: OpenFailure) {
+        self.status_msg = match why {
+            OpenFailure::Missing => format!("打不开「{name}」：文件可能已经不在了"),
+            OpenFailure::NoProgram => format!("「{name}」打不开：系统里没有能打开它的应用"),
+        };
         self.status_at = Some(std::time::Instant::now());
         self.status_is_err = true;
     }
@@ -1695,12 +1698,15 @@ impl GuiApp {
         if go {
             self.confirm_run = None;
             match crate::ops::resolve_rel(&self.cfg, &rel) {
-                Some(path) if open_with_default(&path) => {
-                    self.status_msg = format!("已打开 {name}");
-                    self.status_at = Some(std::time::Instant::now());
-                    self.status_is_err = false;
-                }
-                _ => self.report_open_failure(&name),
+                Some(path) => match open_with_default(&path) {
+                    Ok(()) => {
+                        self.status_msg = format!("已打开 {name}");
+                        self.status_at = Some(std::time::Instant::now());
+                        self.status_is_err = false;
+                    }
+                    Err(why) => self.report_open_failure(&name, why),
+                },
+                None => self.report_open_failure(&name, OpenFailure::Missing),
             }
             ctx.request_repaint();
         }
