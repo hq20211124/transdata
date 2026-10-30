@@ -546,52 +546,51 @@ impl GuiApp {
             pal.muted,
         );
 
-        // 行内 ✏ 🗑（悬停或选中时才出现，免得整屏都是按钮）
+        // 行内 ✏ 🗑：常显但压得很淡，悬停才提亮（删除变红），既看得见又不吵
         let actions_rect = cols.2;
-        if resp.hovered() || selected {
-            let pencil = eframe::egui::Rect::from_center_size(
-                eframe::egui::pos2(actions_rect.left() + 23.0, rect.center().y),
-                eframe::egui::vec2(32.0, 22.0),
-            );
-            let trash = eframe::egui::Rect::from_center_size(
-                eframe::egui::pos2(actions_rect.left() + 59.0, rect.center().y),
-                eframe::egui::vec2(32.0, 22.0),
-            );
-            let pr = ui.interact(pencil, ui.id().with(("pen", &row.rel)), eframe::egui::Sense::click());
-            let tr = ui.interact(trash, ui.id().with(("trash", &row.rel)), eframe::egui::Sense::click());
-            if pr.hovered() {
-                ui.painter().rect_filled(pencil, 5.0, pal.soft_bg);
-            }
+        let base_color = pal.muted.gamma_multiply(if selected { 0.75 } else { 0.5 });
+        let pencil = eframe::egui::Rect::from_center_size(
+            eframe::egui::pos2(actions_rect.left() + 23.0, rect.center().y),
+            eframe::egui::vec2(32.0, 22.0),
+        );
+        let trash = eframe::egui::Rect::from_center_size(
+            eframe::egui::pos2(actions_rect.left() + 59.0, rect.center().y),
+            eframe::egui::vec2(32.0, 22.0),
+        );
+        let pr = ui.interact(pencil, ui.id().with(("pen", &row.rel)), eframe::egui::Sense::click());
+        let tr = ui.interact(trash, ui.id().with(("trash", &row.rel)), eframe::egui::Sense::click());
+        if pr.hovered() {
+            ui.painter().rect_filled(pencil, 5.0, pal.soft_bg);
+        }
+        if tr.hovered() {
+            ui.painter().rect_filled(trash, 5.0, pal.soft_bg);
+        }
+        paint_pencil(
+            ui.painter(),
+            pencil.center(),
+            if pr.hovered() { pal.accent } else { base_color },
+            1.3,
+        );
+        paint_trash(
+            ui.painter(),
+            trash.center(),
             if tr.hovered() {
-                ui.painter().rect_filled(trash, 5.0, pal.soft_bg);
-            }
-            paint_pencil(
-                ui.painter(),
-                pencil.center(),
-                if pr.hovered() { pal.accent } else { pal.muted },
-                1.3,
-            );
-            paint_trash(
-                ui.painter(),
-                trash.center(),
-                if tr.hovered() {
-                    pal.btn_hover_close
-                } else {
-                    pal.muted
-                },
-                1.3,
-            );
-            if pr.clicked() {
-                self.selected = Some(row.rel.clone());
-                self.renaming = Some((row.rel.clone(), row.name.clone()));
-                self.rename_fresh = true;
-                ctx.request_repaint();
-                return;
-            }
-            if tr.clicked() {
-                self.ask_delete(row);
-                return;
-            }
+                pal.btn_hover_close
+            } else {
+                base_color
+            },
+            1.3,
+        );
+        if pr.clicked() {
+            self.selected = Some(row.rel.clone());
+            self.renaming = Some((row.rel.clone(), row.name.clone()));
+            self.rename_fresh = true;
+            ctx.request_repaint();
+            return;
+        }
+        if tr.clicked() {
+            self.ask_delete(row);
+            return;
         }
 
         if resp.clicked() {
