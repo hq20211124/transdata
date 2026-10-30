@@ -721,39 +721,38 @@ impl GuiApp {
 
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 10.0;
-                    // 二维码：卡里空着的地方都给它，扫起来更快
+                    // 二维码：白底方框自己画（居中、四边留白一致），码贴到框里
                     let qr = 112.0_f32;
                     let (qr_rect, qr_resp) = ui.allocate_exact_size(
                         eframe::egui::vec2(qr, qr),
                         eframe::egui::Sense::click(),
                     );
-                    eframe::egui::Frame::none()
-                        .fill(eframe::egui::Color32::WHITE)
-                        .rounding(8.0)
-                        .stroke(eframe::egui::Stroke::new(1.0_f32, pal::now().card_border))
-                        .inner_margin(eframe::egui::Margin::same(4.0))
-                        .show(ui, |ui| {
-                            ui.allocate_ui_at_rect(qr_rect, |ui| {
-                                if self.pair_hidden {
-                                    ui.painter().text(
-                                        qr_rect.center(),
-                                        eframe::egui::Align2::CENTER_CENTER,
-                                        "已隐藏\n点眼睛显示",
-                                        eframe::egui::FontId::proportional(10.0),
-                                        pal::now().muted,
-                                    );
-                                } else if let Some(h) = &self.qr_handle {
-                                    // 码本身不带白边，这里留 3px + 框的 4px 当静区
-                                    ui.add(
-                                        eframe::egui::widgets::Image::from_texture(h)
-                                            .fit_to_exact_size(eframe::egui::vec2(
-                                                qr - 6.0,
-                                                qr - 6.0,
-                                            )),
-                                    );
-                                }
-                            });
-                        });
+                    ui.painter().rect(
+                        qr_rect,
+                        8.0,
+                        eframe::egui::Color32::WHITE,
+                        eframe::egui::Stroke::new(1.0_f32, pal::now().card_border),
+                    );
+                    if self.pair_hidden {
+                        ui.painter().text(
+                            qr_rect.center(),
+                            eframe::egui::Align2::CENTER_CENTER,
+                            "已隐藏\n点眼睛显示",
+                            eframe::egui::FontId::proportional(10.0),
+                            pal::now().muted,
+                        );
+                    } else if let Some(h) = &self.qr_handle {
+                        // 码本身不带白边，四周 5px 白框就是静区
+                        ui.painter().image(
+                            h.id(),
+                            qr_rect.shrink(5.0),
+                            eframe::egui::Rect::from_min_max(
+                                eframe::egui::pos2(0.0, 0.0),
+                                eframe::egui::pos2(1.0, 1.0),
+                            ),
+                            eframe::egui::Color32::WHITE,
+                        );
+                    }
                     if qr_resp.clicked() && self.pair_hidden {
                         toggle_hidden = true;
                     }
@@ -789,12 +788,33 @@ impl GuiApp {
                                 self.pair_msg = "配对码已复制".to_string();
                             }
                         }
-                        let f = eframe::egui::FontId::monospace(10.5);
-                        let addr = ui.label(
-                            RichText::new(elide(ctx, &url, f.clone(), ui.available_width() - 4.0))
-                                .font(f)
-                                .color(pal::now().accent),
+                        // 地址不省略：先缩字号尽量整行放下，实在放不下再换行
+                        let avail = ui.available_width() - 2.0;
+                        let mut font = eframe::egui::FontId::monospace(10.5);
+                        for cand in [10.5_f32, 10.0, 9.5, 9.0] {
+                            font = eframe::egui::FontId::monospace(cand);
+                            let fits = ui.fonts(|fonts| {
+                                fonts
+                                    .layout_no_wrap(
+                                        url.clone(),
+                                        font.clone(),
+                                        eframe::egui::Color32::WHITE,
+                                    )
+                                    .size()
+                                    .x
+                            }) <= avail;
+                            if fits {
+                                break;
+                            }
+                        }
+                        let mut job = eframe::egui::text::LayoutJob::simple(
+                            url.clone(),
+                            font,
+                            pal::now().accent,
+                            avail,
                         );
+                        job.wrap.break_anywhere = true;
+                        let addr = ui.label(job);
                         // 热点 / 双网卡时默认路由的 IP 未必是手机能连上的那个
                         if self.ips.len() > 1 {
                             addr.on_hover_text(format!(
