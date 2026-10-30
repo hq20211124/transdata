@@ -1002,8 +1002,7 @@ impl GuiApp {
                 let p = ui.painter();
                 p.text(c.0.left_center(), eframe::egui::Align2::LEFT_CENTER, "设备", f.clone(), muted);
                 p.text(c.1.center_top(), eframe::egui::Align2::CENTER_TOP, "空闲", f.clone(), muted);
-                p.text(c.2.center_top(), eframe::egui::Align2::CENTER_TOP, "传输", f.clone(), muted);
-                p.text(c.3.center_top(), eframe::egui::Align2::CENTER_TOP, "删除/修改", f, muted);
+                p.text(c.2.center_top(), eframe::egui::Align2::CENTER_TOP, "删除/修改", f, muted);
 
                 eframe::egui::ScrollArea::vertical()
                     .id_source("device_list")
@@ -1055,20 +1054,12 @@ impl GuiApp {
                                 cols.1.center(),
                                 eframe::egui::Align2::CENTER_CENTER,
                                 fmt_ago_short(d.idle_secs),
-                                f_small.clone(),
-                                pal.muted,
-                            );
-                            // 传输列永远绿：上传下载不受授权影响
-                            ui.painter().text(
-                                cols.2.center(),
-                                eframe::egui::Align2::CENTER_CENTER,
-                                "↑↓",
                                 f_small,
-                                pal.green,
+                                pal.muted,
                             );
                             // 授权开关
                             let sw_rect = eframe::egui::Rect::from_center_size(
-                                cols.3.center(),
+                                cols.2.center(),
                                 eframe::egui::vec2(30.0, 16.0),
                             );
                             let mut on = d.allow_write;
@@ -1100,7 +1091,7 @@ impl GuiApp {
                             }
                             // 断开
                             let kick_rect = eframe::egui::Rect::from_min_max(
-                                eframe::egui::pos2(cols.3.right() + 2.0, row.top()),
+                                eframe::egui::pos2(cols.2.right() + 2.0, row.top()),
                                 row.max,
                             );
                             let kr = ui.interact(
@@ -1742,35 +1733,29 @@ fn dir_columns(r: eframe::egui::Rect) -> (
     (name, size, time)
 }
 
-/// 设备表的列边界：IP / 空闲 / 传输 / 开关（+ 断开）
+/// 设备表的列边界：IP / 空闲 / 开关（+ 断开）
 fn dev_columns(r: eframe::egui::Rect) -> (
-    eframe::egui::Rect,
     eframe::egui::Rect,
     eframe::egui::Rect,
     eframe::egui::Rect,
 ) {
     let kick_w = 34.0;
     let sw_w = 34.0;
-    let trans_w = 30.0;
     let idle_w = 52.0;
     let right = r.right() - kick_w;
     let sw = eframe::egui::Rect::from_min_max(
         eframe::egui::pos2(right - sw_w, r.top()),
         eframe::egui::pos2(right, r.bottom()),
     );
-    let trans = eframe::egui::Rect::from_min_max(
-        eframe::egui::pos2(sw.left() - trans_w, r.top()),
-        eframe::egui::pos2(sw.left(), r.bottom()),
-    );
     let idle = eframe::egui::Rect::from_min_max(
-        eframe::egui::pos2(trans.left() - idle_w, r.top()),
-        eframe::egui::pos2(trans.left(), r.bottom()),
+        eframe::egui::pos2(sw.left() - idle_w, r.top()),
+        eframe::egui::pos2(sw.left(), r.bottom()),
     );
     let ip = eframe::egui::Rect::from_min_max(
         eframe::egui::pos2(r.left(), r.top()),
         eframe::egui::pos2(idle.left() - 4.0, r.bottom()),
     );
-    (ip, idle, trans, sw)
+    (ip, idle, sw)
 }
 
 /// 详情表的列边界：操作/文件 / 大小 / 时间

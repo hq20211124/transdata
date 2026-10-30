@@ -123,7 +123,6 @@
   .drow .dot{width:6px;height:6px;flex:0 0 6px;border-radius:50%;background:var(--green-dot)}
   .drow .ip{width:74px;flex:0 0 74px;font-family:Consolas,"Cascadia Mono",monospace;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .drow .idle{width:42px;flex:0 0 42px;font-size:9.5px;color:var(--muted);white-space:nowrap}
-  .drow .io{width:30px;flex:0 0 30px;font-size:10px;color:#3F7A5B;text-align:center;white-space:nowrap}
   .drow .perm{width:48px;flex:0 0 48px;display:flex;justify-content:center}
   .drow .kick{
     width:32px;flex:0 0 32px;height:19px;border-radius:5px;border:1px solid var(--card-border);
@@ -317,7 +316,6 @@
           <div class="dhead">
             <span style="width:86px">设备</span>
             <span style="width:42px">空闲</span>
-            <span style="width:30px;text-align:center">传输</span>
             <span style="width:48px;text-align:center">删除/修改</span>
             <span style="width:32px"></span>
           </div>
@@ -372,11 +370,11 @@
   <div class="legend">
     <h4>这版怎么省的纵向空间</h4>
     <ol>
-      <li><b>设备：一台一行</b>（IP / 空闲 / 传输 / 删改开关 / 断开），3 台只占 90px；以前每台一张卡要 312px</li>
+      <li><b>设备：一台一行</b>（IP / 空闲 / 删改开关 / 断开），3 台只占 90px；以前每台一张卡要 312px</li>
       <li><b>操作详情：一条一行</b>，`操作文件 / 大小 / 时间` 三列，26px 一行，一屏能看 18 条</li>
       <li><b>目录收窄到 516px</b>，把宽度让给右边两栏；列宽按最长内容反算，不再留空</li>
       <li><b>行高统一压到 30px</b>（文件/设备），内边距 10，卡片圆角 10 —— 一屏 18 行文件</li>
-      <li><b>权限语义写进表头</b>：`传输` 列常绿、`删除/修改` 列是开关，关掉只动开关，不动传输</li>
+      <li><b>权限语义写进表头</b>：`删除/修改` 列是开关，关掉只影响删除和改名；上传下载永远可用（卡片右上角一句话说明，不再单占一列）</li>
     </ol>
   </div>
 </div>
@@ -559,7 +557,6 @@
         + '<span class="dot"></span>'
         + '<span class="ip">' + d.ip + '</span>'
         + '<span class="idle">' + d.idle + '</span>'
-        + '<span class="io" title="上传、下载可用（不受删除/修改授权影响）">↑↓</span>'
         + '<span class="perm"><label class="switch"><input type="checkbox" data-allow="1"' + (d.allow ? ' checked' : '')
         + '><span class="track"></span><span class="knob"></span></label></span>'
         + '<button class="kick" data-kick="1">断开</button>'
