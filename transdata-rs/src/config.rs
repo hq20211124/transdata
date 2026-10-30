@@ -105,6 +105,50 @@ pub struct Activity {
 /// How many operations are kept for the desktop window.
 const ACTIVITY_CAP: usize = 300;
 
+/// 同一台设备、同一个文件在这么短的时间里再下载一次，算同一次下载。
+///
+/// 手机浏览器的下载器会把一个 GET 拆成好几个（先探测再正式下、断了重连、
+/// 用户连点两下），而从用户角度那只是一次下载。上传不受影响：上传是文件
+/// 落盘之后才记，且一次 POST 只记一次。
+const DOWNLOAD_MERGE: Duration = Duration::from_secs(10);
+
+/// 追加一条操作记录；`Download` 先看窗口内有没有同一文件，有就更新那条
+/// （时间、字节数跟着最新一次走），移动到最后，保证列表仍是「新的在上面」。
+fn push_activity(
+    log: &mut std::collections::VecDeque<Activity>,
+    now: Instant,
+    ip: &str,
+    kind: ActKind,
+    name: &str,
+    size: u64,
+) {
+    let host = peer_host(ip);
+    if kind == ActKind::Download {
+        let hit = log.iter().rposition(|a| {
+            a.kind == ActKind::Download && a.ip == host && a.name == name
+        });
+        if let Some(pos) = hit {
+            if now.saturating_duration_since(log[pos].at) < DOWNLOAD_MERGE {
+                let mut prev = log.remove(pos).unwrap();
+                prev.at = now;
+                prev.size = size;
+                log.push_back(prev);
+                return;
+            }
+        }
+    }
+    log.push_back(Activity {
+        at: now,
+        ip: host.to_string(),
+        kind,
+        name: name.to_string(),
+        size,
+    });
+    while log.len() > ACTIVITY_CAP {
+        log.pop_front();
+    }
+}
+
 /// One paired device: when it was last seen and where it came from.
 pub struct Session {
     /// Last request time (touched on every authorized request).
@@ -620,16 +664,7 @@ impl Config {
     /// without bound even for a 10k-file folder upload.
     pub fn log_activity(&self, ip: &str, kind: ActKind, name: &str, size: u64) {
         let mut log = self.activity.lock().unwrap();
-        log.push_back(Activity {
-            at: Instant::now(),
-            ip: peer_host(ip).to_string(),
-            kind,
-            name: name.to_string(),
-            size,
-        });
-        while log.len() > ACTIVITY_CAP {
-            log.pop_front();
-        }
+        push_activity(&mut log, Instant::now(), ip, kind, name, size);
     }
 
     /// Newest first, at most `n` entries.
@@ -884,6 +919,45 @@ mod tests {
         let acts = cfg.recent_activity(ACTIVITY_CAP + 50);
         assert_eq!(acts.len(), ACTIVITY_CAP);
         assert_eq!(acts[0].name, format!("f{}", ACTIVITY_CAP + 19));
+    }
+
+    /// 重复的下载请求在窗口内合并成一条；上传不合并（落盘一次记一次）。
+    #[test]
+    fn repeated_download_request_merges_into_one_row() {
+        let mut log = std::collections::VecDeque::new();
+        let t0 = Instant::now();
+        let dl = |log: &mut std::collections::VecDeque<Activity>, secs: u64, ip: &str, name: &str| {
+            push_activity(
+                log,
+                t0 + Duration::from_secs(secs),
+                ip,
+                ActKind::Download,
+                name,
+                100,
+            );
+        };
+
+        // 同一个文件、同一个 IP（端口不同也算同一台设备）3 秒内第二次
+        dl(&mut log, 0, "192.168.1.7:5000", "a.epub");
+        dl(&mut log, 3, "192.168.1.7:5123", "a.epub");
+        assert_eq!(log.len(), 1, "一次点击引发的两次请求只算一次下载");
+        assert_eq!(log[0].at, t0 + Duration::from_secs(3), "时间跟着最新一次走");
+
+        // 超过窗口就是真的下载了两次
+        dl(&mut log, 30, "192.168.1.7:5000", "a.epub");
+        assert_eq!(log.len(), 2);
+
+        // 别的设备、别的文件各算各的
+        dl(&mut log, 31, "192.168.1.8:6000", "a.epub");
+        assert_eq!(log.len(), 3);
+        dl(&mut log, 32, "192.168.1.8:6000", "b.epub");
+        assert_eq!(log.len(), 4);
+
+        // 上传不合并：同一个文件传了两次就是两次
+        push_activity(&mut log, t0 + Duration::from_secs(33), "192.168.1.8:6000", ActKind::Upload, "b.epub", 100);
+        push_activity(&mut log, t0 + Duration::from_secs(34), "192.168.1.8:6000", ActKind::Upload, "b.epub", 100);
+        assert_eq!(log.len(), 6);
+        assert_eq!(log[5].at, t0 + Duration::from_secs(34), "最新的一条在最前（取回时反转）");
     }
 
     /// 窗口上「已连接设备」按 IP 去重：同一个手机开两个标签页算一台。

@@ -1227,13 +1227,8 @@ async fn download(
         .filter(|c| *c != '"' && *c != '\\' && !c.is_control())
         .collect();
     let encoded = percent_encode(&raw_name);
-    // 记一笔：谁下载了什么（取消/断线也算，因为请求已经发出去了）
-    cfg.log_activity(
-        peer,
-        crate::config::ActKind::Download,
-        &rel_display(cfg, &file),
-        len,
-    );
+    // 记录用：传完才记账，所以这里先把展示用的相对路径准备好。
+    let shown = rel_display(cfg, &file);
     let mut out = Vec::with_capacity(512);
     out.extend_from_slice(b"HTTP/1.1 200 OK\r\n");
     out.extend_from_slice(format!("Content-Type: {mime}\r\n").as_bytes());
@@ -1255,14 +1250,19 @@ async fn download(
     let file = tokio::fs::File::open(&file).await?;
     let mut reader = BufReader::with_capacity(CHUNK, file);
     let mut chunk = vec![0u8; CHUNK];
+    let mut sent: u64 = 0;
     loop {
         let n = reader.read(&mut chunk).await?;
         if n == 0 {
             break;
         }
         sock.write_all(&chunk[..n]).await?;
+        sent += n as u64;
     }
     let _ = tokio::io::AsyncWriteExt::shutdown(sock).await;
+    // 传完才记账：一条记录 = 一次真正送出去的下载，取消/断线的不留痕，
+    // 大小是实际发出的字节数。浏览器那边也是这么算的（它只列完成的下载）。
+    cfg.log_activity(peer, crate::config::ActKind::Download, &shown, sent);
     Ok(())
 }
 
@@ -1523,13 +1523,6 @@ async fn zip_dir(
     } else {
         format!("{fname}.zip")
     };
-    // 打包下载也记一笔（大小是压缩前的总量，实际 zip 会小一些）
-    cfg.log_activity(
-        peer,
-        crate::config::ActKind::Download,
-        &format!("{zip_name}（打包）"),
-        0,
-    );
     let encoded = percent_encode(&zip_name);
     let mut out = Vec::with_capacity(512);
     out.extend_from_slice(b"HTTP/1.1 200 OK\r\n");
@@ -1582,11 +1575,13 @@ async fn zip_dir(
     // Pump the archive to the client. If the client disappears the write
     // fails, we drop the receiver and the builder stops at the next chunk.
     let mut client_gone = false;
+    let mut sent: u64 = 0;
     while let Some(buf) = rx.recv().await {
         if sock.write_all(&buf).await.is_err() {
             client_gone = true;
             break;
         }
+        sent += buf.len() as u64;
     }
     // Must happen before awaiting the builder: a builder that is waiting for
     // room in the channel only notices the dead client when the receiver is
@@ -1605,6 +1600,13 @@ async fn zip_dir(
         return Ok(());
     }
     let _ = tokio::io::AsyncWriteExt::shutdown(sock).await;
+    // 打包也是传完才记，大小是实际发出的 zip 字节数
+    cfg.log_activity(
+        peer,
+        crate::config::ActKind::Download,
+        &format!("{zip_name}（打包）"),
+        sent,
+    );
     Ok(())
 }
 
@@ -3102,6 +3104,15 @@ mod folder_tests {
     /// Each test must pass a unique `name` — parallel tests share the pid,
     /// and the temp dir is wiped at setup.
     pub(super) async fn setup(name: &str, files: &[(&str, &[u8])]) -> (u16, std::path::PathBuf) {
+        let (port, dir, _cfg) = setup_cfg(name, files).await;
+        (port, dir)
+    }
+
+    /// 同 `setup`，但把 `Config` 也交出来：需要检查操作记录的用例用这个。
+    pub(super) async fn setup_cfg(
+        name: &str,
+        files: &[(&str, &[u8])],
+    ) -> (u16, std::path::PathBuf, Arc<Config>) {
         let dir = std::env::temp_dir().join(format!(
             "transdata_folder_{}_{}",
             std::process::id(),
@@ -3119,15 +3130,16 @@ mod folder_tests {
         cfg.set_upload_dir(dir.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
+        let cfg2 = cfg.clone();
         tokio::spawn(async move {
             while let Ok((sock, _)) = listener.accept().await {
-                let c2 = cfg.clone();
+                let c2 = cfg2.clone();
                 tokio::spawn(async move {
                     let _ = handle_conn(sock, &c2, "127.0.0.1").await;
                 });
             }
         });
-        (port, dir)
+        (port, dir, cfg)
     }
 
     pub(super) async fn http_bytes(port: u16, raw: &str) -> Vec<u8> {
@@ -3610,7 +3622,7 @@ mod folder_tests {
 
 #[cfg(test)]
 mod review_fix_tests {
-    use super::folder_tests::{http_bytes, http_text, setup};
+    use super::folder_tests::{http_bytes, http_text, setup, setup_cfg};
     use super::*;
     use crate::config::Config;
 
@@ -3842,6 +3854,55 @@ mod review_fix_tests {
         let text = String::from_utf8_lossy(&resp);
         assert!(text.starts_with("HTTP/1.1 200 OK"), "{text}");
         assert!(text.ends_with("ok"), "{text}");
+    }
+
+    /// 一次完成的下载 = 一条记录，大小是实际发出的字节；同一个文件的重复
+    /// 请求（浏览器探测 / 断线重连 / 连点）在 10 秒内并成一条。
+    #[tokio::test]
+    async fn download_logs_once_per_transfer_and_merges_retries() {
+        let (port, _dir, cfg) = setup_cfg(
+            "dl_log",
+            &[("a.txt", &b"AAAA"[..]), ("b/c.txt", &b"CC"[..])],
+        )
+        .await;
+        let a = "GET /download/a.txt HTTP/1.1\r\nHost: t\r\nX-TD-Secret: test-secret\r\n\r\n";
+        let _ = http_bytes(port, a).await;
+        let acts = cfg.recent_activity(10);
+        assert_eq!(acts.len(), 1, "一次下载一条记录");
+        assert_eq!(acts[0].kind, crate::config::ActKind::Download);
+        assert_eq!(acts[0].name, "a.txt");
+        assert_eq!(acts[0].size, 4, "大小用实际发出的字节");
+
+        let _ = http_bytes(port, a).await;
+        assert_eq!(cfg.recent_activity(10).len(), 1, "10 秒内同一文件合并成一条");
+
+        let _ = http_bytes(
+            port,
+            "GET /download/b/c.txt HTTP/1.1\r\nHost: t\r\nX-TD-Secret: test-secret\r\n\r\n",
+        )
+        .await;
+        assert_eq!(cfg.recent_activity(10).len(), 2, "不同文件各一条");
+    }
+
+    /// 传到一半被掐断的下载不记账（浏览器那边也只列完成的下载）。
+    #[tokio::test]
+    async fn aborted_download_is_not_recorded() {
+        let big = vec![7u8; 4 * 1024 * 1024];
+        let (port, _dir, cfg) = setup_cfg("dl_abort", &[("big.bin", &big[..])]).await;
+        let mut c = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        c.write_all(
+            b"GET /download/big.bin HTTP/1.1\r\nHost: t\r\nX-TD-Secret: test-secret\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        drop(c);
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            cfg.recent_activity(10).is_empty(),
+            "中断的下载不能记成一次下载"
+        );
     }
 
     /// 切换 HTTPS 开关前后，同一个端口必须一直能连上。

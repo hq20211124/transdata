@@ -587,8 +587,22 @@
                         attempt++;
                         notice($('uploadNotice'), '正在上传第 ' + (bi + 1) + '/' + batches.length + ' 批' +
                             (attempt > 1 ? '（第 ' + attempt + ' 次尝试）' : '') + '…', 'info');
-                        return uploadBatch(batch, function (loaded) {
-                            setProgress(doneBytes + loaded, total, bi + 1, batches.length);
+                        // 上一次可能其实已经传完了，只是响应没回来（热点抖动、
+                        // 手机切后台让 XHR 报错）。重试前先问一次服务器：已经
+                        // 完整的文件不再重发，否则会落成 `_1` 副本、还多记一笔。
+                        var pre = attempt > 1
+                            ? verifyManifest(manifest(batch))
+                            : Promise.resolve({ results: [] });
+                        return pre.then(function (v) {
+                            var complete = {};
+                            (v.results || []).forEach(function (r) {
+                                if (r.status === 'ok') complete[r.path] = true;
+                            });
+                            var send = batch.filter(function (it) { return !complete[it.path]; });
+                            if (!send.length) return { success: true };
+                            return uploadBatch(send, function (loaded) {
+                                setProgress(doneBytes + loaded, total, bi + 1, batches.length);
+                            });
                         }).then(function (j) {
                             if (j && j.success) return true;
                             throw new Error('batch failed');
