@@ -251,6 +251,7 @@ impl GuiApp {
         }
 
         self.draw_confirm(ctx);
+        self.draw_confirm_run(ctx);
     }
 
     /// 画一张卡片底（圆角 + 边框），返回卡片内可用的矩形。
@@ -602,10 +603,32 @@ impl GuiApp {
                 }
             }
         }
-        if resp.double_clicked() && row.is_dir {
-            // 双击进目录：展开 + 选中（不做路径跳转，避免出现「当前目录」概念）
-            self.collapsed.remove(&row.rel);
+        if resp.double_clicked() {
+            if row.is_dir {
+                // 双击进目录：展开 + 选中（不做路径跳转，避免出现「当前目录」概念）
+                self.collapsed.remove(&row.rel);
+            } else {
+                self.selected = Some(row.rel.clone());
+                if looks_like_program(&row.name) {
+                    self.confirm_run = Some(ConfirmRun {
+                        rel: row.rel.clone(),
+                        name: row.name.clone(),
+                    });
+                } else if let Some(path) = crate::ops::resolve_rel(&self.cfg, &row.rel) {
+                    if !open_with_default(&path) {
+                        self.report_open_failure(&row.name);
+                    }
+                } else {
+                    self.report_open_failure(&row.name);
+                }
+            }
         }
+    }
+
+    fn report_open_failure(&mut self, name: &str) {
+        self.status_msg = format!("打不开「{name}」：文件可能已经不在了");
+        self.status_at = Some(std::time::Instant::now());
+        self.status_is_err = true;
     }
 
     fn dir_status(&mut self, ui: &mut eframe::egui::Ui, rect: eframe::egui::Rect, ctx: &eframe::egui::Context) {
@@ -1621,6 +1644,64 @@ impl GuiApp {
             }
             self.refresh_now
                 .store(true, std::sync::atomic::Ordering::SeqCst);
+            ctx.request_repaint();
+        }
+    }
+
+    fn draw_confirm_run(&mut self, ctx: &eframe::egui::Context) {
+        let Some(c) = self.confirm_run.as_ref() else {
+            return;
+        };
+        let (rel, name) = (c.rel.clone(), c.name.clone());
+        let mut close = false;
+        let mut go = false;
+        eframe::egui::Window::new("打开程序")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(eframe::egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_min_width(320.0);
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(format!("「{name}」是程序，打开会运行它。"))
+                        .size(12.5)
+                        .color(pal::now().fg),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("确认是你自己要打开的吗？")
+                        .size(11.5)
+                        .color(pal::now().btn_hover_close),
+                );
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if btn_soft(ui, "取消", 12.0, 30.0, 88.0) {
+                        close = true;
+                    }
+                    ui.with_layout(
+                        eframe::egui::Layout::right_to_left(eframe::egui::Align::Center),
+                        |ui| {
+                            if btn_primary(ui, "打开", 12.0, 30.0, 88.0) {
+                                go = true;
+                            }
+                        },
+                    );
+                });
+            });
+        if close {
+            self.confirm_run = None;
+            return;
+        }
+        if go {
+            self.confirm_run = None;
+            match crate::ops::resolve_rel(&self.cfg, &rel) {
+                Some(path) if open_with_default(&path) => {
+                    self.status_msg = format!("已打开 {name}");
+                    self.status_at = Some(std::time::Instant::now());
+                    self.status_is_err = false;
+                }
+                _ => self.report_open_failure(&name),
+            }
             ctx.request_repaint();
         }
     }

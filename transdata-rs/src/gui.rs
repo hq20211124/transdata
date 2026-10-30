@@ -752,6 +752,8 @@ struct GuiApp {
     rename_fresh: bool,
     /// 删除确认窗：路径 / 名字 / 是否目录 / 里面有几个项目
     confirm_delete: Option<ConfirmDelete>,
+    /// 双击程序类文件前的确认（.exe/.bat/... 一打开就运行）
+    confirm_run: Option<ConfirmRun>,
     /// 右栏显示的是哪台设备（点设备表切换）
     detail_ip: Option<String>,
     /// 底部状态栏的一句话（错误红字 / 操作结果）
@@ -776,6 +778,12 @@ struct ConfirmDelete {
     is_dir: bool,
     /// 目录里有多少个项目（文件 + 子目录），文件为 0
     items: usize,
+}
+
+/// 「这个文件是程序，打开会运行它」确认窗
+struct ConfirmRun {
+    rel: String,
+    name: String,
 }
 
 /// 拖边缘改大小时记下的东西：起始光标位置 + 起始窗口矩形（物理像素）
@@ -854,6 +862,7 @@ impl GuiApp {
             renaming: None,
             rename_fresh: false,
             confirm_delete: None,
+            confirm_run: None,
             detail_ip: None,
             status_msg: String::new(),
             status_is_err: false,
@@ -1657,6 +1666,8 @@ impl GuiApp {
             self.rename_fresh = false;
         } else if self.confirm_delete.is_some() {
             self.confirm_delete = None;
+        } else if self.confirm_run.is_some() {
+            self.confirm_run = None;
         } else if self.settings_open {
             self.settings_open = false;
         }
@@ -2137,6 +2148,60 @@ fn open_in_explorer(dir: PathBuf) {
             .arg(dir.to_string_lossy().to_string())
             .spawn();
     }
+}
+
+/// 双击打开会执行代码的文件：先问一句，别手滑把程序跑起来。
+fn looks_like_program(name: &str) -> bool {
+    let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
+    matches!(
+        ext.as_deref(),
+        Some(
+            "exe" | "com" | "bat" | "cmd" | "msi" | "ps1" | "vbs" | "js" | "wsf" | "hta"
+                | "scr" | "lnk" | "jar"
+        )
+    )
+}
+
+/// 用系统默认程序打开（= 资源管理器里双击）。没有关联程序时弹系统的
+/// 「你要如何打开这个文件？」选择框；返回是否成功。
+#[cfg(windows)]
+fn open_with_default(path: &std::path::Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "shell32")]
+    extern "system" {
+        fn ShellExecuteW(
+            hwnd: isize,
+            op: *const u16,
+            file: *const u16,
+            params: *const u16,
+            dir: *const u16,
+            show: i32,
+        ) -> isize;
+    }
+    fn wide(s: &std::ffi::OsStr) -> Vec<u16> {
+        s.encode_wide().chain(std::iter::once(0)).collect()
+    }
+    let file = wide(path.as_os_str());
+    let run = |verb: &str| {
+        let op: Vec<u16> = verb.encode_utf16().chain(std::iter::once(0)).collect();
+        let r = unsafe {
+            ShellExecuteW(
+                0,
+                op.as_ptr(),
+                file.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                1,
+            )
+        };
+        r as usize > 32
+    };
+    run("open") || run("openas")
+}
+
+#[cfg(not(windows))]
+fn open_with_default(_path: &std::path::Path) -> bool {
+    false
 }
 
 /// Write `text` to the Windows system clipboard (CF_UNICODETEXT).
@@ -3107,6 +3172,67 @@ mod tests {
 
         let _ = ctx.run(esc(), |ctx| app.draw(ctx));
         assert!(!app.settings_open, "第三下关设置");
+    }
+
+    /// 双击打开之前要能认出「会运行代码」的文件。
+    #[test]
+    fn program_like_files_are_flagged() {
+        for name in [
+            "setup.exe",
+            "SETUP.EXE",
+            "安装.Msi",
+            "run.bat",
+            "run.cmd",
+            "tweak.ps1",
+            "x.vbs",
+            "x.js",
+            "x.wsf",
+            "x.hta",
+            "x.scr",
+            "快捷方式.lnk",
+            "app.jar",
+        ] {
+            assert!(looks_like_program(name), "应当确认：{name}");
+        }
+        for name in [
+            "报告.pdf",
+            "图片.JPG",
+            "notes.md",
+            "noext",
+            "数据.csv",
+            "archive.zip",
+        ] {
+            assert!(!looks_like_program(name), "不该拦截：{name}");
+        }
+    }
+
+    /// 程序确认窗也吃 Esc，且不会误触发打开。
+    #[test]
+    fn escape_closes_run_confirm() {
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        app.confirm_run = Some(ConfirmRun {
+            rel: "tools/setup.exe".to_string(),
+            name: "setup.exe".to_string(),
+        });
+        app.files = fake_snapshot();
+        app.files_loading = false;
+
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(WIN_W, WIN_H),
+        ));
+        input.events.push(egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let _ = ctx.run(input, |ctx| app.draw(ctx));
+        assert!(app.confirm_run.is_none(), "Esc 要关掉程序确认窗");
+        assert!(app.status_msg.is_empty(), "Esc 不能顺手把它打开");
     }
 
     /// 展开便签时把没提交的行内改名取消掉（保留原名）。
