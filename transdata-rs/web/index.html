@@ -86,11 +86,14 @@
                     <p class="dz-sub muted">或用下面的按钮选择</p>
                 </div>
                 <div class="dz-actions">
+                    <button class="btn btn--soft" id="pickPhotos" type="button">选照片</button>
                     <button class="btn btn--soft" id="pickFiles" type="button">选择文件</button>
                     <button class="btn btn--soft" id="pickFolder" type="button">选择文件夹</button>
                 </div>
             </div>
 
+            <!-- accept=image/* 才会走系统相册/照片选择器（带缩略图），不写就是文件管理器 -->
+            <input type="file" id="photoInput" accept="image/*" multiple hidden>
             <input type="file" id="fileInput" multiple hidden>
             <input type="file" id="folderInput" webkitdirectory multiple hidden>
 

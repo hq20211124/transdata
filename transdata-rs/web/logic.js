@@ -125,6 +125,14 @@
         return p.split('/').map(encodeURIComponent).join('/');
     }
 
+    /* 截图文件名：截图_20261031_142530.png；同一秒多张用 _2、_3 区分 */
+    function shotName(date, seq, ext) {
+        var p = function (n) { return (n < 10 ? '0' : '') + n; };
+        var stamp = '' + date.getFullYear() + p(date.getMonth() + 1) + p(date.getDate()) +
+            '_' + p(date.getHours()) + p(date.getMinutes()) + p(date.getSeconds());
+        return '截图_' + stamp + (seq > 1 ? '_' + seq : '') + '.' + ext;
+    }
+
     return {
         fmtSize: fmtSize,
         buildBatches: buildBatches,
@@ -133,6 +141,7 @@
         buildTree: buildTree,
         sortTree: sortTree,
         collectRows: collectRows,
-        encPath: encPath
+        encPath: encPath,
+        shotName: shotName
     };
 });

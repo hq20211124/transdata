@@ -766,6 +766,20 @@ struct GuiApp {
     refresh_now: Arc<std::sync::atomic::AtomicBool>,
     /// 窗口是否可见（最小化时后台不刷目录，省 CPU）
     window_visible: Arc<std::sync::atomic::AtomicBool>,
+    /// 便签框里粘贴截图：读剪贴板 + 编码存盘都在后台线程做
+    shot_tx: std::sync::mpsc::Sender<ShotMsg>,
+    shot_rx: std::sync::mpsc::Receiver<ShotMsg>,
+    shot_busy: bool,
+}
+
+/// 便签框粘贴截图的后台结果
+enum ShotMsg {
+    /// 剪贴板里是文字（或者根本没有图）：egui 照常粘文本，这里不用管
+    Text,
+    /// 存好了，返回文件名
+    Saved(String),
+    /// 失败原因（直接给用户看）
+    Failed(String),
 }
 
 /// 删除确认窗要显示的东西
@@ -819,6 +833,7 @@ impl GuiApp {
         let (note_text, last_v) = cfg.read_note();
         let pair_code = cfg.pair_code();
         let pair_secret = cfg.pair_secret();
+        let (shot_tx, shot_rx) = std::sync::mpsc::channel();
         Self {
             cfg,
             port,
@@ -868,6 +883,9 @@ impl GuiApp {
             counts: (0, 0, 0),
             refresh_now,
             window_visible,
+            shot_tx,
+            shot_rx,
+            shot_busy: false,
         }
     }
 
@@ -1642,6 +1660,162 @@ fn theme_visuals(theme: crate::settings::Theme) -> eframe::egui::Visuals {
     v
 }
 
+// ---------------------------------------------------------------------------
+// 便签框粘贴截图
+// ---------------------------------------------------------------------------
+
+/// 剪贴板里读出来的东西（只关心「有文字」和「有图」）
+enum ClipboardImage {
+    Text,
+    None,
+    Image {
+        width: usize,
+        height: usize,
+        rgba: Vec<u8>,
+    },
+}
+
+/// 读系统剪贴板，文字优先。
+///
+/// 从 Word / 网页复制内容时剪贴板里可能图文都有；这种情况按文本处理，
+/// 和用户平时粘贴的预期一致。截图工具（Win+Shift+S / PrintScreen）放的是
+/// 纯图片，这时才走「存进传输目录」。
+fn read_clipboard_image() -> ClipboardImage {
+    // 剪贴板偶尔被别的程序短暂占用（OpenClipboard 失败），等一下再试一次
+    let mut opened = None;
+    for _ in 0..2 {
+        match arboard::Clipboard::new() {
+            Ok(cb) => {
+                opened = Some(cb);
+                break;
+            }
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(15)),
+        }
+    }
+    let Some(mut cb) = opened else {
+        return ClipboardImage::None;
+    };
+    if let Ok(t) = cb.get_text() {
+        if !t.trim().is_empty() {
+            return ClipboardImage::Text;
+        }
+    }
+    match cb.get_image() {
+        Ok(img) => ClipboardImage::Image {
+            width: img.width,
+            height: img.height,
+            rgba: img.bytes.into_owned(),
+        },
+        // 剪贴板里既没有文字也不是图片（空剪贴板、文件列表等）：静默忽略，
+        // 否则每次 Ctrl+V 弹一句「没有图」就是噪音
+        Err(_) => ClipboardImage::None,
+    }
+}
+
+/// 把剪贴板图片编码成 PNG，存进当前传输目录（`截图_时间.png`）。
+fn save_clipboard_screenshot(
+    cfg: &Config,
+    width: usize,
+    height: usize,
+    rgba: Vec<u8>,
+) -> Result<String, String> {
+    let img = image::RgbaImage::from_raw(width as u32, height as u32, rgba)
+        .ok_or_else(|| "截图数据不完整，没能保存".to_string())?;
+    let mut png = Vec::new();
+    img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .map_err(|e| format!("截图编码失败：{e}"))?;
+
+    // 和上传共用一份磁盘预算：截图也占空间，不能绕过「磁盘打满保护」
+    if !crate::ops::take_quota(cfg, png.len() as u64) {
+        return Err("磁盘剩余空间不足，截图没有保存".to_string());
+    }
+    let dir = cfg.upload_dir();
+    let result = std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("无法打开传输目录：{e}"))
+        .and_then(|_| write_new_png(&dir, &local_stamp(), &png));
+    if result.is_err() {
+        // 没写成，把预扣的额度还回去
+        crate::ops::give_quota(cfg, png.len() as u64);
+    }
+    result
+}
+
+/// 新文件一律新建、绝不覆盖：同一秒内多张就加 `_2`、`_3`。
+fn write_new_png(dir: &std::path::Path, stamp: &str, png: &[u8]) -> Result<String, String> {
+    use std::io::Write as _;
+    for seq in 1..=999u32 {
+        let name = if seq == 1 {
+            format!("截图_{stamp}.png")
+        } else {
+            format!("截图_{stamp}_{seq}.png")
+        };
+        let path = dir.join(&name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut f) => {
+                if let Err(e) = f.write_all(png) {
+                    drop(f);
+                    let _ = std::fs::remove_file(&path);
+                    return Err(format!("写入截图失败：{e}"));
+                }
+                return Ok(name);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(format!("无法在传输目录保存截图：{e}")),
+        }
+    }
+    Err("同一秒内截图太多，稍等一秒再试".to_string())
+}
+
+/// 本地时间 `yyyymmdd_HHMMSS`（用于文件名）。用 GetLocalTime 而不是 UTC：
+/// 用户看截图目录时，时间应该是自己墙上的时间。
+#[cfg(windows)]
+fn local_stamp() -> String {
+    #[repr(C)]
+    struct SystemTime {
+        year: u16,
+        month: u16,
+        day_of_week: u16,
+        day: u16,
+        hour: u16,
+        minute: u16,
+        second: u16,
+        milliseconds: u16,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetLocalTime(out: *mut SystemTime);
+    }
+    let mut t = SystemTime {
+        year: 0,
+        month: 0,
+        day_of_week: 0,
+        day: 0,
+        hour: 0,
+        minute: 0,
+        second: 0,
+        milliseconds: 0,
+    };
+    unsafe { GetLocalTime(&mut t) };
+    format!(
+        "{:04}{:02}{:02}_{:02}{:02}{:02}",
+        t.year, t.month, t.day, t.hour, t.minute, t.second
+    )
+}
+
+/// 非 Windows 只是保证能编译（发布目标是 Windows）
+#[cfg(not(windows))]
+fn local_stamp() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("{secs}")
+}
+
 impl App for GuiApp {
     fn update(&mut self, ctx: &eframe::egui::Context, _frame: &mut Frame) {
         self.draw(ctx);
@@ -1663,6 +1837,77 @@ impl GuiApp {
             Some(self.note_status.as_str())
         } else {
             None
+        }
+    }
+
+    /// 便签框里按 Ctrl+V：剪贴板里是图片（且没有文字）就存进传输目录。
+    ///
+    /// 只在便签框有焦点时处理 —— 别的地方粘图不该悄悄落一个文件。
+    /// 文字优先：从 Word / 网页复制来的「图文混排」仍然走 egui 正常的文本粘贴。
+    fn poll_note_paste_image(&mut self, ctx: &eframe::egui::Context) {
+        while let Ok(msg) = self.shot_rx.try_recv() {
+            self.shot_busy = false;
+            match msg {
+                ShotMsg::Text => {}
+                ShotMsg::Saved(name) => {
+                    self.set_note_status(&format!("已保存「{name}」到传输目录"), false);
+                    self.refresh_now
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    ctx.request_repaint();
+                }
+                ShotMsg::Failed(why) => {
+                    self.set_note_status(&why, true);
+                    ctx.request_repaint();
+                }
+            }
+        }
+        if self.shot_busy {
+            return;
+        }
+        let focused =
+            self.note_focused || ctx.memory(|m| m.has_focus(note_editor_id()));
+        // egui-winit 把 Ctrl+V 的「按下」转成纯文本 Paste 事件，剪贴板里没文字时
+        // 直接丢掉，所以 key_pressed 永远看不到 V；松开 V 是普通 Key 事件，
+        // 且自带当时的修饰键，拿它当触发点。
+        let paste = ctx.input(|i| {
+            i.events.iter().any(|e| match e {
+                eframe::egui::Event::Key {
+                    key: eframe::egui::Key::V,
+                    pressed: false,
+                    modifiers,
+                    ..
+                } => modifiers.command && !modifiers.alt,
+                _ => false,
+            })
+        });
+        if !focused || !paste {
+            return;
+        }
+
+        self.shot_busy = true;
+        let cfg = self.cfg.clone();
+        let tx = self.shot_tx.clone();
+        let repaint = ctx.clone();
+        // 读图 + 编码 + 写盘可能要几百毫秒（4K 截图），不能卡在 UI 线程
+        let spawned = std::thread::Builder::new()
+            .name("note-paste-image".into())
+            .spawn(move || {
+                let msg = match read_clipboard_image() {
+                    ClipboardImage::Text | ClipboardImage::None => ShotMsg::Text,
+                    ClipboardImage::Image {
+                        width,
+                        height,
+                        rgba,
+                    } => match save_clipboard_screenshot(&cfg, width, height, rgba) {
+                        Ok(name) => ShotMsg::Saved(name),
+                        Err(why) => ShotMsg::Failed(why),
+                    },
+                };
+                let _ = tx.send(msg);
+                repaint.request_repaint();
+            });
+        if spawned.is_err() {
+            self.shot_busy = false;
         }
     }
 
@@ -1724,6 +1969,9 @@ impl GuiApp {
         self.handle_resize(ctx);
 
         self.handle_escape(ctx);
+
+        // 便签框里的 Ctrl+V 可能是截图：egui 只粘文本，图片要自己读剪贴板
+        self.poll_note_paste_image(ctx);
 
         let refresh_now = self.qr_dirty;
         if self.qr_dirty {
@@ -3442,6 +3690,40 @@ mod tests {
         assert!(c.is_dir);
         assert_eq!(c.items, 1, "备份 里只有一个文件");
         app.confirm_delete = None;
+    }
+
+    /// 便签框粘贴的截图：同一秒多张也不能覆盖前一张。
+    #[test]
+    fn pasted_screenshot_never_overwrites() {
+        let dir = std::env::temp_dir().join(format!("td_shot_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let first = write_new_png(&dir, "20261031_142530", b"AAA").unwrap();
+        let second = write_new_png(&dir, "20261031_142530", b"BBB").unwrap();
+        assert_eq!(first, "截图_20261031_142530.png");
+        assert_eq!(second, "截图_20261031_142530_2.png");
+        assert_eq!(std::fs::read(dir.join(&first)).unwrap(), b"AAA");
+        assert_eq!(std::fs::read(dir.join(&second)).unwrap(), b"BBB");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 文件名用的时间戳就是本地年月日时分秒（15 位数字）。
+    #[cfg(windows)]
+    #[test]
+    fn screenshot_stamp_is_local_datetime() {
+        let s = local_stamp();
+        assert_eq!(s.len(), 15, "{s}");
+        assert_eq!(s.matches('_').count(), 1, "{s}");
+        assert!(
+            s.chars().filter(|c| *c != '_').all(|c| c.is_ascii_digit()),
+            "{s}"
+        );
+        let year: u32 = s[..4].parse().unwrap();
+        assert!((2024..=2100).contains(&year), "{s}");
+        let month: u32 = s[4..6].parse().unwrap();
+        assert!((1..=12).contains(&month), "{s}");
     }
 
 }

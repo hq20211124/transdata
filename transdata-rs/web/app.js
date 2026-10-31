@@ -13,6 +13,8 @@
     var MODE_APP = MODE === 'app';
     /* 纯逻辑在 /logic.js（编译期拼在本文件前面下发），见 web/logic.js */
     var L = self.TDLogic;
+    /* initTabs 里赋成切页函数：粘贴截图后要自动跳到「上传」看到进度 */
+    var tabSelect = null;
 
     /* ---------------------------------------------------------------- utils */
 
@@ -184,6 +186,7 @@
 
         initTabs();
         initUpload();
+        initPaste();
         initDownload();
         initNote();
         initServerInfo();
@@ -275,6 +278,7 @@
                 t.panel.hidden = !on;
             });
         }
+        tabSelect = select;
 
         tabs.forEach(function (t, i) {
             t.btn.addEventListener('click', function () { select(i); });
@@ -349,8 +353,11 @@
 
     /* ------------------------------------------------------------- 上传 */
 
-    var selected = [];      // [{file, path}]
+    var selected = [];      // [{file, path, thumbUrl?}]
     var uploading = false;
+    /* 这一批开始时选中的列表快照：传输期间新加的文件不能被当成「已传完」清掉 */
+    var uploadSnapshot = [];
+    var autoAfter = false;  // 传输中又粘了图：这一批传完自动接着传
     var uploadXhr = null;
     var uploadAbort = false;
     var BATCH_MAX_FILES = 32;
@@ -366,13 +373,28 @@
         var dz = $('dropzone');
         var fileInput = $('fileInput');
         var folderInput = $('folderInput');
+        var photoInput = $('photoInput');
 
+        $('pickPhotos').addEventListener('click', function (e) { e.stopPropagation(); photoInput.click(); });
         $('pickFiles').addEventListener('click', function (e) { e.stopPropagation(); fileInput.click(); });
         $('pickFolder').addEventListener('click', function (e) { e.stopPropagation(); folderInput.click(); });
 
         dz.addEventListener('click', function () { fileInput.click(); });
         dz.addEventListener('keydown', function (e) {
             if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fileInput.click(); }
+        });
+
+        // 相册入口：accept=image/* 让手机走系统照片选择器（缩略图网格、可多选），
+        // 而不是先把人丢进文件管理器的「最近文件」里翻照片。
+        photoInput.addEventListener('change', function () {
+            var picked = [];
+            for (var i = 0; i < photoInput.files.length; i++) {
+                var f = photoInput.files[i];
+                picked.push({ file: f, path: f.name });
+            }
+            photoInput.value = '';
+            mergePicked(picked);
+            renderSelected();
         });
 
         fileInput.addEventListener('change', function () {
@@ -458,6 +480,59 @@
         });
     }
 
+    /* 页面里 Ctrl+V 粘贴截图：浏览器把剪贴板图片给成一个 File，直接进上传列表。
+       只有「纯图片」才拦截 —— 带文字的剪贴板照常粘进便签/输入框，文字优先。 */
+    function initPaste() {
+        document.addEventListener('paste', function (e) {
+            var dt = e.clipboardData;
+            if (!dt) return;
+            var text = '';
+            try { text = dt.getData('text/plain') || ''; } catch (err) { text = ''; }
+            var files = [];
+            if (dt.items) {
+                for (var i = 0; i < dt.items.length; i++) {
+                    var item = dt.items[i];
+                    if (item.kind === 'file' && item.type && item.type.indexOf('image/') === 0) {
+                        var f = item.getAsFile();
+                        if (f) files.push(f);
+                    }
+                }
+            }
+            if (!files.length && dt.files) {
+                for (var j = 0; j < dt.files.length; j++) {
+                    if (isImage(dt.files[j])) files.push(dt.files[j]);
+                }
+            }
+            if (!files.length || text.trim()) return;
+
+            e.preventDefault();
+            var d = new Date();
+            var extOf = { 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/webp': 'webp', 'image/bmp': 'bmp' };
+            var used = {};
+            selected.forEach(function (x) { used[x.path] = true; });
+            var picked = [];
+            files.forEach(function (f) {
+                var ext = extOf[f.type] || 'png';
+                var seq = 1;
+                var name = L.shotName(d, seq, ext);
+                while (used[name]) { seq++; name = L.shotName(d, seq, ext); }
+                used[name] = true;
+                picked.push({ file: f, path: name });
+            });
+
+            mergePicked(picked);
+            if (tabSelect) tabSelect(0);
+            renderSelected();
+            if (uploading) {
+                autoAfter = true;
+                notice($('uploadNotice'), '已加入 ' + picked.length + ' 张截图，当前传输完成后自动上传。', 'ok');
+            } else {
+                notice($('uploadNotice'), '已加入 ' + picked.length + ' 张截图，开始上传…', 'info');
+                startUpload();
+            }
+        });
+    }
+
     /* 递归读取拖入的目录（Chrome/Edge 支持 webkitGetAsEntry） */
     function readEntry(entry) {
         if (entry.isFile) {
@@ -484,6 +559,23 @@
         selected = L.mergePicked(selected, picked);
     }
 
+    function isImage(file) {
+        return !!(file && file.type && file.type.indexOf('image/') === 0);
+    }
+
+    /* 列表里的图片预览：一个文件一个 object URL，移除/传完后释放 */
+    function thumbUrl(it) {
+        if (!it.thumbUrl) it.thumbUrl = URL.createObjectURL(it.file);
+        return it.thumbUrl;
+    }
+
+    function releaseThumb(it) {
+        if (it && it.thumbUrl) {
+            try { URL.revokeObjectURL(it.thumbUrl); } catch (e) { }
+            it.thumbUrl = null;
+        }
+    }
+
     function renderSelected() {
         var list = $('fileList');
         list.textContent = '';
@@ -496,9 +588,21 @@
             var it = selected[idx];
             var li = el('li');
 
-            var ic = el('span', 'fi-icon');
-            ic.appendChild(icon(ICON_FILE));
-            li.appendChild(ic);
+            if (isImage(it.file)) {
+                // 缩略图：从相册/文件夹里选了一堆 IMG_xxx 时，靠它认出是哪张
+                var thumb = el('span', 'fi-thumb');
+                var img = el('img');
+                img.src = thumbUrl(it);
+                img.alt = '';
+                img.decoding = 'async';
+                img.loading = 'lazy';
+                thumb.appendChild(img);
+                li.appendChild(thumb);
+            } else {
+                var ic = el('span', 'fi-icon');
+                ic.appendChild(icon(ICON_FILE));
+                li.appendChild(ic);
+            }
 
             var main = el('div', 'fi-main');
             main.appendChild(el('div', 'fi-name', it.path));
@@ -515,6 +619,7 @@
             // 行号（最多 8 行），跟 selected 的下标不是一回事。
             rm.addEventListener('click', (function (item) {
                 return function () {
+                    releaseThumb(item);
                     selected = L.removeItem(selected, item);
                     renderSelected();
                 };
@@ -611,6 +716,8 @@
         if (uploading || selected.length === 0) return;
         uploading = true;
         uploadAbort = false;
+        autoAfter = false;
+        uploadSnapshot = selected.slice();
         progressT0 = Date.now();
         renderSelected();
         $('progress').hidden = false;
@@ -633,14 +740,15 @@
     function runUpload() {
         // 1) 先核对一次，已完好的不重传（断点续传）
         var skip = {};
-        return verifyManifest(manifest(selected)).then(function (j) {
+        var snapshot = uploadSnapshot;
+        return verifyManifest(manifest(snapshot)).then(function (j) {
             (j.results || []).forEach(function (r) { if (r.status === 'ok') skip[r.path] = true; });
-            var todo = selected.filter(function (it) { return !skip[it.path]; });
-            var skipped = selected.length - todo.length;
+            var todo = snapshot.filter(function (it) { return !skip[it.path]; });
+            var skipped = snapshot.length - todo.length;
             if (skipped > 0) {
                 notice($('uploadNotice'), '已跳过 ' + skipped + ' 个完整文件，剩余 ' + todo.length + ' 个待传。', 'ok');
             }
-            if (!todo.length) { return { done: true, failed: false, todo: [] }; }
+            if (!todo.length) { return { done: true, failed: false, todo: [], all: snapshot }; }
 
             // 2) 分批上传，单批失败重试 3 次
             var batches = L.buildBatches(todo, BATCH_MAX_FILES, BATCH_MAX_BYTES);
@@ -694,7 +802,7 @@
             });
 
             return chain.then(function () {
-                return { done: true, failed: false, todo: todo };
+                return { done: true, failed: false, todo: todo, all: snapshot };
             }).catch(function () {
                 return { done: true, failed: true, aborted: uploadAbort };
             });
@@ -707,6 +815,7 @@
         $('progBar').style.width = '0%';
 
         if (res && res.failed) {
+            autoAfter = false;
             notice($('uploadNotice'), uploadAbort
                 ? '已取消（已传完的文件保留，再点一次可继续传）。'
                 : '上传失败，已保留进度；点「开始上传」可自动续传。', 'err');
@@ -714,15 +823,30 @@
             return;
         }
 
-        var totalCount = selected.length;
-        var todo = (res && res.todo) || selected;
+        var totalCount = uploadSnapshot.length;
+        var todo = (res && res.todo) || uploadSnapshot;
+        // 这一批（含已跳过的）从列表里摘掉；传输期间新加的文件留在列表里
+        var done = {};
+        ((res && res.all) || uploadSnapshot).forEach(function (it) {
+            done[it.path + '|' + it.file.size] = true;
+        });
 
         // 3) 最终清单校验
         var finish = function () {
-            selected = [];
-            $('fileList').textContent = '';
+            var keep = [];
+            selected.forEach(function (it) {
+                if (done[it.path + '|' + it.file.size]) releaseThumb(it);
+                else keep.push(it);
+            });
+            selected = keep;
             renderSelected();
             loadFiles();
+
+            // 刚才传到一半又粘了图：这批完了就接着传，不用再点一次
+            if (autoAfter) {
+                autoAfter = false;
+                if (selected.length) startUpload();
+            }
         };
 
         if (!todo.length) {

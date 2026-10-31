@@ -424,6 +424,21 @@ body {
 }
 .filelist .fi-icon svg { width: 11px; height: 11px; }
 
+/* 图片行用缩略图替掉文件图标：从相册选一堆 IMG_xxx 时靠它认出是哪张 */
+.filelist .fi-thumb {
+    flex: none;
+    width: 17px; height: 17px;
+    border-radius: 4px;
+    overflow: hidden;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+}
+.filelist .fi-thumb img {
+    display: block;
+    width: 100%; height: 100%;
+    object-fit: cover;
+}
+
 /* 名字占满剩余宽度并靠左，整名显示；单行最窄，超长自动换行撑高 */
 .filelist .fi-main {
     flex: 1 1 auto;

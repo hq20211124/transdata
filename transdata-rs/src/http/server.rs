@@ -1043,9 +1043,11 @@ fn sec_headers() -> &'static str {
 /// `script-src 'self'` / `style-src 'self'` means the page may not run a
 /// single inline handler, so an injected `<script>` or `onclick=` does
 /// nothing. `connect-src 'self' ws: wss:` is what allows the note socket.
+/// `blob:` in `img-src` is only for the local upload thumbnails
+/// (`URL.createObjectURL`); those URLs are created by the page itself.
 fn csp_header() -> &'static str {
     "Content-Security-Policy: default-src 'self'; base-uri 'none'; form-action 'none'; \
-     frame-ancestors 'none'; object-src 'none'; img-src 'self' data:; \
+     frame-ancestors 'none'; object-src 'none'; img-src 'self' data: blob:; \
      connect-src 'self' ws: wss:; style-src 'self'; script-src 'self'\r\n"
 }
 

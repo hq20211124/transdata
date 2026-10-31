@@ -129,6 +129,13 @@ test('encPath 逐段编码，斜杠保留为分隔符', function () {
     assert.strictEqual(L.encPath('a+b.txt'), 'a%2Bb.txt');
 });
 
+test('shotName 用本地时间，同一秒多张加序号', function () {
+    const d = new Date(2026, 9, 31, 14, 5, 3); // 10 月 = 9
+    assert.strictEqual(L.shotName(d, 1, 'png'), '截图_20261031_140503.png');
+    assert.strictEqual(L.shotName(d, 2, 'png'), '截图_20261031_140503_2.png');
+    assert.strictEqual(L.shotName(d, 3, 'jpg'), '截图_20261031_140503_3.jpg');
+});
+
 test('fmtSize 边界', function () {
     assert.strictEqual(L.fmtSize(0), '0 B');
     assert.strictEqual(L.fmtSize(1023), '1023 B');
