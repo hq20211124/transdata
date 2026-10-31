@@ -357,6 +357,12 @@ body {
 .dz-sub { margin: 0; font-size: 12px; line-height: 1.35; }
 .dz-actions { display: flex; gap: 6px; flex: none; }
 
+/* 「选照片」只在触屏设备出现：桌面「选择文件」就能挑图片，多这一枚只是占位 */
+#pickPhotos { display: none; }
+@media (hover: none) and (pointer: coarse) {
+    #pickPhotos { display: inline-flex; }
+}
+
 /* --------------------------------------------------------------- listbar */
 
 .listbar {
