@@ -936,7 +936,7 @@
 
         var tree = L.buildTree(dlList);
 
-        // 「折叠 5 条」只作用在顶层：展开的子目录内容全部显示
+        // 「折叠 8 条」只作用在顶层：展开的子目录内容全部显示
         var rows = [];
         L.collectRows(tree, 0, rows, dlExpanded ? null : DL_COLLAPSED_ROWS,
             function (p) { return !!dlOpenDirs[p]; });
