@@ -872,6 +872,24 @@
 
     var dlList = [];
     var dlTruncated = false;
+    /* 服务端签好名的打包链接：目录相对路径 -> /zip/...?e=&d=（'' 是整个目录）。
+       下载链接的签名在每条文件上（f.href）。 */
+    var dlZips = {};
+    var dlHrefBy = {};    // 文件路径 -> 最新签名的下载链接（重取列表后刷新）
+
+    /* 链接里的签名到期时间（?e=Unix 秒）。页面可能一开就是十几小时，链接先
+       过期了；这时点它会 401，所以点的一瞬间悄悄重取一份新签名再走同一条路。 */
+    function dlExpiry(href) {
+        var m = /[?&]e=(\d+)/.exec(href || '');
+        return m ? parseInt(m[1], 10) : 0;
+    }
+
+    /* 过期了就重取列表并在取到后执行 next，返回 true 表示「这次点击交给我」。 */
+    function resignIfNeeded(href, next) {
+        if (dlExpiry(href) >= Math.floor(Date.now() / 1000)) return false;
+        loadFiles().then(next);
+        return true;
+    }
     /* 这台设备还能不能「删除 / 修改」（由 /info 的 can_write 决定） */
     var canWrite = true;
     var dlOpenDirs = {};      // 已展开的目录路径 -> true
@@ -887,8 +905,14 @@
         });
         // 打包是边压边传的：点了之后浏览器马上开始下载，浏览器自己的下载
         // 框里能看到进度。这里只补一句提示，免得以为没反应。
-        $('zipAll').addEventListener('click', function () {
+        $('zipAll').addEventListener('click', function (e) {
             notice($('dlNotice'), '正在打包并下载…文件越大越慢，可以先去做别的事。', 'info');
+            var href = this.getAttribute('href') || '';
+            if (resignIfNeeded(href, function () {
+                if (dlZips['']) { location.href = dlZips['']; }
+            })) {
+                e.preventDefault();
+            }
         });
         loadFiles();
     }
@@ -896,6 +920,9 @@
     function loadFiles() {
         return apiJson('/files').then(function (j) {
             dlList = (j && j.files) || [];
+            dlZips = (j && j.zips) || {};
+            dlHrefBy = {};
+            dlList.forEach(function (f) { if (f.href) dlHrefBy[f.name] = f.href; });
             dlTruncated = !!(j && j.truncated);
             renderFiles();
         }).catch(function () {
@@ -921,7 +948,7 @@
         var zipAll = $('zipAll');
         if (dlList.length) {
             zipAll.hidden = false;
-            zipAll.setAttribute('href', '/zip-all');
+            zipAll.setAttribute('href', dlZips[''] || '/zip-all');
         } else {
             zipAll.hidden = true;
         }
@@ -934,7 +961,7 @@
         }
         $('dlEmpty').hidden = true;
 
-        var tree = L.buildTree(dlList);
+        var tree = L.buildTree(dlList, dlZips);
 
         // 「折叠 8 条」只作用在顶层：展开的子目录内容全部显示
         var rows = [];
@@ -1006,15 +1033,27 @@
         if (node.dir) {
             // 只有目录才提供「打包」
             var zip = el('a', 'btn btn--soft btn--xs', '打包');
-            zip.href = '/zip/' + encPath(node.path);
+            zip.href = node.zip;
             zip.title = '把「' + node.name + '」整个文件夹压成 zip 下载';
-            zip.addEventListener('click', function () {
+            zip.addEventListener('click', function (e) {
                 notice($('dlNotice'), '正在打包「' + node.name + '」…边压边传，浏览器里能看到进度。', 'info');
+                if (resignIfNeeded(zip.href, function () {
+                    if (dlZips[node.path]) { location.href = dlZips[node.path]; }
+                })) {
+                    e.preventDefault();
+                }
             });
             actions.appendChild(zip);
         } else {
             var dl = el('a', 'btn btn--soft btn--xs', '下载');
-            dl.href = '/download/' + encPath(node.path);
+            dl.href = node.href;
+            dl.addEventListener('click', function (e) {
+                if (resignIfNeeded(dl.href, function () {
+                    if (dlHrefBy[node.path]) { location.href = dlHrefBy[node.path]; }
+                })) {
+                    e.preventDefault();
+                }
+            });
             actions.appendChild(dl);
         }
         actions.appendChild(renameButton(node));

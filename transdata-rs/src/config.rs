@@ -9,6 +9,14 @@ use tokio::sync::{broadcast, watch};
 /// How long a paired device stays authorized without re-pairing.
 pub const SESSION_TTL: Duration = Duration::from_secs(12 * 3600);
 
+/// How long a signed download link stays usable.
+///
+/// A link is bound to exactly one path and only ever grants *reading* that
+/// path — it cannot list, upload, delete or rename. Same window as a session
+/// so a link that was handed out while the device was paired does not die
+/// under the user's finger.
+pub const DL_TOKEN_TTL: Duration = SESSION_TTL;
+
 /// Per-IP pairing attempts allowed inside the rate-limit window.
 pub const PAIR_ATTEMPTS: usize = 10;
 /// Length of the rate-limit window for pairing attempts.
@@ -205,6 +213,9 @@ pub struct Config {
     /// 8-digit pairing code shown in the desktop window, for devices that
     /// cannot scan the QR code.
     pub pair_code: RwLock<String>,
+    /// Key for the short-lived signed download links (random per run, never
+    /// leaves this process). See `crate::http::server::dl_href`.
+    pub dl_key: [u8; 32],
     /// Live sessions: session id -> (last used, peer address).
     pub sessions: RwLock<HashMap<String, Session>>,
     /// Ring buffer of recent operations (upload / download / delete).
@@ -243,6 +254,22 @@ pub struct Config {
     pub quota_left: AtomicU64,
     /// Is the server serving HTTPS right now?
     pub tls_enabled: AtomicBool,
+    /// The address the phone should use, kept fresh by the GUI's watcher
+    /// thread ([`Config::note_addr`]).
+    ///
+    /// Why this is state and not a live lookup: a phone hotspot hands out
+    /// DHCP leases of about an hour, so the machine's address changes while
+    /// the program keeps running. The QR code is a *picture* of the address,
+    /// and a picture that is not re-rendered points at an address that no
+    /// longer exists — which is exactly the "scanning fails after a few
+    /// hours, refreshing the code fixes it" report.
+    pub lan_addr: RwLock<String>,
+    /// Set when the address changed: the window re-renders the QR code.
+    pub addr_dirty: AtomicBool,
+    /// Set when HTTPS was re-signed because the address moved: the phone has
+    /// to accept the certificate warning again, and only the user can do
+    /// that, so the window has to say so.
+    pub cert_rotated: AtomicBool,
     /// Notifies the server task that the TLS mode changed.
     pub tls_tx: watch::Sender<bool>,
     /// The self-signed certificate (present as soon as it was created, even
@@ -297,6 +324,11 @@ impl Config {
         let (note_tx, _) = broadcast::channel::<String>(32);
         let (tls_tx, _) = watch::channel(false);
 
+        // Key for signed download links: random per run, so a link that
+        // leaks into a phone's download history is worthless after a restart.
+        let mut dl_key = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut dl_key);
+
         // The pages are static for the lifetime of the process: build them
         // (and their gzip forms) once instead of per request.
         let page_app = crate::web::page_html("app").into_bytes();
@@ -325,6 +357,7 @@ impl Config {
             note_tx,
             pair_secret: RwLock::new(secret),
             pair_code: RwLock::new(code),
+            dl_key,
             sessions: RwLock::new(HashMap::new()),
             activity: Mutex::new(std::collections::VecDeque::new()),
             pair_attempts: Mutex::new(HashMap::new()),
@@ -345,6 +378,9 @@ impl Config {
             active_uploads: AtomicUsize::new(0),
             quota_left: AtomicU64::new(quota),
             tls_enabled: AtomicBool::new(false),
+            lan_addr: RwLock::new(crate::net::display_ip()),
+            addr_dirty: AtomicBool::new(false),
+            cert_rotated: AtomicBool::new(false),
             tls_tx,
             tls: RwLock::new(None),
         }
@@ -422,6 +458,33 @@ impl Config {
         self.server_error.lock().ok().and_then(|s| s.clone())
     }
 
+    // ---- 本机地址 ---------------------------------------------------------
+
+    /// The address the phone should open (what the QR code encodes).
+    pub fn lan_addr_show(&self) -> String {
+        self.lan_addr.read().unwrap().clone()
+    }
+
+    /// Record the machine's current address; true when it moved.
+    ///
+    /// A loopback reading is ignored on purpose. It happens for the moment a
+    /// Wi-Fi association is redone, and drawing `127.0.0.1` into a QR code is
+    /// strictly worse than keeping the previous address: the phone would scan
+    /// it and talk to itself.
+    pub fn note_addr(&self, ip: &str) -> bool {
+        if ip.is_empty() || ip == "127.0.0.1" {
+            return false;
+        }
+        let mut cur = self.lan_addr.write().unwrap();
+        if *cur == ip {
+            return false;
+        }
+        *cur = ip.to_string();
+        drop(cur);
+        self.addr_dirty.store(true, Ordering::SeqCst);
+        true
+    }
+
     // ---- HTTPS ------------------------------------------------------------
 
     /// Switch HTTPS on or off. The server task notices the change and
@@ -431,9 +494,22 @@ impl Config {
         let _ = self.tls_tx.send(on);
     }
 
-    /// Is HTTPS currently switched on?
+    /// Is HTTPS switched on?
+    ///
+    /// Note: this is the *intent*. Ask [`Self::https_live`] when something
+    /// has to match what the port actually speaks.
     pub fn tls_on(&self) -> bool {
         self.tls_enabled.load(Ordering::SeqCst)
+    }
+
+    /// The protocol the port is really serving right now.
+    ///
+    /// HTTPS without a usable certificate falls back to plain HTTP (see
+    /// `serve`), and a QR code / cookie that assumed `https` then points at
+    /// a port that does not speak it. Anything user-visible has to follow
+    /// this, not [`Self::tls_on`].
+    pub fn https_live(&self) -> bool {
+        self.tls_enabled.load(Ordering::SeqCst) && self.tls.read().unwrap().is_some()
     }
 
     /// The certificate material (present even while HTTPS is off).
@@ -919,6 +995,38 @@ mod tests {
         let acts = cfg.recent_activity(ACTIVITY_CAP + 50);
         assert_eq!(acts.len(), ACTIVITY_CAP);
         assert_eq!(acts[0].name, format!("f{}", ACTIVITY_CAP + 19));
+    }
+
+    /// 手机热点的 DHCP 租期常常只有一个小时，电脑地址漂移是常态：变了必须
+    /// 惊动界面（重画二维码），但读到回环地址不算变。
+    #[test]
+    fn note_addr_follows_the_real_address() {
+        let cfg = Config::with_secret("s".into(), "12345678".into());
+        *cfg.lan_addr.write().unwrap() = "192.168.43.221".to_string();
+        cfg.addr_dirty.store(false, Ordering::SeqCst);
+
+        assert!(!cfg.note_addr("192.168.43.221"), "同一个地址不该惊动界面");
+        assert!(!cfg.addr_dirty.load(Ordering::SeqCst));
+
+        // Wi-Fi 正在重连时读到 127.0.0.1：留着上一个地址。画一张写着
+        // 127.0.0.1 的码等于让手机扫完去连它自己，比旧码更糟。
+        assert!(!cfg.note_addr("127.0.0.1"));
+        assert_eq!(cfg.lan_addr_show(), "192.168.43.221");
+
+        assert!(cfg.note_addr("192.168.43.222"), "换热点后必须标记要重画");
+        assert!(cfg.addr_dirty.load(Ordering::SeqCst));
+        assert_eq!(cfg.lan_addr_show(), "192.168.43.222");
+    }
+
+    /// 「HTTPS 开关打开」和「端口真的在说 https」是两件事：没有证书时端口
+    /// 还是明文，二维码和 cookie 都必须跟着事实走。
+    #[test]
+    fn https_live_needs_a_certificate() {
+        let cfg = Config::with_secret("s".into(), "12345678".into());
+        assert!(!cfg.https_live());
+        cfg.set_tls(true);
+        assert!(cfg.tls_on(), "开关本身还是开着的");
+        assert!(!cfg.https_live(), "没证书不能说自己在讲 https");
     }
 
     /// 重复的下载请求在窗口内合并成一条；上传不合并（落盘一次记一次）。

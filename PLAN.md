@@ -942,3 +942,104 @@ README 补两节（管理端目录 / 设备授权）。
 - 另记：本机防火墙里有允许规则的只有 `target/release` 与 `target/debug` 下的 transdata.exe，
   **部署位置 C:\TransData\transdata.exe 没有入站允许规则**；默认入站是拦截，
   手机从 WLAN 打进来可能会被挡（与 http / https 无关）。
+
+## 执行记录（2026-11-03）：手机「扫不上」和「下不动」的两个真因
+
+用户报两条：①隔几个小时再扫码就连不上，刷新二维码才好；②连上之后下载失败。
+两条都不是会话过期，也互不相干，各自有根因。
+
+### ① 本机地址漂移，而二维码是地址的「照片」
+
+**证据（系统事件日志 + 磁盘状态）**
+- `Microsoft-Windows-Dhcp-Client/Admin`：11-02 13:44:31 连上 SSID `HONOR 90 Pro`、
+  20:07:11 断开后连上 `P30`，两次都是「租用已过期」重新取址 —— 相隔 6 小时 23 分，
+  正好是用户说的「隔几个小时」。
+- 磁盘上 `transdata-tls-ips.txt` 与证书 SAN 都是 `192.168.43.221`，而网卡现在是
+  `192.168.43.222`（`Get-NetIPAddress`，`PrefixOrigin=Dhcp`，**剩余租期只有 52 分钟**）。
+- 代码侧：地址文字每帧现取（`base_url`），二维码贴图只在 `qr_dirty` 时重画，运行期
+  没有任何地方重新检测 IP → 屏幕上是新地址、码里是旧地址，两者静默分叉。
+- 排除项：`SESSION_TTL` 12 小时且每次使用都续期，几个小时不可能过期。
+
+**修法**
+- 地址成为程序状态：`Config::lan_addr` + `note_addr()`（回环地址一律忽略 —— 画一张
+  `127.0.0.1` 的码等于让手机扫完去连它自己，比留着旧地址更糟），变了置 `addr_dirty`。
+- `run_gui` 新增看护线程：每 3 秒核对一次 `display_ip()`，变了就重画二维码 + 刷新 IP
+  列表 + 一句状态文字；HTTPS 开着时顺带按新地址列表重签证书（`load_or_create` 自己
+  比对地址集合，没变不动磁盘），指纹真变了就 `set_tls(true)` 唤醒监听线程重绑，并置
+  `cert_rotated` —— 手机上要重新接受一次警告，这是唯一真的需要用户动手的情形，界面
+  直接说出来。
+- 「刷新二维码」按钮的职责回归本意：它是换配对码，不再兼任救地址的活。
+
+### ② 下载凭证只剩 Cookie，而 Via / X 浏览器把下载交给系统下载器
+
+**证据**：部署版上直接 `GET /download/<真实文件>`（无任何凭证）拿到 **401**。
+200 KB 的文档也失败、且是「隔一会儿才报网络连接失败」= 系统下载器另开一条不带
+`HttpOnly` cookie 的连接 → 401 → 退避重试几轮 → 报网络错误。
+这是上次安全重构的连带损失：凭证从 URL 挪进 Cookie（`authorized` 的注释记着缘由），
+query 被显式忽略，于是「交给外部下载器」这条路整个断了 —— 打包 / 全部打包同病。
+
+**修法**
+- 路径绑定的短时效签名：`?e=<到期 Unix 秒>&d=<HMAC-SHA256(dl_key, "e\n路径") 前 16 字节>`。
+  `dl_key` 每次运行随机、不落盘；签名只授「读这一个路径」，12 小时过期，不能列表 /
+  上传 / 改名 / 删除；`authorized` 只在 GET/HEAD 且路径属于下载或打包时才认它。
+- HMAC 手写（`sha2` 已有，不为一个 MAC 引新依赖）。
+- `/files` 直接给成品链接：每个文件一个 `href`，外加 `zips` 映射（目录相对路径 →
+  打包链接，空键是整个目录）—— 签名只有服务端能算，前端拼不出来。
+- 前端 `logic.js`/`app.js` 改用服务端给的链接；页面可能开着十几小时而链接先过期，
+  点击时若已过期就静默重取列表拿新签名再走同一条路（`resignIfNeeded`），不把 401 甩给用户。
+
+### ③ 顺带：大文件断点续传（用户点名要）
+
+`Accept-Ranges: bytes` + 单段 `Range`（`a-b` / `a-` / `-n`）→ 206 + `Content-Range:
+bytes a-b/总长`，越界给 416 并带上真实大小，多段范围退化成整文件（永远合法）；
+新增 HEAD 支持（只给头、不记账）。zip 是边压边传的流，长度未知，不做范围。
+
+### ④ HTTPS 自查（用户要求「带 s 的你自己也看看」）
+
+- 证书以前只在启动时签发，运行期地址变了 SAN 就对不上 → 手机报「名字不匹配」，
+  新版浏览器不给「继续前往」按钮，比 http 更难连；现在由看护线程重签 + 重绑。
+- 新增 `Config::https_live()`：开关打开但证书不可用时端口其实还在说 http。二维码、
+  `/info`、Cookie 的 `Secure`、`same_origin` 全部改按实际生效的协议走 —— 以前开着
+  开关没证书时，手机在 http 页面上点上传会被判成跨站 403，用户看到的是一句看不懂的话。
+- 卡片补两行红字：证书不可用仍在说 http / 本机没有可用地址。
+- 排除一条误判：`download()` 发完头没 `flush`（`zip_dir` 有），读了 tokio-rustls
+  0.26.6 的 `poll_write`，它写完立刻 `while wants_write { write_io }`，TLS 下不会憋住。
+- 又补一个口子：看护线程只在 HTTPS **开着**时重签，「先换热点、后打开 HTTPS」会拿到旧
+  SAN 的证书。现在 `GuiApp::set_tls(true)` 每次都按当前地址核对一遍（`load_or_create`
+  自己比对磁盘上的地址列表，没变不重签），指纹变了就照旧提示「手机上要再接受一次警告」。
+
+### 自查抓到的一个 bug（差点把中文名文件全打死）
+
+第一版把签名算在**编码后**的 URL 路径上，而 `authorized` 拿**解码后**的 `req.path`
+去比对 —— 纯 ASCII 名字两边一样，测试全绿；`JVM指南.pdf` 这种中文名两边不同，必然 401。
+补了 `signed_links_work_for_awkward_filenames`（中文、带空格、`%`、`+`），并临时把签名
+改回错误写法确认这条用例会红（`JVM指南.pdf 的签名链接被拒：401`），然后才修好重构建 ——
+部署版因此装了三次（补完 `set_tls` 的口子后最终 md5 `f36ae49f…`）。
+
+### 验证
+
+- Rust：86 个用例通过（新增 `signed_links_download_without_any_cookie`、
+  `signed_links_work_for_awkward_filenames`、
+  `a_download_signature_authorizes_nothing_else`、`range_requests_resume_a_download`、
+  `head_on_a_download_gives_headers_only`、`range_parsing_edges`、
+  `note_addr_follows_the_real_address`、`https_live_needs_a_certificate`、
+  `addr_change_redraws_the_qr_on_its_own`）；`cross_origin_requests_are_rejected`
+  按「没证书 = 还是 http」重写断言。
+- 前端 node 13 个用例通过（新增签名链接与缺省回退）。
+- 部署版冒烟（`C:\TransData`，md5 与 `target/release` 一致）：从窗口现读 8 位配对码 →
+  配对拿 sid → `/files` 80 条各带签名 + 14 个打包键 → **不带任何 cookie** 签名链接 200 / 10247 字节与磁盘一致；
+  `JVM指南.pdf`（中文名）匿名签名链接 200、775620 字节与磁盘逐字节一致，再按 `Range:
+  bytes=400000-400999` 取切片也与磁盘一致；
+  `Range: bytes=0-99` → 206 + `Content-Range: bytes 0-99/10247`；24 MB 的 apk 从第
+  100 万字节取 100 字节 → 与磁盘逐字节一致（seek 正确）；签名换路径 / 伪造 / 过期一律 401；
+  打包链接匿名 200（99 MB zip，PK 头与中央目录都在）；HEAD 200 无体；
+  窗口地址显示 `192.168.43.222` = 当前网卡地址（不再是证书里那个 .221）。
+- 最终那一版（`f36ae49f…`）重跑同一套：`/files` 80 条全带签名 + 14 个打包键；中文名
+  `JVM指南.pdf` 匿名签名链接 200 / 775620 字节与磁盘一致；`Range: bytes=500000-` 拿到
+  206 + `Content-Range: bytes 500000-775619/775620`，尾部切片与磁盘一致；打包链接匿名
+  200（92 MB）；无凭证的 `/files` 与 `/download/...` 都是 401；窗口地址仍是 `.222`，
+  重启后设备表 0 台。
+- 清理：临时下载物、截图脚本、435 个测试遗留目录（个别 48 MB）已删；重启部署实例清掉
+  验证时临时配上的本机设备。
+- 已知遗留：`instance::tests::second_instance_cannot_start` 在部署实例运行时必失败（环境
+  冲突，停掉后全绿）；测试仍会在 `%TEMP%` 漏 `transdata_*` 目录，没在这次改动里处理。

@@ -880,6 +880,22 @@ impl GuiApp {
                             .color(pal::now().btn_hover_close),
                     );
                 }
+                // 界面别的地方看不出这两种「开关说了但事实不是」的状态，所以要
+                // 说出来：说一套做一套的二维码比不亮的二维码更难查。
+                let warn = if self.cfg.tls_on() && !self.cfg.https_live() {
+                    Some("HTTPS 已打开但证书不可用：现在这个端口说的是 http")
+                } else if self.cfg.lan_addr_show() == "127.0.0.1" {
+                    Some("本机还没有可用的局域网地址（网络未就绪），手机连不上是正常的")
+                } else {
+                    None
+                };
+                if let Some(w) = warn {
+                    ui.label(
+                        RichText::new(w)
+                            .size(10.0)
+                            .color(pal::now().btn_hover_close),
+                    );
+                }
                 if !self.pair_msg.is_empty() {
                     ui.label(
                         RichText::new(&self.pair_msg)

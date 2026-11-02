@@ -94,6 +94,28 @@ test('buildTree 还原目录树并向上累加数量/大小', function () {
     assert.strictEqual(sub.path, 'a/sub', 'path 是相对路径，用于 /zip/ 与展开状态');
 });
 
+test('buildTree 用服务端签好名的链接；缺省时退回原来的拼法', function () {
+    // 下载/打包是交给手机自己的下载器去取的，那条连接不带会话 cookie，
+    // 链接里必须有签名 —— 签名只有服务端能算，所以前端只用服务端给的 href。
+    const files = [
+        { name: 'a/1.txt', size: 10, modified: 0, href: '/download/a/1.txt?e=9&d=aa' },
+        { name: 'top.txt', size: 5, modified: 0 }
+    ];
+    const tree = L.buildTree(files, { '': '/zip-all?e=9&d=zz', 'a': '/zip/a?e=9&d=yy' });
+
+    const one = tree.children.find((c) => c.name === 'a')
+        .children.find((c) => c.name === '1.txt');
+    assert.strictEqual(one.href, '/download/a/1.txt?e=9&d=aa', '文件用服务端给的下载链接');
+    assert.strictEqual(tree.children.find((c) => c.name === 'a').zip, '/zip/a?e=9&d=yy');
+    assert.strictEqual(tree.zip, '/zip-all?e=9&d=zz', '根目录的打包链接也来自服务端');
+
+    // 旧服务端（没有 zips/href）也不能把页面搞坏：退回原来的拼法
+    const bare = L.buildTree([{ name: 'a/1.txt', size: 1, modified: 0 }]);
+    assert.strictEqual(bare.children[0].zip, '/zip/a');
+    assert.strictEqual(bare.children[0].children[0].href, '/download/a/1.txt');
+    assert.strictEqual(bare.zip, '/zip-all');
+});
+
 test('buildTree 目录排在文件前面', function () {
     const tree = L.buildTree([
         { name: 'zzz.txt', size: 1, modified: 0 },

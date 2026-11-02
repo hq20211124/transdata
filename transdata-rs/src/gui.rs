@@ -589,6 +589,52 @@ pub fn run_gui(cfg: Arc<Config>, port: u16) {
             }
         });
     }
+
+    // ---- 本机地址的看护 ----------------------------------------------------
+    //
+    // 手机热点给的 DHCP 租期常常只有一个小时，换一台热点、掉线重连一次，电脑
+    // 的地址就变了。二维码是地址的「照片」，不重画就成了一张指向不存在地址的
+    // 码 —— 用户遇到的就是「隔几个小时再扫就连不上，刷新一下才好」。这里把它
+    // 变成程序的事：地址一变就自动重画，用户不需要知道发生过什么。
+    {
+        let cfg_addr = cfg.clone();
+        let ctx_holder_addr = ctx_holder.clone();
+        std::thread::spawn(move || {
+            let gui_ctx = loop {
+                if let Some(ctx) = ctx_holder_addr.lock().unwrap().clone() {
+                    break ctx;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            };
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                if !cfg_addr.note_addr(&crate::net::display_ip()) {
+                    continue;
+                }
+                let _ = gui_ctx.request_repaint();
+                // 证书是按地址签的：地址一变，SAN 就对不上，手机会当成「名字不
+                // 匹配」直接拒掉。重签一份（`load_or_create` 自己比对地址列表，
+                // 没变不动磁盘），并让监听线程拿着新证书重绑端口。
+                if cfg_addr.tls_on() {
+                    let ips = crate::net::all_ipv4s();
+                    if let Ok(m) = crate::tls::load_or_create(&ips) {
+                        let changed = cfg_addr
+                            .tls_material()
+                            .map(|old| old.fingerprint != m.fingerprint)
+                            .unwrap_or(true);
+                        if changed {
+                            cfg_addr.set_tls_material(m);
+                            // 再发一次同样的值也会唤醒监听线程 —— 这里要的就是
+                            // 「重绑」这个动作，不是改开关。
+                            cfg_addr.set_tls(true);
+                            cfg_addr.cert_rotated.store(true, std::sync::atomic::Ordering::SeqCst);
+                            let _ = gui_ctx.request_repaint();
+                        }
+                    }
+                }
+            }
+        });
+    }
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -890,9 +936,15 @@ impl GuiApp {
     }
 
     /// The address the phone has to open (protocol depends on HTTPS).
+    ///
+    /// Both parts come from what the machine is *actually* doing, not from
+    /// the switches: `lan_addr` is kept fresh by the watcher thread, and
+    /// `https_live` is false while HTTPS is asked for but no certificate
+    /// exists (the port then really speaks plain HTTP, and a QR code saying
+    /// `https` would send the phone somewhere it cannot talk to).
     fn base_url(&self) -> String {
-        let scheme = if self.cfg.tls_on() { "https" } else { "http" };
-        format!("{}://{}:{}", scheme, crate::net::display_ip(), self.port)
+        let scheme = if self.cfg.https_live() { "https" } else { "http" };
+        format!("{}://{}:{}", scheme, self.cfg.lan_addr_show(), self.port)
     }
 
     fn refresh_qr(&mut self, ctx: &eframe::egui::Context) {
@@ -927,15 +979,31 @@ impl GuiApp {
     /// Switch HTTPS on or off. The server re-binds the port, so the
     /// address and the QR code change as well.
     fn set_tls(&mut self, on: bool) {
-        if on && self.cfg.tls_material().is_none() {
-            // No certificate yet (first run, or the file could not be
-            // written): create one now.
+        if on {
+            // 每次都按当前地址核对一遍：看护线程只在 HTTPS *开着*的时候重签，
+            // 「先换热点、后打开 HTTPS」这条路如果不重签，手机拿到的就是一张
+            // 名字对不上的证书 —— 浏览器连「继续前往」都不给。
+            // `load_or_create` 自己比对磁盘上的地址列表，没变就不重新签发。
             let ips = crate::net::all_ipv4s();
             match crate::tls::load_or_create(&ips) {
-                Ok(m) => self.cfg.set_tls_material(m),
+                Ok(m) => {
+                    let rotated = self
+                        .cfg
+                        .tls_material()
+                        .map(|old| old.fingerprint != m.fingerprint)
+                        .unwrap_or(false);
+                    self.cfg.set_tls_material(m);
+                    if rotated {
+                        self.cfg.cert_rotated.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
                 Err(e) => {
                     eprintln!("tls: {e}");
-                    return;
+                    if self.cfg.tls_material().is_none() {
+                        // 一张证书都没有：开着 HTTPS 也只是让端口说 http，
+                        // 不如不开，并让调用方看到原因。
+                        return;
+                    }
                 }
             }
         }
@@ -1972,6 +2040,27 @@ impl GuiApp {
 
         // 便签框里的 Ctrl+V 可能是截图：egui 只粘文本，图片要自己读剪贴板
         self.poll_note_paste_image(ctx);
+
+        // 地址变了（换热点 / DHCP 重新分配）就自动重画二维码：旧地址已经不存在，
+        // 这里没有需要用户判断的东西，所以不弹提示、不等点击。
+        if self
+            .cfg
+            .addr_dirty
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.qr_dirty = true;
+            self.ips = crate::net::all_ipv4s();
+            self.pair_msg = "本机地址变了，二维码已自动更新".to_string();
+        }
+        // 唯一真的要用户动手的：HTTPS 下证书重签了，手机得重新接受一次警告。
+        if self
+            .cfg
+            .cert_rotated
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.qr_dirty = true;
+            self.pair_msg = "证书已跟着新地址重签：手机上要再接受一次安全警告".to_string();
+        }
 
         let refresh_now = self.qr_dirty;
         if self.qr_dirty {
@@ -3274,6 +3363,45 @@ mod tests {
         crate::settings::set_theme(crate::settings::Theme::Light);
         app.settings.theme = crate::settings::Theme::Light;
         app.settings.save();
+    }
+
+    /// 本机地址变了（换了一台手机热点 / DHCP 重新分配）时，界面必须自己把二维码
+    /// 重画掉。以前不会：码里的地址是启动时烘进去的，几小时后扫它就等于扫一张
+    /// 指向不存在地址的图，只能靠人回电脑前点「刷新二维码」。
+    #[test]
+    fn addr_change_redraws_the_qr_on_its_own() {
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        let cfg = app.cfg.clone();
+        let frame = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(WIN_W, WIN_H),
+            )),
+            ..Default::default()
+        };
+
+        let _ = ctx.run(frame(), |ctx| app.draw(ctx));
+        assert!(app.qr_handle.is_some(), "第一帧就该画出二维码");
+
+        assert!(cfg.note_addr("10.9.8.7"), "换地址必须标脏");
+        let _ = ctx.run(frame(), |ctx| app.draw(ctx));
+
+        assert!(
+            app.base_url().contains("10.9.8.7"),
+            "二维码用的必须是新地址，实际是 {}",
+            app.base_url()
+        );
+        assert!(
+            !cfg.addr_dirty.load(std::sync::atomic::Ordering::SeqCst),
+            "界面要把「该重画」消费掉"
+        );
+        assert!(!app.qr_dirty, "重画已完成，不该还留着脏标记");
+        assert!(
+            app.pair_msg.contains("地址"),
+            "要有一句人话说明刚发生了什么：{}",
+            app.pair_msg
+        );
     }
 
     /// 设置面板里能看到版本号（关于）

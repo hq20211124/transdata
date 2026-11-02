@@ -64,9 +64,16 @@
         return out;
     }
 
-    /* 把 /files 的扁平列表（name 带子目录前缀）还原成树 */
-    function buildTree(files) {
-        var root = { name: '', path: '', dir: true, children: [], files: 0, size: 0, parent: null };
+    /* 把 /files 的扁平列表（name 带子目录前缀）还原成树
+       zips：目录相对路径 → 打包链接（服务端签好名的），空串是整个目录。
+       链接由服务端给：下载/打包要交给手机自己的下载器去取，那条连接不带
+       会话 cookie，只能靠链接里的签名 —— 前端自己拼不出合法签名。 */
+    function buildTree(files, zips) {
+        var map = zips || {};
+        var root = {
+            name: '', path: '', dir: true, children: [], files: 0, size: 0,
+            parent: null, zip: map[''] || '/zip-all'
+        };
         var index = { '': root };
         files.forEach(function (f) {
             var parts = f.name.split('/');
@@ -77,7 +84,8 @@
                 if (!node) {
                     node = {
                         name: parts[i], path: p, dir: true, children: [],
-                        files: 0, size: 0, parent: cur
+                        files: 0, size: 0, parent: cur,
+                        zip: map[p] || '/zip/' + encPath(p)
                     };
                     index[p] = node;
                     cur.children.push(node);
@@ -86,7 +94,8 @@
             }
             cur.children.push({
                 name: parts[parts.length - 1], path: f.name, dir: false,
-                children: [], files: 1, size: f.size, parent: cur
+                children: [], files: 1, size: f.size, parent: cur,
+                href: f.href || '/download/' + encPath(f.name)
             });
             var up = cur;
             while (up) { up.files++; up.size += f.size; up = up.parent; }

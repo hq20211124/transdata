@@ -222,7 +222,9 @@ async fn write_https_only_notice(
     sock: &mut impl Conn,
     cfg: &Arc<Config>,
 ) -> Result<(), std::io::Error> {
-    let url = format!("https://{}:{}", crate::net::display_ip(), cfg.port);
+    // Same address the desktop QR code shows (`lan_addr`), so the page and
+    // the code can never disagree about where the phone should go.
+    let url = format!("https://{}:{}", cfg.lan_addr_show(), cfg.port);
     let body = format!(
         r#"<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -278,6 +280,25 @@ struct Request {
     accept_gzip: bool,
     /// `If-None-Match` header (for the page's ETag / 304).
     if_none_match: Option<String>,
+    /// Raw query string (only read for the signed download links).
+    query: String,
+    /// `Range` header, kept verbatim for the parser in `download`.
+    range: Option<String>,
+}
+
+impl Request {
+    /// Value of a query parameter (no decoding: the only values we read are
+    /// decimal timestamps and lowercase hex signatures).
+    fn qparam(&self, name: &str) -> Option<&str> {
+        for pair in self.query.split('&') {
+            if let Some((k, v)) = pair.split_once('=') {
+                if k == name {
+                    return Some(v);
+                }
+            }
+        }
+        None
+    }
 }
 
 fn parse_request(head: &str) -> Option<Request> {
@@ -286,9 +307,10 @@ fn parse_request(head: &str) -> Option<Request> {
     let mut parts = start.split_whitespace();
     let method = parts.next()?.to_string();
     let target = parts.next()?;
-    // The target may carry a query string (ignored: no credential ever
-    // travels in the URL any more).
-    let (raw_path, _query) = match target.split_once('?') {
+    // The target may carry a query string. Nothing authenticates from it any
+    // more (see `authorized`); it only ever holds the signature of a
+    // download link, which is checked against the path it is bound to.
+    let (raw_path, query) = match target.split_once('?') {
         Some((p, q)) => (p, q.to_string()),
         None => (target, String::new()),
     };
@@ -303,6 +325,7 @@ fn parse_request(head: &str) -> Option<Request> {
     let mut origin = None;
     let mut accept_gzip = false;
     let mut if_none_match = None;
+    let mut range = None;
     for line in lines {
         if line.is_empty() {
             break;
@@ -341,6 +364,8 @@ fn parse_request(head: &str) -> Option<Request> {
             accept_gzip = true;
         } else if lname == "if-none-match" {
             if_none_match = Some(v.to_string());
+        } else if lname == "range" {
+            range = Some(v.to_string());
         }
     }
     Some(Request {
@@ -355,6 +380,8 @@ fn parse_request(head: &str) -> Option<Request> {
         origin,
         accept_gzip,
         if_none_match,
+        query,
+        range,
     })
 }
 
@@ -384,6 +411,101 @@ fn ct_eq(a: &str, b: &str) -> bool {
     diff == 0
 }
 
+/// HMAC-SHA256 (RFC 2104) over `sha2`. Written here instead of pulled in as a
+/// dependency: this is the only place that needs a MAC.
+fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    const BLOCK: usize = 64;
+    let mut k = [0u8; BLOCK];
+    if key.len() > BLOCK {
+        let h = Sha256::digest(key);
+        k[..32].copy_from_slice(&h);
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let (mut ipad, mut opad) = ([0u8; BLOCK], [0u8; BLOCK]);
+    for i in 0..BLOCK {
+        ipad[i] = k[i] ^ 0x36;
+        opad[i] = k[i] ^ 0x5c;
+    }
+    let inner = {
+        let mut h = Sha256::new();
+        h.update(&ipad);
+        h.update(msg);
+        h.finalize()
+    };
+    let mut h = Sha256::new();
+    h.update(&opad);
+    h.update(inner);
+    h.finalize().into()
+}
+
+/// Signature of a download link: covers the expiry **and** the exact path, so
+/// a link can only ever read the one file (or folder archive) it was made for.
+fn dl_sign(cfg: &Config, exp: u64, path: &str) -> String {
+    let mac = hmac_sha256(&cfg.dl_key, format!("{exp}\n{path}").as_bytes());
+    mac[..16].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The URL a download button should point at, signature included.
+fn dl_href(cfg: &Config, prefix: &str, rel: &str) -> String {
+    // 签名算在**解码后**的路径上（那才是 `authorized` 拿去比对的 `req.path`），
+    // URL 里放的是逐段 percent-encode 的形式。两者对中文名 / 带空格的名字并不
+    // 相同，算错一边就是中文文件永远 401。
+    let signed = if rel.is_empty() {
+        prefix.to_string()
+    } else {
+        format!("{prefix}{rel}")
+    };
+    let url_path = if rel.is_empty() {
+        prefix.to_string()
+    } else {
+        // `/` stays a separator, every other byte is percent-encoded — the
+        // same form the browser produces with `encPath`.
+        format!(
+            "{prefix}{}",
+            rel.split('/')
+                .map(percent_encode)
+                .collect::<Vec<_>>()
+                .join("/")
+        )
+    };
+    let exp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() + crate::config::DL_TOKEN_TTL.as_secs())
+        .unwrap_or(0);
+    format!("{url_path}?e={exp}&d={}", dl_sign(cfg, exp, &signed))
+}
+
+/// Does this request carry a valid signature for its own path?
+///
+/// Only read-only download paths may be signed, and the signature is checked
+/// against `req.path` — which is the *decoded* path, so it cannot be steered
+/// onto another file by re-encoding it.
+fn dl_signed_ok(cfg: &Config, req: &Request) -> bool {
+    if !matches!(
+        req.path.as_str(),
+        p if p.starts_with("/download/") || p.starts_with("/zip/") || p == "/zip-all"
+    ) {
+        return false;
+    }
+    let (Some(exp), Some(sig)) = (
+        req.qparam("e").and_then(|v| v.parse::<u64>().ok()),
+        req.qparam("d"),
+    ) else {
+        return false;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if now > exp {
+        return false;
+    }
+    let want = dl_sign(cfg, exp, &req.path);
+    // The signature is public-facing: compare it without leaking positions.
+    ct_eq(sig, &want)
+}
+
 /// Is this request allowed to talk to the API?
 ///
 /// Two ways in:
@@ -395,11 +517,17 @@ fn ct_eq(a: &str, b: &str) -> bool {
 /// 2. The `X-TD-Secret` header carrying the pairing secret. Only the
 ///    desktop app on the same machine uses this path (it pairs once at
 ///    startup and then behaves like any other client).
+/// 3. A signed download link ([`dl_href`]) — GET/HEAD on one specific path
+///    only. This exists because phones do not always fetch a download with
+///    the page's cookies: Via, X Browser and the Android system downloader
+///    open a fresh connection, and without a credential in the URL they got
+///    a 401 and reported "network error" for a file that was right there.
 ///
 /// The old design handed the token to *everybody* who asked for the index
 /// page, which meant any device on the LAN could list, download and
 /// delete files. The secret is now only ever displayed on the desktop
-/// screen or embedded in the QR code.
+/// screen or embedded in the QR code. A download signature is strictly
+/// narrower: one path, read-only, and it expires.
 fn authorized(cfg: &Config, req: &Request) -> bool {
     if let Some(c) = &req.cookie {
         if let Some(sid) = cookie_value(c, "td_sid") {
@@ -413,6 +541,9 @@ fn authorized(cfg: &Config, req: &Request) -> bool {
         if ct_eq(s, expected.as_str()) {
             return true;
         }
+    }
+    if (req.method == "GET" || req.method == "HEAD") && dl_signed_ok(cfg, req) {
+        return true;
     }
     false
 }
@@ -463,7 +594,7 @@ fn same_origin(req: &Request, cfg: &Config) -> bool {
         Some((s, rest)) => (s, rest.split('/').next().unwrap_or("")),
         None => return true,
     };
-    let expected = if cfg.tls_on() { "https" } else { "http" };
+    let expected = if cfg.https_live() { "https" } else { "http" };
     if !scheme.eq_ignore_ascii_case(expected) {
         return false;
     }
@@ -672,11 +803,12 @@ async fn handle_conn(
                         .count()
                 })
                 .unwrap_or(0);
-            // The scheme has to follow the current mode: with HTTPS switched
-            // on, an `http://` address here would send the phone to the
-            // "please use https" page (the page copies this value).
-            let scheme = if cfg.tls_on() { "https" } else { "http" };
-            let url = format!("{scheme}://{}:{}", crate::net::display_ip(), cfg.port);
+            // The scheme has to follow the protocol the port actually serves
+            // (see `https_live`): with the switch on but no certificate the
+            // phone would otherwise be sent to an `https` address that speaks
+            // plain HTTP.
+            let scheme = if cfg.https_live() { "https" } else { "http" };
+            let url = format!("{scheme}://{}:{}", cfg.lan_addr_show(), cfg.port);
             let dir_s = dir.to_string_lossy().replace('"', "\\\"");
             let active = cfg
                 .active_transfers
@@ -707,21 +839,42 @@ async fn handle_conn(
             // 遍历与上限都在 `crate::ops::list` 里（GUI 用同一份，所以两边
             // 看到的是同一个目录）。网页端只要文件，目录行由前端自己拼。
             let snap = crate::ops::list(cfg);
+            // `href` carries a signature bound to that exact path: the phone
+            // can hand the link to its own downloader (which has no cookies)
+            // and still get the file. Built here rather than client-side for
+            // the same reason — the key never leaves this machine.
             let items: Vec<String> = snap
                 .files()
                 .map(|e| {
                     format!(
-                        r#"{{"name":"{}","size":{},"modified":{}}}"#,
+                        r#"{{"name":"{}","size":{},"modified":{},"href":"{}"}}"#,
                         Config::json_escape(&e.rel),
                         e.size,
-                        e.mtime
+                        e.mtime,
+                        dl_href(cfg, "/download/", &e.rel)
                     )
                 })
                 .collect();
+            // One archive link per directory (keyed by its relative path; the
+            // empty key is the whole transfer dir).
+            let mut zips: Vec<String> = snap
+                .entries
+                .iter()
+                .filter(|e| e.is_dir)
+                .map(|e| {
+                    format!(
+                        r#""{}":"{}""#,
+                        Config::json_escape(&e.rel),
+                        dl_href(cfg, "/zip/", &e.rel)
+                    )
+                })
+                .collect();
+            zips.push(format!(r#""":"{}""#, dl_href(cfg, "/zip-all", "")));
             let body = format!(
-                r#"{{"success":true,"truncated":{},"files":[{}]}}"#,
+                r#"{{"success":true,"truncated":{},"files":[{}],"zips":{{{}}}}}"#,
                 snap.truncated,
-                items.join(",")
+                items.join(","),
+                zips.join(",")
             );
             cfg.store_files_cache(body.clone());
             write_json(&mut sock, &body).await
@@ -732,7 +885,18 @@ async fn handle_conn(
         // which made such files impossible to download or delete.
         ("GET", p) if p.starts_with("/download/") => {
             match resolve_rel(cfg, &p["/download/".len()..]) {
-                Some(p) => download(&mut sock, cfg, &p, peer).await,
+                Some(p) => {
+                    download(&mut sock, cfg, &p, peer, req.range.as_deref(), false).await
+                }
+                None => write_json_err(&mut sock, "Bad path").await,
+            }
+        }
+        // HEAD answers the same headers without the body: downloaders use it
+        // to size the file (and to check the link still works) before opening
+        // the real connection.
+        ("HEAD", p) if p.starts_with("/download/") => {
+            match resolve_rel(cfg, &p["/download/".len()..]) {
+                Some(p) => download(&mut sock, cfg, &p, peer, None, true).await,
                 None => write_json_err(&mut sock, "Bad path").await,
             }
         }
@@ -861,9 +1025,11 @@ async fn pair(
     }
 
     let sid = cfg.new_session(peer);
-    // `Secure` when the server speaks HTTPS: the session id must never
-    // travel in clear text.
-    let secure = if cfg.tls_on() { "; Secure" } else { "" };
+    // `Secure` when the server really speaks HTTPS (not merely when the
+    // switch is on: with no certificate the port is plain HTTP, and a
+    // `Secure` cookie would then never be sent back — the device could pair
+    // and still be told it is not paired).
+    let secure = if cfg.https_live() { "; Secure" } else { "" };
     let cookie = format!(
         "Set-Cookie: td_sid={sid}; Path=/; HttpOnly; SameSite=Strict{secure}; Max-Age={}\r\n",
         crate::config::SESSION_TTL.as_secs()
@@ -1207,11 +1373,76 @@ async fn write_json_status(
 // ---------------------------------------------------------------------------
 // download (streamed from disk in chunks)
 
+/// What a `Range` header asked for.
+enum RangeReq {
+    /// No range, or one this server does not try to honour (several
+    /// segments): send the whole file.
+    Full,
+    /// A satisfiable range, inclusive at both ends.
+    Part(u64, u64),
+    /// A well-formed range outside the file — the client must be told, with
+    /// the real size, so a resumed download can end instead of retrying.
+    Unsatisfiable,
+}
+
+/// Parse `bytes=a-b`, `bytes=a-` and `bytes=-n`.
+///
+/// Single segment only. `multipart/byteranges` is not worth the framing for a
+/// LAN tool: a client asking for several segments gets the whole file, which
+/// is always a valid response (`Range` is a request, not a demand).
+fn parse_range(spec: &str, len: u64) -> RangeReq {
+    let Some(rest) = spec.trim().strip_prefix("bytes=") else {
+        return RangeReq::Full;
+    };
+    if rest.contains(',') {
+        return RangeReq::Full;
+    }
+    let Some((first, last)) = rest.split_once('-') else {
+        return RangeReq::Full;
+    };
+    let (first, last) = (first.trim(), last.trim());
+    if len == 0 {
+        return RangeReq::Unsatisfiable;
+    }
+    let top = len - 1;
+    if first.is_empty() {
+        // `bytes=-n`: the last n bytes.
+        let Ok(n) = last.parse::<u64>() else {
+            return RangeReq::Full;
+        };
+        if n == 0 {
+            return RangeReq::Unsatisfiable;
+        }
+        return RangeReq::Part(len.saturating_sub(n), top);
+    }
+    let Ok(start) = first.parse::<u64>() else {
+        return RangeReq::Full;
+    };
+    if start > top {
+        return RangeReq::Unsatisfiable;
+    }
+    let end = if last.is_empty() {
+        top
+    } else {
+        match last.parse::<u64>() {
+            Ok(v) => v.min(top),
+            Err(_) => top,
+        }
+    };
+    if end < start {
+        return RangeReq::Unsatisfiable;
+    }
+    RangeReq::Part(start, end)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn download(
     sock: &mut impl Conn,
     cfg: &Arc<Config>,
     path: &std::path::Path,
     peer: &str,
+    range: Option<&str>,
+    head_only: bool,
 ) -> Result<(), std::io::Error> {
     let file = path.to_path_buf();
     if !file.is_file() {
@@ -1231,30 +1462,73 @@ async fn download(
     let encoded = percent_encode(&raw_name);
     // 记录用：传完才记账，所以这里先把展示用的相对路径准备好。
     let shown = rel_display(cfg, &file);
+
+    let want = match range {
+        Some(r) => parse_range(r, len),
+        None => RangeReq::Full,
+    };
+    if matches!(want, RangeReq::Unsatisfiable) {
+        let head = format!(
+            "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{len}\r\n\
+             Content-Length: 0\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
+        );
+        sock.write_all(head.as_bytes()).await?;
+        sock.flush().await?;
+        let _ = tokio::io::AsyncWriteExt::shutdown(sock).await;
+        return Ok(());
+    }
+    let (off, count, partial) = match want {
+        RangeReq::Part(a, b) => (a, b - a + 1, true),
+        _ => (0, len, false),
+    };
     let mut out = Vec::with_capacity(512);
-    out.extend_from_slice(b"HTTP/1.1 200 OK\r\n");
+    out.extend_from_slice(format!(
+        "HTTP/1.1 {}\r\n",
+        if partial { "206 Partial Content" } else { "200 OK" }
+    )
+    .as_bytes());
     out.extend_from_slice(format!("Content-Type: {mime}\r\n").as_bytes());
-    out.extend_from_slice(format!("Content-Length: {len}\r\n").as_bytes());
+    out.extend_from_slice(format!("Content-Length: {count}\r\n").as_bytes());
     out.extend_from_slice(
         format!(
             "Content-Disposition: attachment; filename=\"{name}\"; filename*=UTF-8''{encoded}\r\n"
         )
         .as_bytes(),
     );
+    // Saying this is what lets a downloader resume instead of restarting when
+    // the radio drops — which is the whole point on a phone hotspot.
+    out.extend_from_slice(b"Accept-Ranges: bytes\r\n");
+    if partial {
+        // The total size has to be in there: it is how a downloader knows the
+        // piece it asked for is the *end* of the file instead of retrying.
+        let end = off + count - 1;
+        out.extend_from_slice(format!("Content-Range: bytes {off}-{end}/{len}\r\n").as_bytes());
+    }
     out.extend_from_slice(b"Cache-Control: no-store, max-age=0\r\n");
     out.extend_from_slice(b"Connection: close\r\n");
     out.extend_from_slice(b"\r\n");
     sock.write_all(&out).await?;
+    if head_only {
+        // Headers only: nothing was transferred, so nothing is logged.
+        sock.flush().await?;
+        let _ = tokio::io::AsyncWriteExt::shutdown(sock).await;
+        return Ok(());
+    }
 
     // Async disk reads: no blocking tokio workers, no per-chunk flush
     // (TCP writes are already coalesced by the kernel).
     let _active = ActiveGuard::new(cfg);
     let file = tokio::fs::File::open(&file).await?;
     let mut reader = BufReader::with_capacity(CHUNK, file);
+    if off > 0 {
+        use tokio::io::AsyncSeekExt;
+        reader.seek(std::io::SeekFrom::Start(off)).await?;
+    }
     let mut chunk = vec![0u8; CHUNK];
     let mut sent: u64 = 0;
-    loop {
-        let n = reader.read(&mut chunk).await?;
+    while sent < count {
+        let take = ((count - sent) as usize).min(CHUNK);
+        let n = reader.read(&mut chunk[..take]).await?;
         if n == 0 {
             break;
         }
@@ -2412,8 +2686,19 @@ mod tests {
         assert!(!same_origin(&mk("http://evil.example"), &cfg));
         // A different scheme is a different origin.
         assert!(!same_origin(&mk("https://192.168.1.9:9999"), &cfg));
-        // With HTTPS switched on, only https is accepted.
+        // 开关打开但没有证书：端口实际还在说 http，那就只认 http。
+        // （以前这里按 `tls_on` 猜协议，手机在 http 页面上点上传会被判成跨站。）
         cfg.set_tls(true);
+        assert!(!same_origin(&mk("https://192.168.1.9:9999"), &cfg));
+        assert!(same_origin(&mk("http://192.168.1.9:9999"), &cfg));
+        // 证书到位之后，https 才是同一个源，http 反而不是了。
+        let cert_dir = std::env::temp_dir().join(format!("td_origin_{}", std::process::id()));
+        let material = crate::tls::load_or_create_in(
+            &["127.0.0.1".to_string()],
+            std::slice::from_ref(&cert_dir),
+        )
+        .expect("certificate");
+        cfg.set_tls_material(material);
         assert!(same_origin(&mk("https://192.168.1.9:9999"), &cfg));
         assert!(!same_origin(&mk("http://192.168.1.9:9999"), &cfg));
         // No Origin header at all (not a browser) is allowed through.
@@ -3615,6 +3900,272 @@ mod folder_tests {
         let resp = http_text(port, "GET /files HTTP/1.1\r\nHost: t\r\nX-TD-Secret: test-secret\r\n\r\n")
             .await;
         assert!(resp.contains("\"success\":true"), "resp: {resp}");
+    }
+
+    // ---- 签名下载链接 ------------------------------------------------------
+
+    /// The JSON body of an HTTP response (these tests read raw text, so the
+    /// head has to be trimmed off first).
+    fn json_of(resp: &str) -> serde_json::Value {
+        let i = resp.find("{\"success\"").unwrap_or(0);
+        serde_json::from_str(&resp[i..]).expect("response body is not JSON")
+    }
+
+    /// Split a raw response into (head, body).
+    fn split(raw: &[u8]) -> (String, Vec<u8>) {
+        let at = raw
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("no head/body separator");
+        (
+            String::from_utf8_lossy(&raw[..at]).to_string(),
+            raw[at + 4..].to_vec(),
+        )
+    }
+
+    /// 下载链接必须自带凭证：Via、X 浏览器这些会把下载交给系统下载器，那是
+    /// 另一条连接，不带页面的 HttpOnly cookie。只认 cookie 的时候，200 KB 的
+    /// 文档也会「隔一会儿报网络连接失败」——用户看到的正是这个。
+    #[tokio::test]
+    async fn signed_links_download_without_any_cookie() {
+        let (port, _dir, _cfg) =
+            setup_cfg("sig_ok", &[("a.txt", b"HELLO"), ("docs/b.bin", b"WORLD!")]).await;
+        let list = json_of(
+            &http_text(
+                port,
+                "GET /files HTTP/1.1\r\nHost: t\r\nX-TD-Secret: test-secret\r\n\r\n",
+            )
+            .await,
+        );
+        let href_of = |name: &str| -> String {
+            list["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["name"].as_str() == Some(name))
+                .unwrap_or_else(|| panic!("`{name}` missing from {list}"))["href"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let a = href_of("a.txt");
+        assert!(a.starts_with("/download/a.txt?e="), "href: {a}");
+
+        // 一条凭证都不带：靠链接里的签名就该拿到内容。
+        let raw = http_bytes(port, &format!("GET {a} HTTP/1.1\r\nHost: t\r\n\r\n")).await;
+        let (head, body) = split(&raw);
+        assert!(head.contains("200 OK"), "head: {head}");
+        assert!(head.contains("Accept-Ranges: bytes"), "head: {head}");
+        assert_eq!(body, b"HELLO");
+
+        // 目录的打包链接同样能匿名取（打包以前也是只认 cookie 的）。
+        let z = list["zips"]["docs"].as_str().unwrap().to_string();
+        assert!(z.starts_with("/zip/docs?e="), "zip href: {z}");
+        let raw = http_bytes(port, &format!("GET {z} HTTP/1.1\r\nHost: t\r\n\r\n")).await;
+        let (head, body) = split(&raw);
+        assert!(head.contains("200 OK"), "head: {head}");
+        assert!(head.contains("application/zip"), "head: {head}");
+        assert!(!body.is_empty(), "empty archive");
+        // 整个传输目录的打包（空键）也在。
+        let za = list["zips"][""].as_str().unwrap().to_string();
+        assert!(za.starts_with("/zip-all?e="), "zip-all href: {za}");
+        let raw = http_bytes(port, &format!("GET {za} HTTP/1.1\r\nHost: t\r\n\r\n")).await;
+        assert!(split(&raw).0.contains("200 OK"), "zip-all refused");
+    }
+
+    /// 中文名、带空格、带 `%` 和 `+` 的文件名。签名算在解码后的路径上、URL 里
+    /// 放编码后的形式，两边算错一边就是这类文件永远 401（用户的目录里全是中文名）。
+    #[tokio::test]
+    async fn signed_links_work_for_awkward_filenames() {
+        let names = [
+            "JVM指南.pdf",
+            "我的 文档/a b.txt",
+            "50%41.txt",
+            "c++/note+1.txt",
+        ];
+        let files: Vec<(&str, &[u8])> = names.iter().map(|n| (*n, &b"X"[..])).collect();
+        let (port, _dir, _cfg) = setup_cfg("sig_names", &files).await;
+        let list = json_of(
+            &http_text(
+                port,
+                "GET /files HTTP/1.1\r\nHost: t\r\nX-TD-Secret: test-secret\r\n\r\n",
+            )
+            .await,
+        );
+        for name in names {
+            let href = list["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["name"].as_str() == Some(name))
+                .unwrap_or_else(|| panic!("`{name}` 不在列表里：{list}"))["href"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let raw = http_bytes(port, &format!("GET {href} HTTP/1.1\r\nHost: t\r\n\r\n")).await;
+            let (head, body) = split(&raw);
+            assert!(head.contains("200 OK"), "`{name}` 的签名链接被拒：{head} ← {href}");
+            assert_eq!(body, b"X", "`{name}` 内容不对");
+        }
+        // 中文目录的打包链接同样要能匿名取
+        let z = list["zips"]["我的 文档"]
+            .as_str()
+            .unwrap_or_else(|| panic!("没有中文目录的打包键：{list}"))
+            .to_string();
+        let raw = http_bytes(port, &format!("GET {z} HTTP/1.1\r\nHost: t\r\n\r\n")).await;
+        assert!(split(&raw).0.contains("200 OK"), "中文目录打包被拒：{z}");
+    }
+
+    /// 签名只授「那一个路径的读」，别的什么都授不了：换路径、拿去列表、拿去
+    /// 删除都必须 401，过期也一样。
+    #[tokio::test]
+    async fn a_download_signature_authorizes_nothing_else() {
+        let (port, _dir, cfg) =
+            setup_cfg("sig_narrow", &[("a.txt", b"HELLO"), ("b.txt", b"SECRET")]).await;
+        let list = json_of(
+            &http_text(
+                port,
+                "GET /files HTTP/1.1\r\nHost: t\r\nX-TD-Secret: test-secret\r\n\r\n",
+            )
+            .await,
+        );
+        let a = list["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"].as_str() == Some("a.txt"))
+            .unwrap()["href"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let query = a.split_once('?').unwrap().1.to_string();
+
+        // 同一个签名换成另一个文件的路径 → 必须拒绝（不能靠重排 URL 读别的文件）。
+        let swapped = format!("/download/b.txt?{query}");
+        let resp = http_text(port, &format!("GET {swapped} HTTP/1.1\r\nHost: t\r\n\r\n")).await;
+        assert!(resp.contains("401"), "path swap accepted: {resp}");
+
+        // 拿它去列表 / 删除 → 拒绝。
+        let resp = http_text(
+            port,
+            &format!("GET /files?{query} HTTP/1.1\r\nHost: t\r\n\r\n"),
+        )
+        .await;
+        assert!(resp.contains("401"), "listing accepted with a download token");
+        let resp = http_text(
+            port,
+            &format!("DELETE /delete/a.txt?{query} HTTP/1.1\r\nHost: t\r\n\r\n"),
+        )
+        .await;
+        assert!(resp.contains("401"), "delete accepted with a download token");
+
+        // 过期的签名 → 拒绝（时间戳在签名里，改不了）。
+        let path = "/download/a.txt";
+        let dead = format!("{path}?e=1&d={}", dl_sign(&cfg, 1, path));
+        let resp = http_text(port, &format!("GET {dead} HTTP/1.1\r\nHost: t\r\n\r\n")).await;
+        assert!(resp.contains("401"), "expired token accepted: {resp}");
+
+        // 篡改过的签名 → 拒绝。
+        let bad = format!("{path}?e=9999999999&d=00000000000000000000000000000000");
+        let resp = http_text(port, &format!("GET {bad} HTTP/1.1\r\nHost: t\r\n\r\n")).await;
+        assert!(resp.contains("401"), "forged token accepted: {resp}");
+    }
+
+    // ---- Range 断点续传 ---------------------------------------------------
+
+    /// 大文件要能续：手机热点抖一下就得从头重下，是「下载失败」的另一半原因。
+    #[tokio::test]
+    async fn range_requests_resume_a_download() {
+        let data: Vec<u8> = (0..300 * 1024).map(|i| (i % 251) as u8).collect();
+        let (port, _dir, cfg) = setup_cfg("range_ok", &[("big.bin", &data)]).await;
+        let href = dl_href(&cfg, "/download/", "big.bin");
+
+        async fn get(port: u16, href: &str, spec: &str) -> Vec<u8> {
+            http_bytes(
+                port,
+                &format!("GET {href} HTTP/1.1\r\nHost: t\r\nRange: {spec}\r\n\r\n"),
+            )
+            .await
+        }
+
+        // 中段：只发要的那 100 000 个字节，内容和文件里对应的一段完全一致。
+        let raw = get(port, &href, "bytes=100000-199999").await;
+        let (head, body) = split(&raw);
+        assert!(head.contains("206 Partial Content"), "head: {head}");
+        assert!(
+            head.contains("Content-Range: bytes 100000-199999/307200"),
+            "head: {head}"
+        );
+        assert_eq!(body.len(), 100_000);
+        assert_eq!(body, &data[100_000..200_000]);
+
+        // 尾巴（`a-` 不带结束）——下载器续传用的正是这个形式。
+        let raw = get(port, &href, "bytes=200000-").await;
+        let (head, body) = split(&raw);
+        assert!(head.contains("206 Partial Content"), "head: {head}");
+        assert_eq!(body.len(), data.len() - 200_000);
+        assert_eq!(body, &data[200_000..]);
+
+        // 最后 1024 个字节（`-n`）。
+        let raw = get(port, &href, "bytes=-1024").await;
+        let (_head, body) = split(&raw);
+        assert_eq!(body, &data[data.len() - 1024..]);
+
+        // 超出文件末尾 → 416，并把真实大小告诉客户端，让它能收尾而不是死循环重试。
+        let raw = get(port, &href, "bytes=999999-1000000").await;
+        let (head, body) = split(&raw);
+        assert!(head.contains("416"), "head: {head}");
+        assert!(head.contains("Content-Range: bytes */307200"), "head: {head}");
+        assert!(body.is_empty());
+
+        // 多段范围不做（multipart/byteranges 太冷门）：给整个文件，永远合法。
+        let raw = get(port, &href, "bytes=0-9,20-29").await;
+        let (head, body) = split(&raw);
+        assert!(head.contains("200 OK"), "head: {head}");
+        assert_eq!(body.len(), data.len());
+
+        // 不带 Range 的普通请求照旧是 200 全量。
+        let raw = http_bytes(port, &format!("GET {href} HTTP/1.1\r\nHost: t\r\n\r\n")).await;
+        let (head, body) = split(&raw);
+        assert!(head.contains("200 OK"), "head: {head}");
+        assert!(head.contains("Content-Length: 307200"), "head: {head}");
+        assert_eq!(body.len(), data.len());
+    }
+
+    /// HEAD 只给头不给体（下载器用它问大小），也不许记进活动日志。
+    #[tokio::test]
+    async fn head_on_a_download_gives_headers_only() {
+        let (port, _dir, cfg) = setup_cfg("head_one", &[("a.txt", b"HELLO")]).await;
+        let href = dl_href(&cfg, "/download/", "a.txt");
+        let raw = http_bytes(port, &format!("HEAD {href} HTTP/1.1\r\nHost: t\r\n\r\n")).await;
+        let (head, body) = split(&raw);
+        assert!(head.contains("200 OK"), "head: {head}");
+        assert!(head.contains("Content-Length: 5"), "head: {head}");
+        assert!(head.contains("Accept-Ranges: bytes"), "head: {head}");
+        assert!(body.is_empty(), "HEAD sent a body: {body:?}");
+        assert!(
+            cfg.activity.lock().unwrap().is_empty(),
+            "a HEAD was logged as a download"
+        );
+    }
+
+    /// `Range` 解析的边界，逐条钉住（错了就是「续传永远差一个字节」）。
+    #[test]
+    fn range_parsing_edges() {
+        assert!(matches!(parse_range("bytes=0-0", 10), RangeReq::Part(0, 0)));
+        assert!(matches!(parse_range("bytes=5-", 10), RangeReq::Part(5, 9)));
+        assert!(matches!(parse_range("bytes=-3", 10), RangeReq::Part(7, 9)));
+        // 末尾越界要夹紧，不是拒绝。
+        assert!(matches!(parse_range("bytes=8-99", 10), RangeReq::Part(8, 9)));
+        // 起始就在文件外面 → 416。
+        assert!(matches!(parse_range("bytes=10-20", 10), RangeReq::Unsatisfiable));
+        assert!(matches!(parse_range("bytes=0-1,4-5", 10), RangeReq::Full));
+        assert!(matches!(parse_range("items=0-1", 10), RangeReq::Full));
+        assert!(matches!(parse_range("bytes=abc-", 10), RangeReq::Full));
+        assert!(matches!(parse_range("bytes=9-3", 10), RangeReq::Unsatisfiable));
+        assert!(matches!(parse_range("bytes=-0", 10), RangeReq::Unsatisfiable));
+        // 空文件：任何范围都无意义。
+        assert!(matches!(parse_range("bytes=0-", 0), RangeReq::Unsatisfiable));
     }
 }
 
