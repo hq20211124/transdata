@@ -103,9 +103,18 @@ mod tests {
     use super::*;
 
     /// 同一进程里第二次取锁必须失败（等价于第二个实例启动）。
+    ///
+    /// 注意：这把锁是**全局**的，所以本机只要有人在跑 `C:\TransData\transdata.exe`，
+    /// 第一次取锁就会失败 —— 那是环境冲突，不是回归。失败信息要说清这一点，
+    /// 否则每次都会当成新 bug 查一遍。
     #[test]
     fn second_instance_cannot_start() {
-        let first = acquire().expect("第一次应该拿到锁");
+        let Some(first) = acquire() else {
+            panic!(
+                "拿不到实例锁：本机有 TransData 正在运行（默认在 C:\\TransData\\transdata.exe）。\
+                 先停掉它再跑这个测试 —— 这不是回归。"
+            );
+        };
         assert!(acquire().is_none(), "第二个实例必须被拒绝");
         drop(first);
         let again = acquire().expect("释放后应该又能拿到");

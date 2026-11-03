@@ -3404,6 +3404,46 @@ mod tests {
         );
     }
 
+    /// 「先换了热点、之后才打开 HTTPS」这条路不能拿到一张名字对不上的旧证书：
+    /// 开关必须按当前地址核对一遍；换了证书就要提示「手机上要再接受一次警告」。
+    #[test]
+    fn turning_https_on_checks_the_certificate_against_current_ips() {
+        let ctx = egui::Context::default();
+        let mut app = test_app(&ctx);
+        let cfg = app.cfg.clone();
+
+        // 一张「签给别的地址」的证书，模拟本机地址已经漂了
+        let stale_dir =
+            std::env::temp_dir().join(format!("td_stalecert_{}", std::process::id()));
+        let stale = crate::tls::load_or_create_in(
+            &["203.0.113.7".to_string()],
+            std::slice::from_ref(&stale_dir),
+        )
+        .expect("旧证书");
+        let stale_fp = stale.fingerprint.clone();
+        cfg.set_tls_material(stale);
+
+        app.set_tls(true);
+
+        assert!(cfg.tls_on(), "开关应该是开着的");
+        assert!(cfg.https_live(), "证书到位才算真的在讲 https");
+        let now = cfg.tls_material().expect("material");
+        assert_ne!(
+            now.fingerprint, stale_fp,
+            "打开 HTTPS 时必须按当前地址核对证书，不能沿用旧 SAN"
+        );
+        assert!(
+            cfg.cert_rotated.load(std::sync::atomic::Ordering::SeqCst),
+            "换了证书要提示用户：手机上得重新接受一次安全警告"
+        );
+        assert!(
+            app.base_url().starts_with("https://"),
+            "二维码用的必须是 https：{}",
+            app.base_url()
+        );
+        let _ = std::fs::remove_dir_all(&stale_dir);
+    }
+
     /// 设置面板里能看到版本号（关于）
     #[test]
     fn settings_panel_shows_version() {

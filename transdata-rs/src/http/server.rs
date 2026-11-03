@@ -663,6 +663,19 @@ async fn read_body_exact(
     Ok(())
 }
 
+/// 每条 HTTP 响应都以一次礼貌的关闭收尾：TLS 下这会发出 `close_notify`。
+///
+/// 少了它，严格的 TLS 客户端（rustls、Java 的 `HttpsURLConnection`）会把
+/// 「响应其实早就收完了」的连接当成被中途掐断而报错 —— 浏览器通常宽容，所以
+/// 这个缺陷只在带 s 的路径上露头。明文 TCP 上等价于发一个 FIN，行为不变。
+async fn close_conn(
+    mut sock: impl Conn,
+    res: Result<(), std::io::Error>,
+) -> Result<(), std::io::Error> {
+    let _ = tokio::io::AsyncWriteExt::shutdown(&mut sock).await;
+    res
+}
+
 async fn handle_conn(
     mut sock: impl Conn,
     cfg: &Arc<Config>,
@@ -724,7 +737,8 @@ async fn handle_conn(
         if !same_origin(&req, cfg) {
             return write_json_status(&mut sock, "403 Forbidden", "Cross-origin request rejected").await;
         }
-        return pair(&mut sock, cfg, &req, &peer, &mut pending).await;
+        let r = pair(&mut sock, cfg, &req, &peer, &mut pending).await;
+        return close_conn(sock, r).await;
     }
 
     // State-changing requests must come from our own page.
@@ -741,9 +755,11 @@ async fn handle_conn(
         return write_json_status(&mut sock, "401 Unauthorized", "Not paired").await;
     }
 
-    match (req.method.as_str(), req.path.as_str()) {
+    let res = match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/ws") if req.ws => {
-            ws_conn(sock, cfg, head_bytes).await
+            // WebSocket 自己拥有这条连接（它不是一次问答就结束），所以在这里
+            // 直接返回，不走下面的统一关闭。
+            return ws_conn(sock, cfg, head_bytes).await;
         }
         ("GET", "/note") => {
             let (text, v) = cfg.read_note();
@@ -939,7 +955,8 @@ async fn handle_conn(
             zip_dir(&mut sock, cfg, &root, peer).await
         }
         _ => write_json_err(&mut sock, "Not Found").await,
-    }
+    };
+    close_conn(sock, res).await
 }
 
 // ---------------------------------------------------------------------------
@@ -3063,6 +3080,164 @@ mod tests {
         );
     }
 
+    /// 一次 TLS 请求：新连接 → 握手 → 发 → 读到对端关闭（每条响应都是
+    /// `Connection: close`，所以这样能拿到完整回复）。
+    async fn tls_once(connector: &tokio_rustls::TlsConnector, port: u16, raw: &str) -> Vec<u8> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let name = rustls::pki_types::ServerName::IpAddress(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST).into(),
+        );
+        let mut tls = connector.connect(name, tcp).await.expect("tls handshake");
+        tls.write_all(raw.as_bytes()).await.unwrap();
+        let mut out = Vec::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = tls.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+        out
+    }
+
+    /// HTTPS 下的整条下载链路：配对 → 列表拿签名 → **另开一条不带 cookie 的
+    /// TLS 连接**用签名取文件 → 再取一段续传。手机上系统下载器走的就是这条路；
+    /// 只在明文 http 上验过不够，带 s 的协议、`Secure` cookie 和 TLS 流式发送
+    /// 都得真跑一遍。
+    #[tokio::test]
+    async fn https_signed_links_and_resume_over_tls() {
+        use std::io::BufReader;
+
+        let cert_dir =
+            std::env::temp_dir().join(format!("transdata_tlsdl_{}", std::process::id()));
+        std::fs::create_dir_all(&cert_dir).ok();
+        let material = crate::tls::load_or_create_in(
+            &["127.0.0.1".to_string()],
+            std::slice::from_ref(&cert_dir),
+        )
+        .expect("certificate");
+        let mut roots = rustls::RootCertStore::empty();
+        for c in rustls_pemfile::certs(&mut BufReader::new(material.cert_pem.as_bytes())) {
+            roots.add(c.expect("cert")).expect("add cert");
+        }
+        let client_config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+
+        let data: Vec<u8> = (0..200_000).map(|i| (i % 253) as u8).collect();
+        let dir = std::env::temp_dir().join(format!("transdata_tlsup_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).ok();
+        std::fs::write(dir.join("big.bin"), &data).unwrap();
+
+        let port = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        let mut raw = Config::with_secret(TEST_SECRET.to_string(), TEST_CODE.to_string());
+        raw.port = port;
+        let cfg = Arc::new(raw);
+        cfg.set_tls_material(material);
+        cfg.set_upload_dir(dir);
+        cfg.set_tls(true);
+        let cfg2 = cfg.clone();
+        tokio::spawn(async move {
+            let _ = crate::http::server::serve(cfg2).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // 0) 页面本身：`tls_once` 用的是严格客户端 —— 响应发完没做 TLS 关闭
+        //    （缺 `close_notify`）时它会直接报 UnexpectedEof，所以「能读完」就是
+        //    在断言每条响应都礼貌收尾（`close_conn`）。
+        let page = tls_once(&connector, port, "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await;
+        assert!(
+            String::from_utf8_lossy(&page).contains("200 OK"),
+            "TLS 上的页面读不完整"
+        );
+
+        // 1) 配对：HTTPS 下发的 cookie 必须带 `Secure`
+        let body = format!(r#"{{"code":"{TEST_CODE}"}}"#);
+        let resp = tls_once(
+            &connector,
+            port,
+            &format!(
+                "POST /pair HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            ),
+        )
+        .await;
+        let text = String::from_utf8_lossy(&resp).to_string();
+        assert!(text.contains("Set-Cookie: td_sid="), "配对没发 cookie: {text}");
+        assert!(
+            text.contains("Secure"),
+            "HTTPS 下的会话 cookie 必须带 Secure: {text}"
+        );
+        let sid = text
+            .split("td_sid=")
+            .nth(1)
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+
+        // 2) 列表（带 cookie），取服务端签好的链接
+        let list = String::from_utf8_lossy(
+            &tls_once(
+                &connector,
+                port,
+                &format!("GET /files HTTP/1.1\r\nHost: 127.0.0.1\r\nCookie: td_sid={sid}\r\n\r\n"),
+            )
+            .await,
+        )
+        .to_string();
+        let href = list
+            .split("\"href\":\"")
+            .nth(1)
+            .unwrap_or_else(|| panic!("列表里没有签名链接: {list}"))
+            .split('"')
+            .next()
+            .unwrap()
+            .to_string();
+        assert!(href.starts_with("/download/big.bin?e="), "链接不对: {href}");
+
+        // 3) 系统下载器那条路：新连接、不带任何 cookie
+        let got = tls_once(&connector, port, &format!("GET {href} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"))
+            .await;
+        let at = got.windows(4).position(|w| w == b"\r\n\r\n").expect("no head");
+        let head = String::from_utf8_lossy(&got[..at]).to_string();
+        assert!(head.contains("200 OK"), "TLS 上的签名链接被拒: {head}");
+        assert_eq!(&got[at + 4..], &data[..], "TLS 下载内容不对");
+
+        // 4) 续传一段
+        let part = tls_once(
+            &connector,
+            port,
+            &format!(
+                "GET {href} HTTP/1.1\r\nHost: 127.0.0.1\r\nRange: bytes=100000-100099\r\n\r\n"
+            ),
+        )
+        .await;
+        let at = part.windows(4).position(|w| w == b"\r\n\r\n").expect("no head");
+        let head = String::from_utf8_lossy(&part[..at]).to_string();
+        assert!(head.contains("206 Partial Content"), "TLS 续传没给 206: {head}");
+        assert!(
+            head.contains("Content-Range: bytes 100000-100099/200000"),
+            "TLS 续传头不对: {head}"
+        );
+        assert_eq!(&part[at + 4..], &data[100_000..100_100]);
+    }
+
     /// The whole browser flow in one go: pair -> get the app page -> upload
     /// with the session cookie -> list -> download -> delete.
     #[tokio::test]
@@ -3387,6 +3562,38 @@ mod folder_tests {
     use super::*;
     use crate::config::Config;
 
+    /// 测试在 `%TEMP%` 里造的目录（`transdata_*`）随进程 id 命名，跑完不会自己
+    /// 消失 —— 一次全量测试漏 40 多个、个别几十 MB，攒过几十次就是几百个。
+    /// 每次建目录前顺手收一次：只收**六小时前**留下的，免得动到同一台机器上
+    /// 正在跑的另一次测试。
+    fn sweep_old_test_dirs() {
+        let temp = match std::env::temp_dir().canonicalize() {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+        let Ok(rd) = std::fs::read_dir(&temp) else {
+            return;
+        };
+        let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(6 * 3600);
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if !name.starts_with("transdata_") {
+                continue;
+            }
+            let Ok(md) = e.metadata() else { continue };
+            if !md.is_dir() {
+                continue;
+            }
+            let young = match md.modified() {
+                Ok(t) => t > cutoff,
+                Err(_) => true, // 时间读不出来就别删
+            };
+            if !young {
+                let _ = std::fs::remove_dir_all(e.path());
+            }
+        }
+    }
+
     /// A server that accepts any number of sequential connections.
     /// Each test must pass a unique `name` — parallel tests share the pid,
     /// and the temp dir is wiped at setup.
@@ -3400,6 +3607,7 @@ mod folder_tests {
         name: &str,
         files: &[(&str, &[u8])],
     ) -> (u16, std::path::PathBuf, Arc<Config>) {
+        sweep_old_test_dirs();
         let dir = std::env::temp_dir().join(format!(
             "transdata_folder_{}_{}",
             std::process::id(),

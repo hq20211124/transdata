@@ -1043,3 +1043,35 @@ bytes a-b/总长`，越界给 416 并带上真实大小，多段范围退化成�
   验证时临时配上的本机设备。
 - 已知遗留：`instance::tests::second_instance_cannot_start` 在部署实例运行时必失败（环境
   冲突，停掉后全绿）；测试仍会在 `%TEMP%` 漏 `transdata_*` 目录，没在这次改动里处理。
+
+**追加（同日 23:30 前后）：HTTPS 真跑一遍，抓到 close_notify**
+
+- 新增 `https_signed_links_and_resume_over_tls`：用**严格** TLS 客户端（rustls）跑完整
+  链路 —— 页面 → 配对（断言 cookie 带 `Secure`）→ 列表取签名 → **另开一条不带 cookie
+  的连接**取文件 → 再取一段续传。第一次跑就红：`UnexpectedEof ... peer closed without
+  sending TLS close_notify`。
+- 根因：`/pair` 和页面响应（`write_page` 的 200/304 两条分支）只 `flush` 不 `shutdown`，
+  浏览器宽容、严格客户端不宽容。没去逐处补 `shutdown`，改成在 `handle_conn` 收尾统一做
+  （`close_conn`）：WebSocket 自己拥有连接，提前返回不走统一关闭；明文 TCP 上等价于 FIN，
+  行为不变。页面也加进同一条用例，防止回退。
+- `GuiApp::set_tls(true)` 现在每次都按当前地址核对证书（`load_or_create` 自己比对地址
+  列表，没变不动磁盘），换了就置 `cert_rotated` 提示「手机上要再接受一次警告」—— 堵住
+  「先换热点、后打开 HTTPS」拿到旧 SAN 的口子。无头用例
+  `turning_https_on_checks_the_certificate_against_current_ips` 钉住：预置一张签给
+  203.0.113.7 的旧证书 → 开开关 → 指纹必须变、`https_live()` 必须为真、二维码必须是 https。
+- 测试遗留目录：`sweep_old_test_dirs()`（每次建临时目录前跑一次，只收**六小时前**的
+  `transdata_*` 目录，避免动到同一台机器上并行的另一次测试）。实测造一个 10:00 的旧目录
+  和一个当前时间的目录 → 跑测试 → 旧的被收、新的没受伤。
+- `second_instance_cannot_start` 的失败信息改成可执行的说明（「本机有 TransData 在跑，
+  先停掉 —— 这不是回归」）。以前只说「第一次应该拿到锁」，每次都要重新查一遍。
+- 顺带纠正我一个误判：截图看到界面变浅色，我以为测试套件把用户的主题写坏了。查清不是 ——
+  设置文件在 **exe 同目录**，测试二进制写的是 `target/debug/deps/settings.json`，
+  `C:\TransData\settings.json` 的 light 是他白天自己切的。**别去「恢复」用户的选择。**
+- 真实环境里的一次印证：白天地址又漂回 `192.168.43.221`，窗口里的地址和二维码自己跟上，
+  没人点过「刷新二维码」。
+- 没做的：没有在他人正在用的窗口上模拟点击那个 HTTPS 复选框（人在电脑前，不抢鼠标）。
+  复选框 → `set_tls` 的接线是 `workspace.rs` 里一行 `tls_changed`，逻辑本身由上面的
+  无头用例覆盖。
+- 部署：`C:\TransData\transdata.exe` = `dca04387…`（与 `target/release` md5 一致）。
+  测试 88 条：停掉部署实例时 **88 全绿**；实例在跑时 87 通过 + 1 条（实例锁）按上面写明
+  的原因失败。
