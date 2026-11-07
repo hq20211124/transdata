@@ -1890,6 +1890,37 @@ impl App for GuiApp {
     }
 }
 
+/// egui 0.28 在输入法组合期间仍把回车交给多行输入框当换行。
+///
+/// 预编辑的拼音是选中态：回车会先把选中的拼音替换成换行，随后 IME 的
+/// `Commit` 又因为光标位置变了被丢弃——表现就是「拼音不见了，只留下回车」。
+/// 在组合 / 提交那一帧把回车按键事件摘掉，回车只用于确认候选词。
+///
+/// 只处理当前帧里带 IME 事件的情况，不保存跨帧状态：漏掉一次
+/// `Disabled` 也不会让回车从此失效。
+fn drop_enter_during_ime(ctx: &eframe::egui::Context) {
+    use eframe::egui::{Event, ImeEvent, Key};
+    ctx.input_mut(|i| {
+        let ime_busy = i.events.iter().any(|e| match e {
+            Event::Ime(ImeEvent::Preedit(text)) => !text.is_empty(),
+            Event::Ime(ImeEvent::Commit(_) | ImeEvent::Enabled) => true,
+            _ => false,
+        });
+        if ime_busy {
+            i.events.retain(|e| {
+                !matches!(
+                    e,
+                    Event::Key {
+                        key: Key::Enter,
+                        pressed: true,
+                        ..
+                    }
+                )
+            });
+        }
+    });
+}
+
 impl GuiApp {
     /// 记一条便签提示（10 秒后自动消失；warn 用警示色）。
     fn set_note_status(&mut self, msg: &str, warn: bool) {
@@ -2013,6 +2044,8 @@ impl GuiApp {
     /// Build one frame of the window. Kept separate from `App::update` so
     /// the layout can be rendered headlessly in a test.
     fn draw(&mut self, ctx: &eframe::egui::Context) {
+        // 输入法组合期间的回车是「确认候选词」，不能当换行 / 提交
+        drop_enter_during_ime(ctx);
         // 服务器没起来就别装正常：端口被占用时窗口会显示二维码和配对码，
         // 但手机根本连不上 —— 这种情况必须直接说清楚。
         // （只看服务器明确报出来的错，不能用"还没 running"去猜：GUI 的
@@ -3892,6 +3925,136 @@ mod tests {
         assert!((2024..=2100).contains(&year), "{s}");
         let month: u32 = s[4..6].parse().unwrap();
         assert!((1..=12).contains(&month), "{s}");
+    }
+
+    /// 输入法提交候选词的那一下回车，不能落到输入框里当换行 / 提交。
+    #[test]
+    fn ime_enter_is_not_a_newline() {
+        use eframe::egui::{Event, ImeEvent, Key, Modifiers};
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            events: vec![
+                Event::Ime(ImeEvent::Preedit("hh".to_owned())),
+                Event::Key {
+                    key: Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::NONE,
+                },
+                Event::Ime(ImeEvent::Commit("hh".to_owned())),
+                Event::Ime(ImeEvent::Disabled),
+            ],
+            ..Default::default()
+        };
+        let mut enters = 0;
+        let mut ime_events = 0;
+        let _ = ctx.run(raw, |ctx| {
+            drop_enter_during_ime(ctx);
+            enters = ctx.input(|i| {
+                i.events
+                    .iter()
+                    .filter(|e| {
+                        matches!(
+                            e,
+                            Event::Key {
+                                key: Key::Enter,
+                                pressed: true,
+                                ..
+                            }
+                        )
+                    })
+                    .count()
+            });
+            ime_events = ctx.input(|i| {
+                i.events
+                    .iter()
+                    .filter(|e| matches!(e, Event::Ime(_)))
+                    .count()
+            });
+        });
+        assert_eq!(enters, 0, "IME 提交时回车不该交给输入框");
+        assert_eq!(ime_events, 3, "IME 事件必须原样保留");
+    }
+
+    /// 没有输入法时，回车不能受影响。
+    #[test]
+    fn plain_enter_still_reaches_inputs() {        use eframe::egui::{Event, Key, Modifiers};
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            events: vec![Event::Key {
+                key: Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        let mut enters = 0;
+        let _ = ctx.run(raw, |ctx| {
+            drop_enter_during_ime(ctx);
+            enters = ctx.input(|i| {
+                i.events
+                    .iter()
+                    .filter(|e| {
+                        matches!(
+                            e,
+                            Event::Key {
+                                key: Key::Enter,
+                                pressed: true,
+                                ..
+                            }
+                        )
+                    })
+                    .count()
+            });
+        });
+        assert_eq!(enters, 1, "普通回车要照常到达输入框");
+    }
+
+    /// 组合中的拼音 + 回车提交：最终留下的是候选文字，不是换行。
+    #[test]
+    fn ime_commit_keeps_preedit_text() {
+        use eframe::egui::{Event, ImeEvent, Key, Modifiers};
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("ime-test");
+        let mut text = String::new();
+        let mut frame = |events: Vec<Event>, text: &mut String| {
+            let raw = egui::RawInput {
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run(raw, |ctx| {
+                drop_enter_during_ime(ctx);
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.add(egui::TextEdit::multiline(text).id(id)).request_focus();
+                });
+            });
+        };
+        frame(Vec::new(), &mut text);
+        frame(
+            vec![
+                Event::Ime(ImeEvent::Enabled),
+                Event::Ime(ImeEvent::Preedit("hh".to_owned())),
+            ],
+            &mut text,
+        );
+        frame(
+            vec![
+                Event::Key {
+                    key: Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::NONE,
+                },
+                Event::Ime(ImeEvent::Commit("hh".to_owned())),
+                Event::Ime(ImeEvent::Disabled),
+            ],
+            &mut text,
+        );
+        assert_eq!(text, "hh", "输入法提交的文字被回车换行顶掉了");
     }
 
 }

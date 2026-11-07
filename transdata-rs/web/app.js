@@ -211,7 +211,11 @@
             if (e.target === modal) closeDialog(null);
         });
         $('opInput').addEventListener('keydown', function (e) {
-            if (e.key === 'Enter') { e.preventDefault(); submitDialog(); }
+            // 输入法正在组合时，回车是确认候选词，不能提交弹窗
+            if (e.key === 'Enter' && !e.isComposing && e.keyCode !== 229) {
+                e.preventDefault();
+                submitDialog();
+            }
         });
         document.addEventListener('keydown', function (e) {
             if (dlg && e.key === 'Escape') { e.preventDefault(); closeDialog(null); }
