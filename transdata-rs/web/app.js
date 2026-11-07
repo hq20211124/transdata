@@ -930,14 +930,16 @@
             $('dlEmpty').hidden = false;
             $('dlEmpty').querySelector('.empty-title').textContent = '读取失败';
             $('toggleDl').hidden = true;
+            $('dlFoot').hidden = true;
+            $('zipAll').hidden = true;
         });
     }
 
     /* ------------------------------------------------------------------
        下载：目录树
        服务器 /files 返回的是带子目录前缀的扁平列表，buildTree 把它还原成树
-       （在 /logic.js 里，有 node 单测）；目录行有展开/收起 + 打包，
-       文件行只有下载。
+       （在 /logic.js 里，有 node 单测）；目录行的「下载」下载整个文件夹的
+       zip，文件行的「下载」下载单文件。
        ------------------------------------------------------------------ */
 
     function renderFiles() {
@@ -957,6 +959,7 @@
             $('dlEmpty').hidden = false;
             list.classList.remove('is-scrollable');
             $('toggleDl').hidden = true;
+            $('dlFoot').hidden = true;
             return;
         }
         $('dlEmpty').hidden = true;
@@ -991,6 +994,7 @@
         // 不统计、不显示数字：只有一个「展开全部 / 收起」
         var tg = $('toggleDl');
         tg.hidden = total <= DL_COLLAPSED_ROWS;
+        $('dlFoot').hidden = tg.hidden;
         tg.textContent = dlExpanded ? '收起' : '展开全部';
         tg.setAttribute('aria-expanded', dlExpanded ? 'true' : 'false');
     }
@@ -1031,8 +1035,9 @@
 
         var actions = el('div', 'fi-actions');
         if (node.dir) {
-            // 只有目录才提供「打包」
-            var zip = el('a', 'btn btn--soft btn--xs', '打包');
+            // 目录行下载的是整个文件夹的 zip，和文件行的「下载」长得一样，
+            // 靠前面的文件夹图标区分。
+            var zip = el('a', 'btn btn--soft btn--xs', '下载');
             zip.href = node.zip;
             zip.title = '把「' + node.name + '」整个文件夹压成 zip 下载';
             zip.addEventListener('click', function (e) {
